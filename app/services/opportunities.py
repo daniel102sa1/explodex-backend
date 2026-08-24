@@ -12,6 +12,27 @@ from app.services.market_context import market_context
 from app.services.news_context import news_context_for_symbol
 
 
+NEUTRAL_CONTEXT: dict[str, Any] = {
+    "regime": "MIXED",
+    "liquid_symbols": 0,
+    "positive_symbols": 0,
+    "negative_symbols": 0,
+    "positive_breadth_pct": 0.0,
+    "net_breadth_pct": 0.0,
+    "median_24h_change_pct": 0.0,
+    "strong_up_count": 0,
+    "strong_down_count": 0,
+    "btc": {"trend": "NEUTRAL", "change_15m_pct": 0.0, "change_1h_pct": 0.0},
+    "eth": {"trend": "NEUTRAL", "change_15m_pct": 0.0, "change_1h_pct": 0.0},
+    "risk_on_points": 0,
+    "risk_off_points": 0,
+    "long_score_adjustment": 0.0,
+    "short_score_adjustment": 0.0,
+    "available": False,
+    "note": "Market context temporarily unavailable; no contextual score adjustment was applied.",
+}
+
+
 def classify_signal(setup_score: float, risk_score: float) -> dict[str, Any]:
     """Classify signal quality without pretending the score is a true probability."""
     if setup_score >= 95 and risk_score <= 20:
@@ -90,13 +111,24 @@ async def calibration_by_score(db: AsyncSession) -> dict[str, Any]:
     }
 
 
+async def _safe_market_context() -> dict[str, Any]:
+    try:
+        value = await market_context()
+        return {**value, "available": True}
+    except Exception as exc:
+        return {**NEUTRAL_CONTEXT, "error": str(exc)[:500]}
+
+
 async def ranked_opportunities(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
+    # Market-data/network failure must never make the whole dashboard unusable.
     calibration, context = await asyncio.gather(
         calibration_by_score(db),
-        market_context(),
+        _safe_market_context(),
     )
     calibration_map = {item["score_bucket"]: item for item in calibration["buckets"]}
 
+    # Keep this query intentionally dependent only on the core signals/symbols tables.
+    # Optional metrics/news are enrichment and must not be able to break ranking.
     result = await db.execute(
         text(
             """
@@ -105,20 +137,9 @@ async def ranked_opportunities(db: AsyncSession, limit: int = 50) -> dict[str, A
                    s.entry_low, s.entry_high, s.stop_loss, s.tp1, s.tp2, s.tp3,
                    s.expected_move_min_pct, s.expected_move_max_pct,
                    s.expected_duration_min_minutes, s.expected_duration_max_minutes,
-                   sm.structure_score, sm.oi_score, sm.taker_score, sm.volume_score,
-                   sm.funding_score, sm.btc_score, sm.absorption_score,
-                   sm.volatility_score, sm.liquidity_score,
-                   sm.oi_change_pct, sm.taker_ratio, sm.funding_rate,
-                   sm.relative_volume, sm.absorption_detected,
-                   sm.btc_filter_passed, sm.notes
+                   s.reason
             FROM signals s
             JOIN symbols sy ON sy.id = s.symbol_id
-            LEFT JOIN LATERAL (
-                SELECT * FROM signal_metrics m
-                WHERE m.signal_id = s.id
-                ORDER BY m.created_at DESC
-                LIMIT 1
-            ) sm ON TRUE
             WHERE s.is_active = TRUE
             ORDER BY s.setup_score DESC, s.risk_score ASC, s.created_at DESC
             LIMIT :limit
@@ -129,12 +150,16 @@ async def ranked_opportunities(db: AsyncSession, limit: int = 50) -> dict[str, A
 
     rows = [dict(row) for row in result.mappings().all()]
 
-    # Only enrich the best few with news to keep response time/cost under control.
+    # Only enrich a few leaders with news; timeout/provider errors degrade to neutral.
     news_targets = rows[: max(0, settings.news_max_candidates)] if settings.news_enabled else []
-    news_results = await asyncio.gather(
-        *(news_context_for_symbol(str(item["symbol"])) for item in news_targets),
-        return_exceptions=True,
-    ) if news_targets else []
+    news_results = (
+        await asyncio.gather(
+            *(news_context_for_symbol(str(item["symbol"])) for item in news_targets),
+            return_exceptions=True,
+        )
+        if news_targets
+        else []
+    )
 
     news_map: dict[str, dict[str, Any]] = {}
     for item, news in zip(news_targets, news_results):
@@ -143,6 +168,7 @@ async def ranked_opportunities(db: AsyncSession, limit: int = 50) -> dict[str, A
                 "sentiment": "UNAVAILABLE",
                 "score_adjustment": 0.0,
                 "headlines": [],
+                "note": "News provider temporarily unavailable.",
             }
         else:
             news_map[str(item["symbol"])] = news
@@ -155,7 +181,9 @@ async def ranked_opportunities(db: AsyncSession, limit: int = 50) -> dict[str, A
         direction = str(item["direction"])
 
         market_adjustment = float(
-            context["long_score_adjustment"] if direction == "LONG" else context["short_score_adjustment"]
+            context.get("long_score_adjustment", 0.0)
+            if direction == "LONG"
+            else context.get("short_score_adjustment", 0.0)
         )
 
         news = news_map.get(str(item["symbol"]), {
@@ -165,16 +193,14 @@ async def ranked_opportunities(db: AsyncSession, limit: int = 50) -> dict[str, A
             "note": "News enrichment is reserved for top-ranked candidates.",
         })
         raw_news_adjustment = float(news.get("score_adjustment", 0.0) or 0.0)
-        # Positive news helps LONG and hurts SHORT; negative news does the reverse.
         directional_news_adjustment = raw_news_adjustment if direction == "LONG" else -raw_news_adjustment
 
         contextual_score = max(0.0, min(100.0, base_score + market_adjustment + directional_news_adjustment))
 
-        # Strong adverse context increases risk rather than only reducing score.
         contextual_risk = risk_score
-        if direction == "LONG" and context["regime"] == "RISK_OFF":
+        if direction == "LONG" and context.get("regime") == "RISK_OFF":
             contextual_risk = min(100.0, contextual_risk + 10)
-        elif direction == "SHORT" and context["regime"] == "RISK_ON":
+        elif direction == "SHORT" and context.get("regime") == "RISK_ON":
             contextual_risk = min(100.0, contextual_risk + 10)
 
         if directional_news_adjustment <= -3.75:
@@ -192,7 +218,8 @@ async def ranked_opportunities(db: AsyncSession, limit: int = 50) -> dict[str, A
         item["contextual_risk_score"] = round(contextual_risk, 2)
         item["market_adjustment"] = round(market_adjustment, 2)
         item["news_adjustment"] = round(directional_news_adjustment, 2)
-        item["market_regime"] = context["regime"]
+        item["market_regime"] = context.get("regime", "MIXED")
+        item["market_context_available"] = bool(context.get("available", False))
         item["news"] = news
         item["score_bucket"] = bucket_name
         item["historical_sample_size"] = sample
