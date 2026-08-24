@@ -19,6 +19,7 @@ from app.services.paper_trading import (
     paper_performance,
     sync_ready_signals,
 )
+from app.services.prediction_engine import build_pre_move_prediction
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
 from app.services.scanner_progress import scanner_progress
@@ -37,8 +38,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.9.0",
-    description="ExplodeX early LONG/SHORT scanner with multi-exchange confirmation",
+    version="0.10.0",
+    description="ExplodeX early LONG/SHORT scanner with multi-exchange confirmation and pre-move prediction",
     lifespan=lifespan,
 )
 
@@ -74,7 +75,7 @@ def _float(value, default: float = 0.0) -> float:
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.9.0",
+        "version": "0.10.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
@@ -83,6 +84,7 @@ async def root():
             "configured": coinglass_client.configured,
             "require_for_ready": settings.coinglass_require_for_ready,
         },
+        "prediction_engine": "pre-move-v1",
         "message": "ExplodeX backend online",
     }
 
@@ -97,6 +99,7 @@ async def health():
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
         "provider_warning": binance_client.last_primary_error,
+        "prediction_engine": "pre-move-v1",
         "coinglass": coinglass_client.status(),
     }
 
@@ -107,6 +110,7 @@ async def runtime_status():
     payload["market_data_source"] = binance_client.active_source
     payload["provider_warning"] = binance_client.last_primary_error
     payload["coinglass"] = coinglass_client.status()
+    payload["prediction_engine"] = "pre-move-v1"
     return payload
 
 
@@ -121,7 +125,6 @@ async def scanner_live_progress():
 
 @app.get("/api/v1/coinglass/status")
 async def coinglass_status(probe: bool = Query(default=False)):
-    # Never expose the API key. Probe performs one safe BTC OI request.
     return await coinglass_client.status_probe() if probe else coinglass_client.status()
 
 
@@ -219,6 +222,20 @@ async def live_symbol_analysis(symbol: str):
 
         cg = await coinglass_client.enrich_symbol(safe_symbol)
         scored = apply_coinglass_confirmation(local_scored, cg)
+        prediction = build_pre_move_prediction(scored, snapshot, cg)
+
+        # READY is intentionally stricter than a high technical score. We only
+        # allow it when the pre-move sequence has actually activated and the plan
+        # is not already late/chasing. PREACTIVACION remains an early warning.
+        if scored.get("state") == "READY" and prediction.get("phase") != "ACTIVADO":
+            scored = dict(scored)
+            scored["state"] = "PREPARING"
+            metrics = dict(scored.get("metrics") or {})
+            rejects = list(metrics.get("reject_reasons") or [])
+            if "pre_move_not_activated" not in rejects:
+                rejects.append("pre_move_not_activated")
+            metrics["reject_reasons"] = rejects
+            scored["metrics"] = metrics
 
         availability = {
             "price_structure": bool(snapshot.get("klines")),
@@ -246,7 +263,6 @@ async def live_symbol_analysis(symbol: str):
             availability["order_book"],
             availability["futures_flow"],
             availability["coinglass_aggregated_oi"],
-            availability["coinglass_aggregated_taker"],
         ]
         data_quality = "FULL" if all(availability.values()) else ("TRADE_GRADE" if all(required) else "LIMITED")
 
@@ -257,6 +273,7 @@ async def live_symbol_analysis(symbol: str):
             "data_quality": data_quality,
             "availability": availability,
             "coinglass": cg,
+            "prediction": prediction,
             "current_open_interest": _float(snapshot.get("open_interest", {}).get("openInterest")),
             "direction": scored["direction"],
             "state": scored["state"],
@@ -267,25 +284,27 @@ async def live_symbol_analysis(symbol: str):
             "risk_score": scored["risk_score"],
             "local_risk_score_before_coinglass": local_scored["risk_score"],
             "current_price": scored["current_price"],
-            "entry_low": scored["entry_low"],
-            "entry_high": scored["entry_high"],
-            "stop_loss": scored["stop_loss"],
-            "tp1": scored["tp1"],
-            "tp2": scored["tp2"],
-            "tp3": scored["tp3"],
+            "entry_low": prediction.get("entry_low", scored["entry_low"]),
+            "entry_high": prediction.get("entry_high", scored["entry_high"]),
+            "invalidation_price": prediction.get("invalidation_price", scored["stop_loss"]),
+            "stop_loss": prediction.get("stop_loss", scored["stop_loss"]),
+            "tp1": prediction.get("tp1", scored["tp1"]),
+            "tp2": prediction.get("tp2", scored["tp2"]),
+            "tp3": prediction.get("tp3", scored["tp3"]),
             "expected_move_min_pct": scored["expected_move_min_pct"],
             "expected_move_max_pct": scored["expected_move_max_pct"],
-            "expected_duration_min_minutes": scored["expected_duration_min_minutes"],
-            "expected_duration_max_minutes": scored["expected_duration_max_minutes"],
+            "expected_duration_min_minutes": prediction.get("expected_duration_min_minutes", scored["expected_duration_min_minutes"]),
+            "expected_duration_max_minutes": prediction.get("expected_duration_max_minutes", scored["expected_duration_max_minutes"]),
             "components": scored["components"],
             "metrics": scored["metrics"],
             "btc_context": btc_context,
             "risk_policy": {
                 "paper_only": settings.paper_trading_only,
                 "coinglass_required_for_ready": settings.coinglass_require_for_ready,
+                "prediction_activation_required_for_ready": True,
                 "score_is_probability": False,
             },
-            "note": "Score is setup quality, not a guaranteed probability of profit.",
+            "note": "El score mide calidad del setup; la predicción previa tampoco garantiza una vela grande.",
         }
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Live analysis unavailable: {exc}") from exc
@@ -357,93 +376,3 @@ async def opportunities(
 @app.get("/api/v1/calibration")
 async def calibration(db: AsyncSession = Depends(get_db)):
     return await calibration_by_score(db)
-
-
-@app.post("/api/v1/paper/sync")
-async def paper_sync(db: AsyncSession = Depends(get_db)):
-    try:
-        return await sync_ready_signals(db)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Paper sync failed: {exc}") from exc
-
-
-@app.post("/api/v1/paper/manage")
-async def paper_manage(db: AsyncSession = Depends(get_db)):
-    try:
-        return await manage_open_paper_trades(db)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Paper manager failed: {exc}") from exc
-
-
-@app.get("/api/v1/paper/open")
-async def paper_open(
-    limit: int = Query(default=20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        text(
-            """
-            SELECT t.id::text, sy.symbol, t.direction, t.status, t.leverage,
-                   t.risk_pct, t.entry_price, t.quantity, t.notional_usdt,
-                   t.stop_loss, t.tp1, t.tp2, t.tp3, t.opened_at,
-                   t.pnl_usdt, t.r_multiple, t.metadata
-            FROM trades t
-            JOIN symbols sy ON sy.id = t.symbol_id
-            WHERE t.mode = 'PAPER' AND t.status IN ('OPEN','PARTIAL')
-            ORDER BY t.opened_at DESC
-            LIMIT :limit
-            """
-        ),
-        {"limit": limit},
-    )
-    return [dict(row) for row in result.mappings().all()]
-
-
-@app.get("/api/v1/paper/history")
-async def paper_history(
-    limit: int = Query(default=50, ge=1, le=500),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        text(
-            """
-            SELECT t.id::text, sy.symbol, t.direction, t.status,
-                   t.entry_price, t.exit_price, t.stop_loss, t.tp1, t.tp2, t.tp3,
-                   t.opened_at, t.closed_at, t.pnl_usdt, t.pnl_pct,
-                   t.r_multiple, t.fees_usdt, t.close_reason
-            FROM trades t
-            JOIN symbols sy ON sy.id = t.symbol_id
-            WHERE t.mode = 'PAPER' AND t.status IN ('CLOSED','STOPPED')
-            ORDER BY t.closed_at DESC
-            LIMIT :limit
-            """
-        ),
-        {"limit": limit},
-    )
-    return [dict(row) for row in result.mappings().all()]
-
-
-@app.get("/api/v1/paper/performance")
-async def paper_stats(db: AsyncSession = Depends(get_db)):
-    return await paper_performance(db)
-
-
-@app.get("/api/v1/alerts/pending")
-async def pending_alerts(
-    limit: int = Query(default=50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        text(
-            """
-            SELECT id::text, signal_id::text, trade_id::text, created_at,
-                   channel, severity, title, message
-            FROM alerts
-            WHERE is_sent = FALSE
-            ORDER BY created_at ASC
-            LIMIT :limit
-            """
-        ),
-        {"limit": limit},
-    )
-    return [dict(row) for row in result.mappings().all()]
