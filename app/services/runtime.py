@@ -7,9 +7,9 @@ from typing import Any
 
 from app.config import settings
 from app.database import SessionLocal
-from app.services.paper_time_management import manage_open_paper_trades_with_time
-from app.services.paper_trading import sync_ready_signals
+from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
 from app.services.scanner import run_scanner
+from app.services.trade_time_manager import manage_trade_time_stops
 
 logger = logging.getLogger("explodex.runtime")
 
@@ -55,7 +55,6 @@ class RuntimeState:
             "paper_manager": {
                 "running": self.paper_manage_running,
                 "interval_seconds": settings.paper_manage_interval_seconds,
-                "time_stop_enabled": True,
                 "last_run_at": iso(self.last_paper_manage_at),
                 "last_ok": self.last_paper_manage_ok,
                 "last_error": self.last_paper_manage_error,
@@ -106,11 +105,12 @@ async def _run_paper_manage_once() -> None:
     runtime_state.paper_manage_running = True
     try:
         async with SessionLocal() as db:
-            result = await manage_open_paper_trades_with_time(db)
+            price_result = await manage_open_paper_trades(db)
+            time_result = await manage_trade_time_stops(db)
         runtime_state.last_paper_manage_result = {
-            "managed": result.get("managed", 0),
-            "actions": result.get("actions", [])[:10],
-            "time_management": result.get("time_management", [])[:10],
+            "managed": price_result.get("managed", 0),
+            "actions": (price_result.get("actions", []) + time_result.get("actions", []))[:15],
+            "time_stop_actions": time_result.get("actions", [])[:10],
         }
         runtime_state.last_paper_manage_ok = True
         runtime_state.last_paper_manage_error = None
