@@ -20,6 +20,7 @@ class ScannerProgress:
         self.deep_total = 0
         self.deep_completed = 0
         self.candidates_found = 0
+        self.data_source = "unknown"
         self.current_symbols: set[str] = set()
         self.recent_symbols: deque[str] = deque(maxlen=30)
         self.recent_results: deque[dict[str, Any]] = deque(maxlen=30)
@@ -32,10 +33,11 @@ class ScannerProgress:
         self.phase = "loading_market"
         self.started_at = datetime.now(timezone.utc).isoformat()
 
-    def set_universe(self, universe_size: int, early_pool_size: int, deep_total: int) -> None:
+    def set_universe(self, universe_size: int, early_pool_size: int, deep_total: int, data_source: str = "BINANCE_FUTURES") -> None:
         self.universe_size = universe_size
         self.early_pool_size = early_pool_size
         self.deep_total = deep_total
+        self.data_source = data_source
         self.phase = "deep_analysis"
 
     def symbol_started(self, symbol: str) -> None:
@@ -46,7 +48,7 @@ class ScannerProgress:
         self.current_symbols.discard(symbol)
         self.deep_completed += 1
         if error:
-            self.errors.appendleft(f"{symbol}: {error}"[:400])
+            self.errors.appendleft(f"{symbol}: {error}"[:500])
             return
         if score:
             if score.get("state") != "NO_TRADE":
@@ -71,9 +73,19 @@ class ScannerProgress:
                 "trend_1h": metrics.get("trend_1h"),
             })
 
+    def fatal_error(self, error: str) -> None:
+        self.errors.appendleft(str(error)[:1200])
+        self.status = "failed"
+        self.phase = "failed"
+
     def finish(self, status: str = "completed") -> None:
         self.status = status
-        self.phase = "finished" if status == "completed" else "failed"
+        if status == "completed":
+            self.phase = "finished"
+        elif status == "degraded":
+            self.phase = "degraded"
+        else:
+            self.phase = "failed"
         self.finished_at = datetime.now(timezone.utc).isoformat()
         self.current_symbols.clear()
 
@@ -91,6 +103,7 @@ class ScannerProgress:
             "deep_completed": self.deep_completed,
             "progress_pct": round(progress_pct, 1),
             "candidates_found": self.candidates_found,
+            "data_source": self.data_source,
             "current_symbols": sorted(self.current_symbols),
             "recent_symbols": list(self.recent_symbols),
             "recent_results": list(self.recent_results),
