@@ -7,7 +7,8 @@ from typing import Any
 
 from app.config import settings
 from app.database import SessionLocal
-from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
+from app.services.paper_time_management import manage_open_paper_trades_with_time
+from app.services.paper_trading import sync_ready_signals
 from app.services.scanner import run_scanner
 
 logger = logging.getLogger("explodex.runtime")
@@ -54,6 +55,7 @@ class RuntimeState:
             "paper_manager": {
                 "running": self.paper_manage_running,
                 "interval_seconds": settings.paper_manage_interval_seconds,
+                "time_stop_enabled": True,
                 "last_run_at": iso(self.last_paper_manage_at),
                 "last_ok": self.last_paper_manage_ok,
                 "last_error": self.last_paper_manage_error,
@@ -89,7 +91,7 @@ async def _run_scanner_once() -> None:
         }
         runtime_state.last_scanner_ok = True
         runtime_state.last_scanner_error = None
-    except Exception as exc:  # runtime must keep running even if one cycle fails
+    except Exception as exc:
         logger.exception("Automatic scanner cycle failed")
         runtime_state.last_scanner_ok = False
         runtime_state.last_scanner_error = str(exc)[:1000]
@@ -104,10 +106,11 @@ async def _run_paper_manage_once() -> None:
     runtime_state.paper_manage_running = True
     try:
         async with SessionLocal() as db:
-            result = await manage_open_paper_trades(db)
+            result = await manage_open_paper_trades_with_time(db)
         runtime_state.last_paper_manage_result = {
             "managed": result.get("managed", 0),
             "actions": result.get("actions", [])[:10],
+            "time_management": result.get("time_management", [])[:10],
         }
         runtime_state.last_paper_manage_ok = True
         runtime_state.last_paper_manage_error = None
@@ -145,7 +148,6 @@ async def _run_paper_sync_once() -> None:
 
 
 async def _scanner_loop() -> None:
-    # Give Railway/PostgreSQL a few seconds to become ready after a deploy.
     await asyncio.sleep(8)
     while True:
         await _run_scanner_once()
@@ -160,7 +162,6 @@ async def _paper_manage_loop() -> None:
 
 
 async def _paper_sync_loop() -> None:
-    # Run after scanner has had a chance to create READY signals.
     await asyncio.sleep(25)
     while True:
         await _run_paper_sync_once()
