@@ -13,6 +13,7 @@ from app.config import settings
 from app.services.binance import binance_client
 from app.services.scanner_progress import scanner_progress
 from app.services.scoring import build_btc_context, score_snapshot
+from app.services.signal_alerts import create_signal_alert
 
 
 def _is_candidate_ticker(t: dict[str, Any]) -> bool:
@@ -103,6 +104,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
 
         ranked: list[dict[str, Any]] = []
         errors: list[str] = []
+        alerts_created = 0
 
         for item in results_raw:
             if isinstance(item, Exception):
@@ -236,6 +238,15 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 },
             )
 
+            if await create_signal_alert(
+                db,
+                signal_id=signal_id,
+                symbol_id=symbol_id,
+                symbol=symbol,
+                score=score,
+            ):
+                alerts_created += 1
+
             ranked.append({"symbol": symbol, "change_24h_pct": float(ticker.get("priceChangePercent", 0) or 0), **score})
 
         ranked.sort(key=lambda x: (x["setup_score"], -x["risk_score"]), reverse=True)
@@ -260,6 +271,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             "btc_context": btc_context,
             "symbols_scanned": len(selected),
             "candidates_found": len(candidates),
+            "alerts_created": alerts_created,
             "errors": errors[:5],
             "top": ranked[:10],
         }
