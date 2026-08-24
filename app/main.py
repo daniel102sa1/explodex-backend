@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import check_database, get_db
 from app.services.binance import binance_client
+from app.services.opportunities import calibration_by_score, ranked_opportunities
 from app.services.paper_trading import (
     manage_open_paper_trades,
     paper_performance,
@@ -14,7 +15,7 @@ from app.services.scanner import run_scanner
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.2.0",
+    version="0.3.0",
     description="ExplodeX early LONG/SHORT scanner for Binance USDT-M Futures",
 )
 
@@ -23,7 +24,7 @@ app = FastAPI(
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.2.0",
+        "version": "0.3.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "message": "ExplodeX backend online",
     }
@@ -100,6 +101,25 @@ async def active_signals(
         {"limit": limit},
     )
     return [dict(row) for row in result.mappings().all()]
+
+
+@app.get("/api/v1/opportunities")
+async def opportunities(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rank active setups into ELITE, VERY_STRONG, STRONG, WATCH and NO_TRADE.
+
+    A 100/100 score is intentionally not exposed as a guaranteed 100% probability.
+    Historical win-rate estimates only appear after enough paper trades exist.
+    """
+    return await ranked_opportunities(db, limit=limit)
+
+
+@app.get("/api/v1/calibration")
+async def calibration(db: AsyncSession = Depends(get_db)):
+    """Observed paper-trade win rate by score bucket for probability calibration."""
+    return await calibration_by_score(db)
 
 
 @app.post("/api/v1/paper/sync")
