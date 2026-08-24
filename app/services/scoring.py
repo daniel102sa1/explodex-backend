@@ -42,6 +42,71 @@ def _range_pct(highs: list[float], lows: list[float], lookback: int, current: fl
     return ((h - l) / current) * 100
 
 
+def _trend(klines: list[list[Any]]) -> str:
+    if len(klines) < 22:
+        return "NEUTRAL"
+    closes = [float(k[4]) for k in klines]
+    ema9 = _ema(closes[-40:], 9)
+    ema21 = _ema(closes[-60:], 21)
+    change = _pct_change(closes[-5], closes[-1]) if len(closes) >= 5 else 0.0
+    if ema9 > ema21 and change > -0.2:
+        return "BULLISH"
+    if ema9 < ema21 and change < 0.2:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _order_book_metrics(book: dict[str, Any]) -> dict[str, float]:
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    bid_notional = sum(float(p) * float(q) for p, q in bids[:20])
+    ask_notional = sum(float(p) * float(q) for p, q in asks[:20])
+    total = bid_notional + ask_notional
+    imbalance = ((bid_notional - ask_notional) / total) if total > 0 else 0.0
+    best_bid = float(bids[0][0]) if bids else 0.0
+    best_ask = float(asks[0][0]) if asks else 0.0
+    mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
+    spread_bps = ((best_ask - best_bid) / mid) * 10000 if mid else 0.0
+    return {
+        "bid_notional": bid_notional,
+        "ask_notional": ask_notional,
+        "imbalance": imbalance,
+        "spread_bps": spread_bps,
+    }
+
+
+def _agg_flow(trades: list[dict[str, Any]]) -> dict[str, float]:
+    buy = 0.0
+    sell = 0.0
+    for trade in trades:
+        price = float(trade.get("p", 0) or 0)
+        qty = float(trade.get("q", 0) or 0)
+        notional = price * qty
+        # Binance aggTrades field m=True means buyer is maker => aggressive seller.
+        if bool(trade.get("m", False)):
+            sell += notional
+        else:
+            buy += notional
+    total = buy + sell
+    delta_ratio = ((buy - sell) / total) if total > 0 else 0.0
+    buy_sell_ratio = buy / sell if sell > 0 else (9.99 if buy > 0 else 1.0)
+    return {
+        "buy_notional": buy,
+        "sell_notional": sell,
+        "delta_ratio": delta_ratio,
+        "buy_sell_ratio": buy_sell_ratio,
+    }
+
+
+def _last_ratio(rows: list[dict[str, Any]], key: str = "longShortRatio") -> float:
+    if not rows:
+        return 1.0
+    try:
+        return float(rows[-1].get(key, 1) or 1)
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def build_btc_context(klines: list[list[Any]]) -> dict[str, float | str]:
     closes = [float(k[4]) for k in klines]
     if len(closes) < 13:
@@ -66,10 +131,7 @@ def build_btc_context(klines: list[list[Any]]) -> dict[str, float | str]:
     }
 
 
-def score_snapshot(
-    snapshot: dict[str, Any],
-    btc_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def score_snapshot(snapshot: dict[str, Any], btc_context: dict[str, Any] | None = None) -> dict[str, Any]:
     klines = snapshot["klines"]
     closes = [float(k[4]) for k in klines]
     highs = [float(k[2]) for k in klines]
@@ -90,17 +152,12 @@ def score_snapshot(
     base_slice = quote_volumes[-24:-3] if len(quote_volumes) >= 24 else quote_volumes[:-3]
     base_vol = mean(base_slice or quote_volumes)
     relative_volume = recent_vol / base_vol if base_vol > 0 else 1.0
-
     previous_vol_slice = quote_volumes[-6:-3]
     previous_vol = mean(previous_vol_slice) if previous_vol_slice else base_vol
     volume_acceleration = recent_vol / previous_vol if previous_vol > 0 else 1.0
 
     oi_hist = snapshot.get("open_interest_history", [])
-    oi_values = [
-        float(x.get("sumOpenInterest", 0))
-        for x in oi_hist
-        if float(x.get("sumOpenInterest", 0) or 0) > 0
-    ]
+    oi_values = [float(x.get("sumOpenInterest", 0)) for x in oi_hist if float(x.get("sumOpenInterest", 0) or 0) > 0]
     oi_change_pct = _pct_change(oi_values[0], oi_values[-1]) if len(oi_values) >= 2 else 0.0
 
     taker = snapshot.get("taker", [])
@@ -112,6 +169,16 @@ def score_snapshot(
     taker_strengthening_short = taker_avg_3 < taker_prev_3 and taker_avg_3 <= 0.95
 
     funding = float(snapshot.get("premium", {}).get("lastFundingRate", 0) or 0)
+    global_ls = _last_ratio(snapshot.get("long_short", []))
+    top_account_ls = _last_ratio(snapshot.get("top_long_short_accounts", []))
+    top_position_ls = _last_ratio(snapshot.get("top_long_short_positions", []))
+
+    order_book = _order_book_metrics(snapshot.get("order_book", {}))
+    futures_flow = _agg_flow(snapshot.get("agg_trades", []))
+    spot_flow = _agg_flow(snapshot.get("spot_agg_trades", []))
+
+    trend_15m = _trend(snapshot.get("klines_15m", []))
+    trend_1h = _trend(snapshot.get("klines_1h", []))
 
     range_12_pct = _range_pct(highs, lows, 12, current_price)
     range_48_pct = _range_pct(highs, lows, 48, current_price)
@@ -132,10 +199,14 @@ def score_snapshot(
         "btc": 10.0,
         "funding": 10.0,
         "response": 10.0,
+        "orderbook": 10.0,
+        "flow": 10.0,
+        "spot": 10.0,
+        "top_traders": 10.0,
+        "mtf": 10.0,
     }
     components_short = dict(components_long)
 
-    # Structure / trend alignment.
     if ema9 > ema21 and change_15m >= -0.15:
         components_long["structure"] += 8
         components_short["structure"] -= 5
@@ -143,7 +214,6 @@ def score_snapshot(
         components_short["structure"] += 8
         components_long["structure"] -= 5
 
-    # OI must agree with price direction; rising OI against direction is a warning.
     if oi_change_pct >= 0.30:
         if change_15m > 0.10:
             components_long["oi"] += 10
@@ -155,7 +225,6 @@ def score_snapshot(
         components_long["oi"] -= 5
         components_short["oi"] -= 5
 
-    # Aggressive flow; repeated/strengthening flow scores more than a single spike.
     if taker_avg_3 >= 1.15:
         components_long["taker"] += 8
         components_short["taker"] -= 6
@@ -167,7 +236,6 @@ def score_snapshot(
         if taker_strengthening_short:
             components_short["taker"] += 4
 
-    # Volume expansion before/around the break.
     if relative_volume >= 1.35:
         if change_15m >= 0:
             components_long["volume"] += 6
@@ -177,7 +245,6 @@ def score_snapshot(
         components_long["volume"] += 2
         components_short["volume"] += 2
 
-    # Compression is useful for both sides; proximity decides which side has room to trigger first.
     if compressed:
         components_long["compression"] += 7
         components_short["compression"] += 7
@@ -186,13 +253,11 @@ def score_snapshot(
     if 0 <= distance_to_low_pct <= max(0.40, atr_pct * 1.2):
         components_short["compression"] += 3
 
-    # Funding crowding filter.
     if funding > 0.0005:
         components_long["funding"] -= 6
     elif funding < -0.0005:
         components_short["funding"] -= 6
 
-    # BTC regime filter. This is deliberately asymmetric: don't fight a strong BTC impulse.
     btc_context = btc_context or {"trend": "NEUTRAL", "change_15m_pct": 0.0, "change_1h_pct": 0.0}
     btc_trend = str(btc_context.get("trend", "NEUTRAL"))
     if btc_trend == "BEARISH":
@@ -202,27 +267,79 @@ def score_snapshot(
         components_short["btc"] -= 10
         components_long["btc"] += 4
 
-    # Price response / absorption detection.
-    long_absorption_conflict = taker_avg_3 >= 1.20 and change_15m <= 0.05
-    short_absorption_conflict = taker_avg_3 <= 0.83 and change_15m >= -0.05
+    # Order-book pressure: moderate imbalance helps; extreme imbalance is not treated as certainty.
+    if order_book["imbalance"] >= 0.12:
+        components_long["orderbook"] += 6
+        components_short["orderbook"] -= 4
+    elif order_book["imbalance"] <= -0.12:
+        components_short["orderbook"] += 6
+        components_long["orderbook"] -= 4
+    if order_book["spread_bps"] > 12:
+        components_long["orderbook"] -= 4
+        components_short["orderbook"] -= 4
+
+    # Recent aggressive futures trades.
+    if futures_flow["delta_ratio"] >= 0.10:
+        components_long["flow"] += 7
+        components_short["flow"] -= 5
+    elif futures_flow["delta_ratio"] <= -0.10:
+        components_short["flow"] += 7
+        components_long["flow"] -= 5
+
+    # Spot participation is especially valuable because it is not leverage-driven futures flow.
+    if spot_flow["delta_ratio"] >= 0.08:
+        components_long["spot"] += 7
+        components_short["spot"] -= 4
+    elif spot_flow["delta_ratio"] <= -0.08:
+        components_short["spot"] += 7
+        components_long["spot"] -= 4
+
+    # Crowding/top-trader confirmation. Ratios above 1 mean more longs than shorts.
+    if top_position_ls >= 1.15 and top_account_ls >= 1.05:
+        components_long["top_traders"] += 6
+        components_short["top_traders"] -= 3
+    elif top_position_ls <= 0.87 and top_account_ls <= 0.95:
+        components_short["top_traders"] += 6
+        components_long["top_traders"] -= 3
+    if global_ls >= 2.2:
+        components_long["top_traders"] -= 5
+    elif global_ls <= 0.45:
+        components_short["top_traders"] -= 5
+
+    # Multi-timeframe confirmation. 5m trigger against both 15m and 1h is penalized.
+    mtf_bull = sum(1 for x in [trend_15m, trend_1h] if x == "BULLISH")
+    mtf_bear = sum(1 for x in [trend_15m, trend_1h] if x == "BEARISH")
+    components_long["mtf"] += mtf_bull * 4 - mtf_bear * 4
+    components_short["mtf"] += mtf_bear * 4 - mtf_bull * 4
+
+    # Absorption/conflict checks across independent flows.
+    long_absorption_conflict = (
+        (taker_avg_3 >= 1.20 or futures_flow["delta_ratio"] >= 0.12)
+        and change_15m <= 0.05
+        and order_book["imbalance"] <= 0.03
+    )
+    short_absorption_conflict = (
+        (taker_avg_3 <= 0.83 or futures_flow["delta_ratio"] <= -0.12)
+        and change_15m >= -0.05
+        and order_book["imbalance"] >= -0.03
+    )
     if long_absorption_conflict:
         components_long["response"] -= 14
     elif taker_avg_3 >= 1.10 and change_15m >= 0.15:
         components_long["response"] += 6
-
     if short_absorption_conflict:
         components_short["response"] -= 14
     elif taker_avg_3 <= 0.90 and change_15m <= -0.15:
         components_short["response"] += 6
 
-    # Don't chase a move that already expanded too much in the last hour.
     if change_1h >= 4.5:
         components_long["structure"] -= 10
     if change_1h <= -4.5:
         components_short["structure"] -= 10
 
-    long_score = sum(max(0.0, min(20.0, v)) for v in components_long.values()) / 1.6
-    short_score = sum(max(0.0, min(20.0, v)) for v in components_short.values()) / 1.6
+    # 13 components, each capped 0..20 => normalize to 100.
+    long_score = sum(max(0.0, min(20.0, v)) for v in components_long.values()) / 2.6
+    short_score = sum(max(0.0, min(20.0, v)) for v in components_short.values()) / 2.6
     long_score = max(0.0, min(100.0, long_score))
     short_score = max(0.0, min(100.0, short_score))
 
@@ -231,37 +348,58 @@ def score_snapshot(
     selected_components = components_long if direction == "LONG" else components_short
 
     absorption_conflict = long_absorption_conflict if direction == "LONG" else short_absorption_conflict
-    direction_against_btc = (direction == "LONG" and btc_trend == "BEARISH") or (
-        direction == "SHORT" and btc_trend == "BULLISH"
-    )
+    direction_against_btc = (direction == "LONG" and btc_trend == "BEARISH") or (direction == "SHORT" and btc_trend == "BULLISH")
+    mtf_conflict = (direction == "LONG" and mtf_bear == 2) or (direction == "SHORT" and mtf_bull == 2)
+    flow_conflict = (direction == "LONG" and futures_flow["delta_ratio"] < -0.08) or (direction == "SHORT" and futures_flow["delta_ratio"] > 0.08)
+    spot_conflict = (direction == "LONG" and spot_flow["delta_ratio"] < -0.08) or (direction == "SHORT" and spot_flow["delta_ratio"] > 0.08)
 
-    risk_score = 15.0
+    risk_score = 12.0
     if abs(change_1h) > 4:
         risk_score += 15
     if relative_volume > 4.0:
         risk_score += 8
     if absorption_conflict:
-        risk_score += 30
+        risk_score += 28
     if direction_against_btc:
-        risk_score += 20
+        risk_score += 18
+    if mtf_conflict:
+        risk_score += 14
+    if flow_conflict:
+        risk_score += 10
+    if spot_conflict:
+        risk_score += 8
     if abs(funding) > 0.0005:
         risk_score += 8
     if oi_change_pct < -0.75:
         risk_score += 8
     if atr_pct > 2.5:
         risk_score += 10
+    if order_book["spread_bps"] > 12:
+        risk_score += 8
     risk_score = min(100.0, risk_score)
 
-    if setup_score >= 84 and risk_score <= 35:
+    # Hard gating: strong score alone is not enough if important confirmations disagree.
+    hard_conflict = absorption_conflict or (direction_against_btc and mtf_conflict)
+    confirmations = 0
+    confirmations += int(oi_change_pct >= 0.30)
+    confirmations += int((direction == "LONG" and taker_avg_3 >= 1.15) or (direction == "SHORT" and taker_avg_3 <= 0.87))
+    confirmations += int(relative_volume >= 1.35)
+    confirmations += int((direction == "LONG" and futures_flow["delta_ratio"] >= 0.08) or (direction == "SHORT" and futures_flow["delta_ratio"] <= -0.08))
+    confirmations += int((direction == "LONG" and spot_flow["delta_ratio"] >= 0.05) or (direction == "SHORT" and spot_flow["delta_ratio"] <= -0.05))
+    confirmations += int((direction == "LONG" and order_book["imbalance"] >= 0.08) or (direction == "SHORT" and order_book["imbalance"] <= -0.08))
+    confirmations += int((direction == "LONG" and mtf_bull >= 1) or (direction == "SHORT" and mtf_bear >= 1))
+
+    if hard_conflict:
+        state = "NO_TRADE"
+    elif setup_score >= 86 and risk_score <= 32 and confirmations >= 4:
         state = "READY"
-    elif setup_score >= 74 and risk_score <= 50:
+    elif setup_score >= 75 and risk_score <= 48 and confirmations >= 3:
         state = "PREPARING"
     elif setup_score >= 64 and risk_score <= 65:
         state = "WATCH"
     else:
         state = "NO_TRADE"
 
-    # Structure-based invalidation with an ATR buffer. Avoid microscopic stops in noisy coins.
     atr_buffer_pct = max(0.20, min(1.25, atr_pct * 0.45)) / 100
     if direction == "LONG":
         stop = min(lows[-12:]) * (1 - atr_buffer_pct)
@@ -282,18 +420,30 @@ def score_snapshot(
     expected_move_min_pct = max(2.0, risk_pct_from_entry * 1.5)
     expected_move_max_pct = max(expected_move_min_pct + 1.0, risk_pct_from_entry * 4.0)
 
-    # We estimate a holding horizon, not a certainty. Compressed setups generally need longer to develop.
     if compressed and atr_pct < 1.0:
-        duration_min, duration_max = 360, 2160  # 6h to 36h
+        duration_min, duration_max = 360, 2160
     elif compressed:
-        duration_min, duration_max = 180, 1440  # 3h to 24h
+        duration_min, duration_max = 180, 1440
     else:
-        duration_min, duration_max = 60, 720  # 1h to 12h
+        duration_min, duration_max = 60, 720
 
-    component_scores = {
-        key: round(max(0.0, min(20.0, value)), 2)
-        for key, value in selected_components.items()
-    }
+    component_scores = {key: round(max(0.0, min(20.0, value)), 2) for key, value in selected_components.items()}
+
+    reject_reasons: list[str] = []
+    if absorption_conflict:
+        reject_reasons.append("aggressive_flow_absorbed")
+    if direction_against_btc:
+        reject_reasons.append("btc_conflict")
+    if mtf_conflict:
+        reject_reasons.append("multi_timeframe_conflict")
+    if flow_conflict:
+        reject_reasons.append("futures_flow_conflict")
+    if spot_conflict:
+        reject_reasons.append("spot_flow_conflict")
+    if abs(change_1h) > 4.5:
+        reject_reasons.append("already_extended")
+    if confirmations < 3:
+        reject_reasons.append("insufficient_confirmations")
 
     return {
         "direction": direction,
@@ -302,7 +452,6 @@ def score_snapshot(
         "long_score": round(long_score, 2),
         "short_score": round(short_score, 2),
         "risk_score": round(risk_score, 2),
-        # Do not pretend this is a calibrated probability until we have enough backtest/paper-trade data.
         "confidence_pct": None,
         "current_price": current_price,
         "entry_low": round(current_price * 0.999, 12),
@@ -333,6 +482,17 @@ def score_snapshot(
             "taker_strengthening_long": taker_strengthening_long,
             "taker_strengthening_short": taker_strengthening_short,
             "funding_rate": funding,
+            "global_long_short_ratio": round(global_ls, 4),
+            "top_account_long_short_ratio": round(top_account_ls, 4),
+            "top_position_long_short_ratio": round(top_position_ls, 4),
+            "order_book_imbalance": round(order_book["imbalance"], 4),
+            "order_book_spread_bps": round(order_book["spread_bps"], 4),
+            "futures_delta_ratio": round(futures_flow["delta_ratio"], 4),
+            "futures_buy_sell_ratio": round(futures_flow["buy_sell_ratio"], 4),
+            "spot_delta_ratio": round(spot_flow["delta_ratio"], 4),
+            "spot_buy_sell_ratio": round(spot_flow["buy_sell_ratio"], 4),
+            "trend_15m": trend_15m,
+            "trend_1h": trend_1h,
             "range_12_pct": round(range_12_pct, 4),
             "range_48_pct": round(range_48_pct, 4),
             "compression_ratio": round(compression_ratio, 4),
@@ -342,6 +502,8 @@ def score_snapshot(
             "long_absorption_conflict": long_absorption_conflict,
             "short_absorption_conflict": short_absorption_conflict,
             "absorption_conflict": absorption_conflict,
+            "confirmations": confirmations,
+            "reject_reasons": reject_reasons,
             "btc_trend": btc_trend,
             "btc_change_15m_pct": btc_context.get("change_15m_pct", 0.0),
             "btc_change_1h_pct": btc_context.get("change_1h_pct", 0.0),
