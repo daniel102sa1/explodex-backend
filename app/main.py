@@ -17,6 +17,7 @@ from app.services.paper_trading import (
 )
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
+from app.services.scanner_progress import scanner_progress
 
 
 @asynccontextmanager
@@ -31,7 +32,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.5.0",
+    version="0.6.0",
     description="ExplodeX early LONG/SHORT scanner for Binance USDT-M Futures",
     lifespan=lifespan,
 )
@@ -41,7 +42,7 @@ app = FastAPI(
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.5.0",
+        "version": "0.6.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "message": "ExplodeX backend online",
@@ -62,6 +63,11 @@ async def health():
 @app.get("/api/v1/runtime/status")
 async def runtime_status():
     return runtime_state.as_dict()
+
+
+@app.get("/api/v1/scanner/progress")
+async def scanner_live_progress():
+    return scanner_progress.as_dict()
 
 
 @app.get("/api/v1/market/context")
