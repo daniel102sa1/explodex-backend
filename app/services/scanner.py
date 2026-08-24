@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.services.binance import binance_client
+from app.services.scanner_progress import scanner_progress
 from app.services.scoring import build_btc_context, score_snapshot
 
 
@@ -53,6 +54,8 @@ async def _ensure_symbol(db: AsyncSession, symbol: str) -> str:
 async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
     run_id = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc)
+    scanner_progress.start(run_id)
+
     await db.execute(
         text("INSERT INTO scanner_runs (id, started_at, status) VALUES (:id, :started_at, 'running')"),
         {"id": run_id, "started_at": started_at},
@@ -70,22 +73,28 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
         universe.sort(key=lambda t: float(t.get("quoteVolume", 0) or 0), reverse=True)
         universe = universe[: settings.scanner_max_symbols]
 
-        # Early detector: avoid coins that already exploded too much in either direction.
         early = [
             t
             for t in universe
             if abs(float(t.get("priceChangePercent", 0) or 0)) <= 6.0
         ]
         selected = early[: max(1, min(deep_limit, 40))]
+        scanner_progress.set_universe(len(universe), len(early), len(selected))
 
         semaphore = asyncio.Semaphore(5)
 
         async def analyze(ticker: dict[str, Any]):
-            async with semaphore:
-                symbol = ticker["symbol"]
-                snapshot = await binance_client.deep_snapshot(symbol)
-                score = score_snapshot(snapshot, btc_context=btc_context)
+            symbol = ticker["symbol"]
+            scanner_progress.symbol_started(symbol)
+            try:
+                async with semaphore:
+                    snapshot = await binance_client.deep_snapshot(symbol)
+                    score = score_snapshot(snapshot, btc_context=btc_context)
+                scanner_progress.symbol_finished(symbol, score=score)
                 return ticker, snapshot, score
+            except Exception as exc:
+                scanner_progress.symbol_finished(symbol, error=str(exc)[:250])
+                raise
 
         results_raw = await asyncio.gather(
             *(analyze(t) for t in selected),
@@ -133,13 +142,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "relative_volume": score["metrics"]["relative_volume"],
                     "atr_pct": score["metrics"]["atr_pct"],
                     "btc_trend": score["metrics"]["btc_trend"],
-                    "raw_data": json.dumps(
-                        {
-                            "score": score,
-                            "ticker": ticker,
-                            "btc_context": btc_context,
-                        }
-                    ),
+                    "raw_data": json.dumps({"score": score, "ticker": ticker, "btc_context": btc_context}),
                 },
             )
 
@@ -187,10 +190,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "expected_move_max_pct": score["expected_move_max_pct"],
                     "expected_duration_min_minutes": score["expected_duration_min_minutes"],
                     "expected_duration_max_minutes": score["expected_duration_max_minutes"],
-                    "reason": json.dumps({
-                        "metrics": score["metrics"],
-                        "components": score["components"],
-                    }),
+                    "reason": json.dumps({"metrics": score["metrics"], "components": score["components"]}),
                 },
             )
 
@@ -236,13 +236,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 },
             )
 
-            ranked.append(
-                {
-                    "symbol": symbol,
-                    "change_24h_pct": float(ticker.get("priceChangePercent", 0) or 0),
-                    **score,
-                }
-            )
+            ranked.append({"symbol": symbol, "change_24h_pct": float(ticker.get("priceChangePercent", 0) or 0), **score})
 
         ranked.sort(key=lambda x: (x["setup_score"], -x["risk_score"]), reverse=True)
         candidates = [x for x in ranked if x["state"] != "NO_TRADE"]
@@ -256,13 +250,10 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 WHERE id = :id
                 """
             ),
-            {
-                "id": run_id,
-                "symbols_scanned": len(selected),
-                "candidates_found": len(candidates),
-            },
+            {"id": run_id, "symbols_scanned": len(selected), "candidates_found": len(candidates)},
         )
         await db.commit()
+        scanner_progress.finish("completed")
 
         return {
             "run_id": run_id,
@@ -273,11 +264,10 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             "top": ranked[:10],
         }
     except Exception as exc:
+        scanner_progress.finish("failed")
         await db.rollback()
         await db.execute(
-            text(
-                "UPDATE scanner_runs SET finished_at = NOW(), status = 'failed', error_message = :error WHERE id = :id"
-            ),
+            text("UPDATE scanner_runs SET finished_at = NOW(), status = 'failed', error_message = :error WHERE id = :id"),
             {"id": run_id, "error": str(exc)[:2000]},
         )
         await db.commit()
