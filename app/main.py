@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import check_database, get_db
 from app.services.binance import binance_client
+from app.services.market_context import market_context
+from app.services.news_context import news_context_for_symbol
 from app.services.opportunities import calibration_by_score, ranked_opportunities
 from app.services.paper_trading import (
     manage_open_paper_trades,
@@ -29,7 +31,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.4.0",
+    version="0.5.0",
     description="ExplodeX early LONG/SHORT scanner for Binance USDT-M Futures",
     lifespan=lifespan,
 )
@@ -39,7 +41,7 @@ app = FastAPI(
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.4.0",
+        "version": "0.5.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "message": "ExplodeX backend online",
@@ -60,6 +62,22 @@ async def health():
 @app.get("/api/v1/runtime/status")
 async def runtime_status():
     return runtime_state.as_dict()
+
+
+@app.get("/api/v1/market/context")
+async def broad_market_context():
+    try:
+        return await market_context()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Market context failed: {exc}") from exc
+
+
+@app.get("/api/v1/news/{symbol}")
+async def symbol_news(symbol: str):
+    try:
+        return await news_context_for_symbol(symbol)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"News context failed: {exc}") from exc
 
 
 @app.get("/api/v1/market/price/{symbol}")
