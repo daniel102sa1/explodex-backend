@@ -1,0 +1,24 @@
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    app_name: str = "ExplodeX Backend"
+    app_env: str = "development"
+    database_url: str
+    binance_futures_base_url: str = "https://fapi.binance.com"
+    scanner_min_quote_volume_usdt: float = 10_000_000
+    scanner_max_symbols: int = 80
+    scanner_min_setup_score: float = 80
+    scanner_max_risk_score: float = 35
+    paper_trading_only: bool = True
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
