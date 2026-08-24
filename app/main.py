@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,9 +33,20 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.6.0",
+    version="0.6.1",
     description="ExplodeX early LONG/SHORT scanner for Binance USDT-M Futures",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://explodex-web.vercel.app",
+        "http://localhost:3000",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 
@@ -42,7 +54,7 @@ app = FastAPI(
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.6.0",
+        "version": "0.6.1",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "message": "ExplodeX backend online",
