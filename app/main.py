@@ -19,6 +19,7 @@ from app.services.paper_trading import (
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
 from app.services.scanner_progress import scanner_progress
+from app.services.scoring import build_btc_context, score_snapshot
 
 
 @asynccontextmanager
@@ -33,8 +34,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.6.1",
-    description="ExplodeX early LONG/SHORT scanner for Binance USDT-M Futures",
+    version="0.8.0",
+    description="ExplodeX early LONG/SHORT scanner for USDT perpetual futures",
     lifespan=lifespan,
 )
 
@@ -50,13 +51,30 @@ app.add_middleware(
 )
 
 
+def _safe_symbol(symbol: str) -> str:
+    value = symbol.upper().strip()
+    if not value.endswith("USDT"):
+        value = f"{value}USDT"
+    if not value.replace("USDT", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    return value
+
+
+def _float(value, default: float = 0.0) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
 @app.get("/")
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.6.1",
+        "version": "0.8.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
+        "market_data_source": binance_client.active_source,
         "message": "ExplodeX backend online",
     }
 
@@ -69,23 +87,34 @@ async def health():
         "database": db_ok,
         "paper_trading_only": settings.paper_trading_only,
         "scheduler_enabled": settings.scheduler_enabled,
+        "market_data_source": binance_client.active_source,
+        "provider_warning": binance_client.last_primary_error,
     }
 
 
 @app.get("/api/v1/runtime/status")
 async def runtime_status():
-    return runtime_state.as_dict()
+    payload = runtime_state.as_dict()
+    payload["market_data_source"] = binance_client.active_source
+    payload["provider_warning"] = binance_client.last_primary_error
+    return payload
 
 
 @app.get("/api/v1/scanner/progress")
 async def scanner_live_progress():
-    return scanner_progress.as_dict()
+    payload = scanner_progress.as_dict()
+    payload["market_data_source"] = binance_client.active_source
+    payload["provider_warning"] = binance_client.last_primary_error
+    return payload
 
 
 @app.get("/api/v1/market/context")
 async def broad_market_context():
     try:
-        return await market_context()
+        payload = await market_context()
+        payload["market_data_source"] = binance_client.active_source
+        payload["provider_warning"] = binance_client.last_primary_error
+        return payload
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Market context failed: {exc}") from exc
 
@@ -93,7 +122,7 @@ async def broad_market_context():
 @app.get("/api/v1/news/{symbol}")
 async def symbol_news(symbol: str):
     try:
-        return await news_context_for_symbol(symbol)
+        return await news_context_for_symbol(_safe_symbol(symbol))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"News context failed: {exc}") from exc
 
@@ -101,9 +130,106 @@ async def symbol_news(symbol: str):
 @app.get("/api/v1/market/price/{symbol}")
 async def market_price(symbol: str):
     try:
-        return await binance_client.price(symbol)
+        payload = await binance_client.price(_safe_symbol(symbol))
+        payload["source"] = payload.get("source") or binance_client.active_source
+        return payload
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Binance error: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Market data error: {exc}") from exc
+
+
+@app.get("/api/v1/market/candles/{symbol}")
+async def market_candles(
+    symbol: str,
+    interval: str = Query(default="15m"),
+    limit: int = Query(default=120, ge=20, le=300),
+):
+    allowed = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"}
+    safe_interval = interval if interval in allowed else "15m"
+    safe_symbol = _safe_symbol(symbol)
+    try:
+        rows = await binance_client.klines(safe_symbol, safe_interval, limit)
+        candles = []
+        for row in rows:
+            if len(row) < 8:
+                continue
+            candles.append({
+                "time": int(row[0]),
+                "open": _float(row[1]),
+                "high": _float(row[2]),
+                "low": _float(row[3]),
+                "close": _float(row[4]),
+                "volume": _float(row[7]),
+            })
+        return {
+            "symbol": safe_symbol,
+            "interval": safe_interval,
+            "source": binance_client.active_source,
+            "provider_warning": binance_client.last_primary_error,
+            "candles": candles,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Candles unavailable: {exc}") from exc
+
+
+@app.get("/api/v1/analysis/{symbol}")
+async def live_symbol_analysis(symbol: str):
+    safe_symbol = _safe_symbol(symbol)
+    try:
+        snapshot, btc_klines = await __import__("asyncio").gather(
+            binance_client.deep_snapshot(safe_symbol),
+            binance_client.klines("BTCUSDT", interval="5m", limit=120),
+        )
+        btc_context = build_btc_context(btc_klines)
+        scored = score_snapshot(snapshot, btc_context=btc_context)
+
+        availability = {
+            "price_structure": bool(snapshot.get("klines")),
+            "multi_timeframe_15m": bool(snapshot.get("klines_15m")),
+            "multi_timeframe_1h": bool(snapshot.get("klines_1h")),
+            "open_interest_current": bool(snapshot.get("open_interest")),
+            "open_interest_history": bool(snapshot.get("open_interest_history")),
+            "taker_ratio": bool(snapshot.get("taker")),
+            "funding": bool(snapshot.get("premium")),
+            "global_long_short": bool(snapshot.get("long_short")),
+            "order_book": bool(snapshot.get("order_book", {}).get("bids") or snapshot.get("order_book", {}).get("asks")),
+            "futures_flow": bool(snapshot.get("agg_trades")),
+            "spot_flow": bool(snapshot.get("spot_agg_trades")),
+            "top_trader_accounts": bool(snapshot.get("top_long_short_accounts")),
+            "top_trader_positions": bool(snapshot.get("top_long_short_positions")),
+        }
+        full_inputs = all(availability.values())
+
+        return {
+            "symbol": safe_symbol,
+            "source": snapshot.get("source") or binance_client.active_source,
+            "provider_warning": snapshot.get("provider_warning") or binance_client.last_primary_error,
+            "data_quality": "FULL" if full_inputs else "LIMITED",
+            "availability": availability,
+            "current_open_interest": _float(snapshot.get("open_interest", {}).get("openInterest")),
+            "direction": scored["direction"],
+            "state": scored["state"],
+            "setup_score": scored["setup_score"],
+            "long_score": scored["long_score"],
+            "short_score": scored["short_score"],
+            "risk_score": scored["risk_score"],
+            "current_price": scored["current_price"],
+            "entry_low": scored["entry_low"],
+            "entry_high": scored["entry_high"],
+            "stop_loss": scored["stop_loss"],
+            "tp1": scored["tp1"],
+            "tp2": scored["tp2"],
+            "tp3": scored["tp3"],
+            "expected_move_min_pct": scored["expected_move_min_pct"],
+            "expected_move_max_pct": scored["expected_move_max_pct"],
+            "expected_duration_min_minutes": scored["expected_duration_min_minutes"],
+            "expected_duration_max_minutes": scored["expected_duration_max_minutes"],
+            "components": scored["components"],
+            "metrics": scored["metrics"],
+            "btc_context": btc_context,
+            "note": "Score is a setup-quality score, not a guaranteed probability of profit.",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Live analysis unavailable: {exc}") from exc
 
 
 @app.post("/api/v1/scanner/run")
