@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import httpx
@@ -9,16 +10,23 @@ from app.config import settings
 
 
 class BinancePublicClient:
+    """Primary Binance Futures market-data client with a transparent public fallback.
+
+    Railway can receive HTTP 451 from Binance depending on the egress region. In that
+    case we stop retrying Binance for a cooldown period and use OKX public USDT swap
+    market data instead. The fallback is clearly exposed through ``active_source`` so
+    the UI never pretends fallback data is Binance data.
+    """
+
     def __init__(self) -> None:
         primary = settings.binance_futures_base_url.rstrip("/")
-        futures_candidates = [
+        self.futures_bases = list(dict.fromkeys([
             primary,
             "https://fapi.binance.com",
             "https://fapi1.binance.com",
             "https://fapi2.binance.com",
             "https://fapi3.binance.com",
-        ]
-        self.futures_bases = list(dict.fromkeys(futures_candidates))
+        ]))
         self.spot_bases = [
             "https://api.binance.com",
             "https://api-gcp.binance.com",
@@ -28,11 +36,19 @@ class BinancePublicClient:
             "https://api4.binance.com",
             "https://data-api.binance.vision",
         ]
+        self.okx_bases = [
+            "https://www.okx.com",
+            "https://openapi.okx.com",
+        ]
         self._preferred_futures = 0
         self._preferred_spot = 0
+        self._preferred_okx = 0
+        self._binance_blocked_until = 0.0
+        self.active_source = "BINANCE_FUTURES"
+        self.last_primary_error: str | None = None
         self.headers = {
             "Accept": "application/json",
-            "User-Agent": "ExplodeX/0.7 market-data client",
+            "User-Agent": "ExplodeX/0.8 market-data client",
         }
 
     @staticmethod
@@ -42,6 +58,41 @@ class BinancePublicClient:
         preferred = max(0, min(preferred, len(values) - 1))
         order = list(range(preferred, len(values))) + list(range(0, preferred))
         return [(index, values[index]) for index in order]
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _okx_swap_id(symbol: str) -> str:
+        symbol = symbol.upper()
+        if not symbol.endswith("USDT"):
+            raise ValueError(f"Unsupported fallback symbol: {symbol}")
+        return f"{symbol[:-4]}-USDT-SWAP"
+
+    @staticmethod
+    def _okx_spot_id(symbol: str) -> str:
+        symbol = symbol.upper()
+        if not symbol.endswith("USDT"):
+            raise ValueError(f"Unsupported fallback symbol: {symbol}")
+        return f"{symbol[:-4]}-USDT"
+
+    @staticmethod
+    def _okx_symbol(inst_id: str) -> str | None:
+        if not inst_id.endswith("-USDT-SWAP"):
+            return None
+        return inst_id.removesuffix("-USDT-SWAP").replace("-", "") + "USDT"
+
+    def _binance_available(self) -> bool:
+        return time.monotonic() >= self._binance_blocked_until
+
+    def _mark_binance_blocked(self, error: Exception) -> None:
+        self.last_primary_error = str(error)[:1000]
+        self._binance_blocked_until = time.monotonic() + 1800
+        self.active_source = "OKX_FALLBACK"
 
     async def _request_with_failover(
         self,
@@ -57,24 +108,25 @@ class BinancePublicClient:
 
         async with httpx.AsyncClient(timeout=timeout, headers=self.headers, follow_redirects=True) as client:
             for index, base in self._rotated(bases, preferred):
-                url = f"{base}{path}"
                 try:
-                    response = await client.get(url, params=params)
+                    response = await client.get(f"{base}{path}", params=params)
+                    if response.status_code == 451:
+                        raise RuntimeError(f"HTTP 451 regional restriction from {base}")
                     response.raise_for_status()
+                    try:
+                        payload = response.json()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Non-JSON response from {base} ({response.status_code}): {response.text[:120]}"
+                        ) from exc
                     setattr(self, preferred_attr, index)
-                    return response.json()
+                    return payload
                 except Exception as exc:
-                    status = getattr(getattr(exc, "response", None), "status_code", None)
-                    detail = f"{base}"
-                    if status is not None:
-                        detail += f" HTTP {status}"
-                    detail += f" {type(exc).__name__}: {str(exc)[:140]}"
-                    errors.append(detail)
+                    errors.append(f"{base}: {type(exc).__name__}: {str(exc)[:180]}")
 
-        joined = " | ".join(errors[-5:])
-        raise RuntimeError(f"Binance endpoints unavailable for {path}. {joined}")
+        raise RuntimeError(f"All endpoints failed for {path}. {' | '.join(errors[-5:])}")
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    async def _binance_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return await self._request_with_failover(
             bases=self.futures_bases,
             preferred_attr="_preferred_futures",
@@ -83,7 +135,7 @@ class BinancePublicClient:
             timeout=12.0,
         )
 
-    async def _get_spot(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    async def _binance_spot_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return await self._request_with_failover(
             bases=self.spot_bases,
             preferred_attr="_preferred_spot",
@@ -92,75 +144,276 @@ class BinancePublicClient:
             timeout=10.0,
         )
 
+    async def _okx_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        payload = await self._request_with_failover(
+            bases=self.okx_bases,
+            preferred_attr="_preferred_okx",
+            path=path,
+            params=params,
+            timeout=12.0,
+        )
+        if not isinstance(payload, dict) or str(payload.get("code", "0")) != "0":
+            raise RuntimeError(f"OKX error for {path}: {payload}")
+        self.active_source = "OKX_FALLBACK"
+        return payload
+
+    async def _prefer_binance(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        if not self._binance_available():
+            raise RuntimeError("Binance temporarily disabled after regional/provider failure")
+        try:
+            value = await self._binance_get(path, params)
+            self.active_source = "BINANCE_FUTURES"
+            return value
+        except Exception as exc:
+            self._mark_binance_blocked(exc)
+            raise
+
     async def exchange_info(self) -> dict[str, Any]:
-        return await self._get("/fapi/v1/exchangeInfo")
+        if self._binance_available():
+            try:
+                return await self._prefer_binance("/fapi/v1/exchangeInfo")
+            except Exception:
+                pass
+        payload = await self._okx_get("/api/v5/public/instruments", {"instType": "SWAP"})
+        return {"symbols": payload.get("data", []), "source": "OKX_FALLBACK"}
 
     async def ticker_24h(self) -> list[dict[str, Any]]:
-        return await self._get("/fapi/v1/ticker/24hr")
+        if self._binance_available():
+            try:
+                return await self._prefer_binance("/fapi/v1/ticker/24hr")
+            except Exception:
+                pass
+
+        payload = await self._okx_get("/api/v5/market/tickers", {"instType": "SWAP"})
+        normalized: list[dict[str, Any]] = []
+        for item in payload.get("data", []):
+            symbol = self._okx_symbol(str(item.get("instId", "")))
+            if not symbol:
+                continue
+            last = self._safe_float(item.get("last"))
+            open24h = self._safe_float(item.get("open24h"))
+            if last <= 0:
+                continue
+            change = ((last - open24h) / open24h * 100) if open24h > 0 else 0.0
+            vol_ccy = self._safe_float(item.get("volCcy24h"))
+            quote_volume = abs(vol_ccy * last)
+            if quote_volume <= 0:
+                quote_volume = abs(self._safe_float(item.get("vol24h")) * last)
+            normalized.append({
+                "symbol": symbol,
+                "lastPrice": str(last),
+                "priceChangePercent": str(change),
+                "quoteVolume": str(quote_volume),
+                "volume": str(vol_ccy),
+                "source": "OKX_FALLBACK",
+            })
+        return normalized
 
     async def price(self, symbol: str) -> dict[str, Any]:
-        return await self._get("/fapi/v1/ticker/price", {"symbol": symbol.upper()})
+        if self._binance_available():
+            try:
+                return await self._prefer_binance("/fapi/v1/ticker/price", {"symbol": symbol.upper()})
+            except Exception:
+                pass
+        payload = await self._okx_get("/api/v5/market/ticker", {"instId": self._okx_swap_id(symbol)})
+        rows = payload.get("data", [])
+        if not rows:
+            raise RuntimeError(f"OKX ticker unavailable for {symbol}")
+        return {"symbol": symbol.upper(), "price": rows[0].get("last"), "source": "OKX_FALLBACK"}
 
     async def klines(self, symbol: str, interval: str = "5m", limit: int = 120) -> list[list[Any]]:
-        return await self._get(
-            "/fapi/v1/klines",
-            {"symbol": symbol.upper(), "interval": interval, "limit": limit},
+        if self._binance_available():
+            try:
+                return await self._prefer_binance(
+                    "/fapi/v1/klines",
+                    {"symbol": symbol.upper(), "interval": interval, "limit": limit},
+                )
+            except Exception:
+                pass
+
+        bar_map = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1D"}
+        bar = bar_map.get(interval, interval)
+        payload = await self._okx_get(
+            "/api/v5/market/candles",
+            {"instId": self._okx_swap_id(symbol), "bar": bar, "limit": min(max(limit, 1), 300)},
         )
+        rows = list(reversed(payload.get("data", [])))
+        output: list[list[Any]] = []
+        for row in rows:
+            if len(row) < 5:
+                continue
+            ts = int(row[0])
+            quote_volume = row[7] if len(row) > 7 else (row[6] if len(row) > 6 else "0")
+            output.append([
+                ts,
+                row[1], row[2], row[3], row[4],
+                row[5] if len(row) > 5 else "0",
+                ts + 1,
+                quote_volume,
+                0, 0, 0, 0,
+            ])
+        return output
 
     async def order_book(self, symbol: str, limit: int = 20) -> dict[str, Any]:
-        safe_limit = limit if limit in {5, 10, 20, 50, 100, 500, 1000} else 20
-        return await self._get(
-            "/fapi/v1/depth",
-            {"symbol": symbol.upper(), "limit": safe_limit},
+        if self._binance_available():
+            try:
+                safe_limit = limit if limit in {5, 10, 20, 50, 100, 500, 1000} else 20
+                return await self._prefer_binance("/fapi/v1/depth", {"symbol": symbol.upper(), "limit": safe_limit})
+            except Exception:
+                pass
+        payload = await self._okx_get(
+            "/api/v5/market/books",
+            {"instId": self._okx_swap_id(symbol), "sz": min(max(limit, 1), 400)},
         )
+        rows = payload.get("data", [])
+        row = rows[0] if rows else {}
+        return {
+            "bids": [[x[0], x[1]] for x in row.get("bids", []) if len(x) >= 2],
+            "asks": [[x[0], x[1]] for x in row.get("asks", []) if len(x) >= 2],
+            "source": "OKX_FALLBACK",
+        }
 
     async def agg_trades(self, symbol: str, limit: int = 250) -> list[dict[str, Any]]:
-        return await self._get(
-            "/fapi/v1/aggTrades",
-            {"symbol": symbol.upper(), "limit": max(20, min(limit, 1000))},
+        if self._binance_available():
+            try:
+                return await self._prefer_binance(
+                    "/fapi/v1/aggTrades",
+                    {"symbol": symbol.upper(), "limit": max(20, min(limit, 1000))},
+                )
+            except Exception:
+                pass
+        payload = await self._okx_get(
+            "/api/v5/market/trades",
+            {"instId": self._okx_swap_id(symbol), "limit": min(max(limit, 20), 500)},
         )
+        return [
+            {
+                "p": item.get("px", "0"),
+                "q": item.get("sz", "0"),
+                "m": str(item.get("side", "")).lower() == "sell",
+                "T": item.get("ts"),
+            }
+            for item in payload.get("data", [])
+        ]
 
     async def spot_agg_trades(self, symbol: str, limit: int = 250) -> list[dict[str, Any]]:
-        return await self._get_spot(
-            "/api/v3/aggTrades",
-            {"symbol": symbol.upper(), "limit": max(20, min(limit, 1000))},
-        )
+        if self._binance_available():
+            try:
+                return await self._binance_spot_get(
+                    "/api/v3/aggTrades",
+                    {"symbol": symbol.upper(), "limit": max(20, min(limit, 1000))},
+                )
+            except Exception:
+                pass
+        try:
+            payload = await self._okx_get(
+                "/api/v5/market/trades",
+                {"instId": self._okx_spot_id(symbol), "limit": min(max(limit, 20), 500)},
+            )
+        except Exception:
+            return []
+        return [
+            {
+                "p": item.get("px", "0"),
+                "q": item.get("sz", "0"),
+                "m": str(item.get("side", "")).lower() == "sell",
+                "T": item.get("ts"),
+            }
+            for item in payload.get("data", [])
+        ]
 
     async def open_interest(self, symbol: str) -> dict[str, Any]:
-        return await self._get("/fapi/v1/openInterest", {"symbol": symbol.upper()})
+        if self._binance_available():
+            try:
+                return await self._prefer_binance("/fapi/v1/openInterest", {"symbol": symbol.upper()})
+            except Exception:
+                pass
+        payload = await self._okx_get(
+            "/api/v5/public/open-interest",
+            {"instType": "SWAP", "instId": self._okx_swap_id(symbol)},
+        )
+        rows = payload.get("data", [])
+        value = 0.0
+        if rows:
+            value = self._safe_float(rows[0].get("oiCcy")) or self._safe_float(rows[0].get("oi"))
+        return {"symbol": symbol.upper(), "openInterest": str(value), "source": "OKX_FALLBACK"}
 
     async def open_interest_history(self, symbol: str, period: str = "5m", limit: int = 12) -> list[dict[str, Any]]:
-        return await self._get(
-            "/futures/data/openInterestHist",
-            {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
-        )
+        if self._binance_available():
+            try:
+                return await self._prefer_binance(
+                    "/futures/data/openInterestHist",
+                    {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
+                )
+            except Exception:
+                pass
+        # OKX's basic public OI endpoint is current-state. Do not fabricate history.
+        return []
 
     async def taker_ratio(self, symbol: str, period: str = "5m", limit: int = 8) -> list[dict[str, Any]]:
-        return await self._get(
-            "/futures/data/takerlongshortRatio",
-            {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
-        )
+        if self._binance_available():
+            try:
+                return await self._prefer_binance(
+                    "/futures/data/takerlongshortRatio",
+                    {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
+                )
+            except Exception:
+                pass
+        trades = await self.agg_trades(symbol, 250)
+        buy = 0.0
+        sell = 0.0
+        for trade in trades:
+            notional = self._safe_float(trade.get("p")) * self._safe_float(trade.get("q"))
+            if bool(trade.get("m", False)):
+                sell += notional
+            else:
+                buy += notional
+        ratio = buy / sell if sell > 0 else (9.99 if buy > 0 else 1.0)
+        return [{"buySellRatio": str(ratio), "source": "OKX_FALLBACK"}]
 
     async def premium_index(self, symbol: str) -> dict[str, Any]:
-        return await self._get("/fapi/v1/premiumIndex", {"symbol": symbol.upper()})
+        if self._binance_available():
+            try:
+                return await self._prefer_binance("/fapi/v1/premiumIndex", {"symbol": symbol.upper()})
+            except Exception:
+                pass
+        payload = await self._okx_get("/api/v5/public/funding-rate", {"instId": self._okx_swap_id(symbol)})
+        rows = payload.get("data", [])
+        funding = rows[0].get("fundingRate", "0") if rows else "0"
+        return {"symbol": symbol.upper(), "lastFundingRate": funding, "source": "OKX_FALLBACK"}
 
     async def long_short_ratio(self, symbol: str, period: str = "5m", limit: int = 8) -> list[dict[str, Any]]:
-        return await self._get(
-            "/futures/data/globalLongShortAccountRatio",
-            {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
-        )
+        if self._binance_available():
+            try:
+                return await self._prefer_binance(
+                    "/futures/data/globalLongShortAccountRatio",
+                    {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
+                )
+            except Exception:
+                pass
+        return []
 
     async def top_long_short_account_ratio(self, symbol: str, period: str = "5m", limit: int = 8) -> list[dict[str, Any]]:
-        return await self._get(
-            "/futures/data/topLongShortAccountRatio",
-            {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
-        )
+        if self._binance_available():
+            try:
+                return await self._prefer_binance(
+                    "/futures/data/topLongShortAccountRatio",
+                    {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
+                )
+            except Exception:
+                pass
+        return []
 
     async def top_long_short_position_ratio(self, symbol: str, period: str = "5m", limit: int = 8) -> list[dict[str, Any]]:
-        return await self._get(
-            "/futures/data/topLongShortPositionRatio",
-            {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
-        )
+        if self._binance_available():
+            try:
+                return await self._prefer_binance(
+                    "/futures/data/topLongShortPositionRatio",
+                    {"symbol": symbol.upper(), "period": period, "limit": max(2, min(limit, 500))},
+                )
+            except Exception:
+                pass
+        return []
 
     @staticmethod
     def _optional_value(value: Any, fallback: Any) -> Any:
@@ -192,6 +445,8 @@ class BinancePublicClient:
 
         return {
             "symbol": symbol,
+            "source": self.active_source,
+            "provider_warning": self.last_primary_error if self.active_source != "BINANCE_FUTURES" else None,
             "klines": klines,
             "klines_15m": self._optional_value(klines_15m, []),
             "klines_1h": self._optional_value(klines_1h, []),
