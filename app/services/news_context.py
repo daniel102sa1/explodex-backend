@@ -16,17 +16,29 @@ _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _CACHE_LOCK = asyncio.Lock()
 
 POSITIVE_WORDS = {
+    # English (kept because some international sources can still appear).
     "approval", "approved", "adoption", "adopts", "adopted", "partnership",
     "partners", "launch", "launched", "upgrade", "growth", "surge", "record",
     "integration", "listing", "listed", "bullish", "rally", "breakout", "inflows",
     "investment", "invests", "expands", "expansion", "milestone", "success",
+    # Spanish.
+    "aprobacion", "aprobado", "adopcion", "alianza", "lanzamiento", "mejora",
+    "crecimiento", "subida", "sube", "record", "integracion", "listado", "alcista",
+    "rally", "ruptura", "entradas", "inversion", "expansion", "exito", "impulso",
+    "recuperacion", "acuerdo", "apoyo", "compras", "demanda",
 }
 
 NEGATIVE_WORDS = {
+    # English.
     "hack", "hacked", "exploit", "lawsuit", "delist", "delisted", "ban", "banned",
     "investigation", "outflow", "outflows", "crash", "plunge", "fraud", "scam",
     "breach", "shutdown", "bankruptcy", "liquidation", "liquidations", "bearish",
     "attack", "stolen", "theft", "warning", "probe", "fine", "fined",
+    # Spanish.
+    "hackeo", "hackeado", "ataque", "demanda", "retirada", "prohibicion",
+    "investigacion", "salidas", "caida", "desplome", "fraude", "estafa", "quiebra",
+    "liquidacion", "liquidaciones", "bajista", "robado", "robo", "advertencia",
+    "multa", "multado", "suspension", "riesgo", "ventas", "presion",
 }
 
 KNOWN_NAMES = {
@@ -65,12 +77,18 @@ def _query_for_symbol(symbol: str) -> str:
     base = _base_asset(symbol)
     name = KNOWN_NAMES.get(base)
     if name and name.upper() != base:
-        return f'"{name}" crypto OR "{base}" cryptocurrency'
-    return f'"{base}" cryptocurrency'
+        return f'"{name}" criptomoneda OR "{base}" cripto'
+    return f'"{base}" criptomoneda OR "{base}" cripto'
 
 
 def _tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-zA-Z]+", text.lower())
+    # Normalize common accented Spanish characters for the lightweight keyword score.
+    normalized = (
+        text.lower()
+        .replace("á", "a").replace("é", "e").replace("í", "i")
+        .replace("ó", "o").replace("ú", "u").replace("ü", "u")
+    )
+    return re.findall(r"[a-zA-Z]+", normalized)
 
 
 def _headline_score(title: str) -> int:
@@ -81,18 +99,20 @@ def _headline_score(title: str) -> int:
 
 
 async def _fetch_google_news_rss(query: str, timeout_seconds: float = 8.0) -> list[dict[str, str]]:
+    # Prefer Latin-American Spanish and Guatemala-localized Google News results.
     url = (
         "https://news.google.com/rss/search?"
-        f"q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+        f"q={quote_plus(query)}&hl=es-419&gl=GT&ceid=GT:es-419"
     )
-    headers = {"User-Agent": "ExplodeX/0.5 market research bot"}
+    headers = {"User-Agent": "ExplodeX/0.9 market research bot"}
     async with httpx.AsyncClient(timeout=timeout_seconds, headers=headers, follow_redirects=True) as client:
         response = await client.get(url)
         response.raise_for_status()
 
     root = ET.fromstring(response.text)
     output: list[dict[str, str]] = []
-    for item in root.findall("./channel/item")[: settings.news_max_headlines]:
+    seen_titles: set[str] = set()
+    for item in root.findall("./channel/item")[: settings.news_max_headlines * 2]:
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         published = (item.findtext("pubDate") or "").strip()
@@ -100,7 +120,9 @@ async def _fetch_google_news_rss(query: str, timeout_seconds: float = 8.0) -> li
         source_node = item.find("source")
         if source_node is not None and source_node.text:
             source = source_node.text.strip()
-        if title:
+        normalized_title = title.casefold()
+        if title and normalized_title not in seen_titles:
+            seen_titles.add(normalized_title)
             output.append(
                 {
                     "title": title,
@@ -109,6 +131,8 @@ async def _fetch_google_news_rss(query: str, timeout_seconds: float = 8.0) -> li
                     "source": source,
                 }
             )
+        if len(output) >= settings.news_max_headlines:
+            break
     return output
 
 
@@ -120,7 +144,7 @@ async def news_context_for_symbol(symbol: str) -> dict[str, Any]:
             "sentiment": "UNAVAILABLE",
             "score_adjustment": 0.0,
             "headlines": [],
-            "note": "News enrichment is disabled.",
+            "note": "El enriquecimiento de noticias está desactivado.",
         }
 
     cache_key = symbol.upper()
@@ -147,7 +171,7 @@ async def news_context_for_symbol(symbol: str) -> dict[str, Any]:
                 "headline_count": 0,
                 "headlines": [],
                 "error": str(exc)[:300],
-                "note": "News source unavailable; no score penalty or bonus applied.",
+                "note": "La fuente de noticias no está disponible; no se aplica premio ni penalización.",
             }
             _CACHE[cache_key] = (time.monotonic() + 120, value)
             return value
@@ -166,18 +190,18 @@ async def news_context_for_symbol(symbol: str) -> dict[str, Any]:
         else:
             sentiment = "NEUTRAL"
 
-        # News is deliberately capped. It may confirm/block a setup, not create one by itself.
         adjustment = max(-5.0, min(5.0, raw * 1.25))
 
         value = {
             "enabled": True,
             "symbol": cache_key,
+            "language": "es-419",
             "sentiment": sentiment,
             "raw_sentiment_score": raw,
             "score_adjustment": round(adjustment, 2),
             "headline_count": len(scored),
             "headlines": scored[:5],
-            "note": "Headline sentiment is a secondary filter, not a trade signal and not a certainty estimate.",
+            "note": "Las noticias son un filtro secundario; no generan una entrada por sí solas.",
         }
         _CACHE[cache_key] = (time.monotonic() + settings.news_cache_ttl_seconds, value)
         return value
