@@ -64,15 +64,35 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
     await db.commit()
 
     try:
-        tickers, btc_klines = await asyncio.gather(
+        # The tradable universe is mandatory. BTC context is useful but must never
+        # prevent the scanner from running by itself.
+        ticker_result, btc_result = await asyncio.gather(
             binance_client.ticker_24h(),
             binance_client.klines("BTCUSDT", interval="5m", limit=120),
+            return_exceptions=True,
         )
-        btc_context = build_btc_context(btc_klines)
+
+        if isinstance(ticker_result, Exception):
+            raise RuntimeError(f"Unable to load Binance Futures universe: {ticker_result}")
+        if not isinstance(ticker_result, list) or not ticker_result:
+            raise RuntimeError("Binance Futures returned an empty ticker universe")
+
+        tickers = ticker_result
+        startup_errors: list[str] = []
+        if isinstance(btc_result, Exception):
+            btc_context = {"trend": "NEUTRAL", "change_15m_pct": 0.0, "change_1h_pct": 0.0, "degraded": True}
+            startup_errors.append(f"BTC context unavailable: {str(btc_result)[:300]}")
+        else:
+            btc_context = build_btc_context(btc_result)
 
         universe = [t for t in tickers if _is_candidate_ticker(t)]
         universe.sort(key=lambda t: float(t.get("quoteVolume", 0) or 0), reverse=True)
         universe = universe[: settings.scanner_max_symbols]
+
+        if not universe:
+            raise RuntimeError(
+                f"Binance returned {len(tickers)} tickers but none passed the liquidity/filter rules"
+            )
 
         early = [
             t
@@ -80,7 +100,20 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             if abs(float(t.get("priceChangePercent", 0) or 0)) <= 6.0
         ]
         selected = early[: max(1, min(deep_limit, 40))]
-        scanner_progress.set_universe(len(universe), len(early), len(selected))
+
+        # If every liquid symbol is already outside the early-move filter, still
+        # analyze the least-expanded names instead of returning an empty scanner.
+        if not selected:
+            fallback = sorted(
+                universe,
+                key=lambda t: abs(float(t.get("priceChangePercent", 0) or 0)),
+            )
+            selected = fallback[: max(1, min(deep_limit, 40))]
+            startup_errors.append("No symbols passed the +/-6% early filter; using least-expanded liquid symbols as diagnostic fallback")
+
+        scanner_progress.set_universe(len(universe), len(early), len(selected), data_source="BINANCE_FUTURES")
+        for startup_error in startup_errors:
+            scanner_progress.errors.appendleft(startup_error)
 
         semaphore = asyncio.Semaphore(5)
 
@@ -94,21 +127,18 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 scanner_progress.symbol_finished(symbol, score=score)
                 return ticker, snapshot, score
             except Exception as exc:
-                scanner_progress.symbol_finished(symbol, error=str(exc)[:250])
-                raise
+                scanner_progress.symbol_finished(symbol, error=str(exc)[:500])
+                return exc
 
-        results_raw = await asyncio.gather(
-            *(analyze(t) for t in selected),
-            return_exceptions=True,
-        )
+        results_raw = await asyncio.gather(*(analyze(t) for t in selected))
 
         ranked: list[dict[str, Any]] = []
-        errors: list[str] = []
+        errors: list[str] = list(startup_errors)
         alerts_created = 0
 
         for item in results_raw:
             if isinstance(item, Exception):
-                errors.append(str(item)[:300])
+                errors.append(str(item)[:500])
                 continue
 
             ticker, snapshot, score = item
@@ -224,7 +254,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "btc_score": score["components"].get("btc"),
                     "absorption_score": score["components"].get("response"),
                     "volatility_score": score["components"].get("compression"),
-                    "liquidity_score": 10,
+                    "liquidity_score": score["components"].get("orderbook", 10),
                     "oi_change_pct": score["metrics"]["oi_change_pct"],
                     "taker_ratio": score["metrics"]["taker_avg_3"],
                     "funding_rate": score["metrics"]["funding_rate"],
@@ -251,31 +281,42 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
 
         ranked.sort(key=lambda x: (x["setup_score"], -x["risk_score"]), reverse=True)
         candidates = [x for x in ranked if x["state"] != "NO_TRADE"]
+        final_status = "completed" if ranked else "degraded"
 
         await db.execute(
             text(
                 """
                 UPDATE scanner_runs
                 SET finished_at = NOW(), symbols_scanned = :symbols_scanned,
-                    candidates_found = :candidates_found, status = 'completed'
+                    candidates_found = :candidates_found, status = :status,
+                    error_message = :error_message
                 WHERE id = :id
                 """
             ),
-            {"id": run_id, "symbols_scanned": len(selected), "candidates_found": len(candidates)},
+            {
+                "id": run_id,
+                "symbols_scanned": len(selected),
+                "candidates_found": len(candidates),
+                "status": final_status,
+                "error_message": " | ".join(errors[:5]) if errors else None,
+            },
         )
         await db.commit()
-        scanner_progress.finish("completed")
+        scanner_progress.finish(final_status)
 
         return {
             "run_id": run_id,
             "btc_context": btc_context,
             "symbols_scanned": len(selected),
+            "successful_analyses": len(ranked),
             "candidates_found": len(candidates),
             "alerts_created": alerts_created,
+            "status": final_status,
             "errors": errors[:5],
             "top": ranked[:10],
         }
     except Exception as exc:
+        scanner_progress.fatal_error(str(exc))
         scanner_progress.finish("failed")
         await db.rollback()
         await db.execute(
