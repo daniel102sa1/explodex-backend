@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.services.binance import binance_client
-from app.services.scoring import score_snapshot
+from app.services.scoring import build_btc_context, score_snapshot
 
 
 def _is_candidate_ticker(t: dict[str, Any]) -> bool:
@@ -59,15 +60,20 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
     await db.commit()
 
     try:
-        tickers = await binance_client.ticker_24h()
-        universe = [t for t in tickers if _is_candidate_ticker(t)]
+        tickers, btc_klines = await asyncio.gather(
+            binance_client.ticker_24h(),
+            binance_client.klines("BTCUSDT", interval="5m", limit=120),
+        )
+        btc_context = build_btc_context(btc_klines)
 
-        # Prefer liquid symbols that have not already moved excessively in 24h.
+        universe = [t for t in tickers if _is_candidate_ticker(t)]
         universe.sort(key=lambda t: float(t.get("quoteVolume", 0) or 0), reverse=True)
         universe = universe[: settings.scanner_max_symbols]
 
+        # Early detector: avoid coins that already exploded too much in either direction.
         early = [
-            t for t in universe
+            t
+            for t in universe
             if abs(float(t.get("priceChangePercent", 0) or 0)) <= 6.0
         ]
         selected = early[: max(1, min(deep_limit, 40))]
@@ -78,7 +84,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             async with semaphore:
                 symbol = ticker["symbol"]
                 snapshot = await binance_client.deep_snapshot(symbol)
-                score = score_snapshot(snapshot)
+                score = score_snapshot(snapshot, btc_context=btc_context)
                 return ticker, snapshot, score
 
         results_raw = await asyncio.gather(
@@ -87,8 +93,11 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
         )
 
         ranked: list[dict[str, Any]] = []
+        errors: list[str] = []
+
         for item in results_raw:
             if isinstance(item, Exception):
+                errors.append(str(item)[:300])
                 continue
 
             ticker, snapshot, score = item
@@ -107,7 +116,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                         :symbol_id, NOW(), :price, :change_24h_pct, :volume_24h_usdt,
                         :open_interest, :oi_change_pct, :taker_ratio,
                         :funding_rate, :long_short_ratio, NULL, :relative_volume,
-                        NULL, NULL, CAST(:raw_data AS JSONB)
+                        :atr_pct, :btc_trend, CAST(:raw_data AS JSONB)
                     )
                     """
                 ),
@@ -122,7 +131,15 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "funding_rate": score["metrics"]["funding_rate"],
                     "long_short_ratio": float((snapshot.get("long_short") or [{}])[-1].get("longShortRatio", 0) or 0),
                     "relative_volume": score["metrics"]["relative_volume"],
-                    "raw_data": __import__("json").dumps({"score": score, "ticker": ticker}),
+                    "atr_pct": score["metrics"]["atr_pct"],
+                    "btc_trend": score["metrics"]["btc_trend"],
+                    "raw_data": json.dumps(
+                        {
+                            "score": score,
+                            "ticker": ticker,
+                            "btc_context": btc_context,
+                        }
+                    ),
                 },
             )
 
@@ -134,12 +151,18 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                         id, symbol_id, scanner_run_id, direction, state, setup_type,
                         timeframe, setup_score, risk_score, confidence_pct,
                         current_price, entry_low, entry_high, invalidation_price,
-                        stop_loss, tp1, tp2, tp3, reason, is_active
+                        stop_loss, tp1, tp2, tp3,
+                        expected_move_min_pct, expected_move_max_pct,
+                        expected_duration_min_minutes, expected_duration_max_minutes,
+                        reason, is_active
                     ) VALUES (
                         :id, :symbol_id, :scanner_run_id, :direction, :state, :setup_type,
                         '5m', :setup_score, :risk_score, :confidence_pct,
                         :current_price, :entry_low, :entry_high, :stop_loss,
-                        :stop_loss, :tp1, :tp2, :tp3, :reason, TRUE
+                        :stop_loss, :tp1, :tp2, :tp3,
+                        :expected_move_min_pct, :expected_move_max_pct,
+                        :expected_duration_min_minutes, :expected_duration_max_minutes,
+                        :reason, TRUE
                     )
                     """
                 ),
@@ -152,7 +175,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "setup_type": "early_expansion",
                     "setup_score": score["setup_score"],
                     "risk_score": score["risk_score"],
-                    "confidence_pct": score["setup_score"],
+                    "confidence_pct": score["confidence_pct"],
                     "current_price": score["current_price"],
                     "entry_low": score["entry_low"],
                     "entry_high": score["entry_high"],
@@ -160,7 +183,56 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "tp1": score["tp1"],
                     "tp2": score["tp2"],
                     "tp3": score["tp3"],
-                    "reason": __import__("json").dumps(score["metrics"]),
+                    "expected_move_min_pct": score["expected_move_min_pct"],
+                    "expected_move_max_pct": score["expected_move_max_pct"],
+                    "expected_duration_min_minutes": score["expected_duration_min_minutes"],
+                    "expected_duration_max_minutes": score["expected_duration_max_minutes"],
+                    "reason": json.dumps({
+                        "metrics": score["metrics"],
+                        "components": score["components"],
+                    }),
+                },
+            )
+
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO signal_metrics (
+                        signal_id, structure_score, oi_score, taker_score, volume_score,
+                        funding_score, btc_score, absorption_score, volatility_score,
+                        liquidity_score, oi_change_pct, taker_ratio, funding_rate,
+                        relative_volume, absorption_detected, breakout_confirmed,
+                        btc_filter_passed, notes
+                    ) VALUES (
+                        :signal_id, :structure_score, :oi_score, :taker_score, :volume_score,
+                        :funding_score, :btc_score, :absorption_score, :volatility_score,
+                        :liquidity_score, :oi_change_pct, :taker_ratio, :funding_rate,
+                        :relative_volume, :absorption_detected, FALSE,
+                        :btc_filter_passed, CAST(:notes AS JSONB)
+                    )
+                    """
+                ),
+                {
+                    "signal_id": signal_id,
+                    "structure_score": score["components"].get("structure"),
+                    "oi_score": score["components"].get("oi"),
+                    "taker_score": score["components"].get("taker"),
+                    "volume_score": score["components"].get("volume"),
+                    "funding_score": score["components"].get("funding"),
+                    "btc_score": score["components"].get("btc"),
+                    "absorption_score": score["components"].get("response"),
+                    "volatility_score": score["components"].get("compression"),
+                    "liquidity_score": 10,
+                    "oi_change_pct": score["metrics"]["oi_change_pct"],
+                    "taker_ratio": score["metrics"]["taker_avg_3"],
+                    "funding_rate": score["metrics"]["funding_rate"],
+                    "relative_volume": score["metrics"]["relative_volume"],
+                    "absorption_detected": score["metrics"]["absorption_conflict"],
+                    "btc_filter_passed": not (
+                        (score["direction"] == "LONG" and score["metrics"]["btc_trend"] == "BEARISH")
+                        or (score["direction"] == "SHORT" and score["metrics"]["btc_trend"] == "BULLISH")
+                    ),
+                    "notes": json.dumps(score["metrics"]),
                 },
             )
 
@@ -194,8 +266,10 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
 
         return {
             "run_id": run_id,
+            "btc_context": btc_context,
             "symbols_scanned": len(selected),
             "candidates_found": len(candidates),
+            "errors": errors[:5],
             "top": ranked[:10],
         }
     except Exception as exc:
