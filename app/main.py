@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database import check_database, get_db
+from app.database import check_database, ensure_runtime_schema, get_db
 from app.services.binance import binance_client
 from app.services.coinglass import coinglass_client
 from app.services.coinglass_confirmation import apply_coinglass_confirmation
@@ -26,6 +26,7 @@ from app.services.scoring import build_btc_context, score_snapshot
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await ensure_runtime_schema()
     tasks = await start_runtime()
     app.state.runtime_tasks = tasks
     try:
@@ -36,7 +37,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.11.0",
+    version="0.11.1",
     description=(
         "ExplodeX early LONG/SHORT scanner with multi-exchange confirmation, "
         "pre-move prediction and paper-only risk management"
@@ -112,7 +113,7 @@ def _gate_ready_with_prediction(scored: dict, prediction: dict) -> dict:
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.11.0",
+        "version": "0.11.1",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
