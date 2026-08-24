@@ -51,6 +51,7 @@ class ScannerProgress:
         if score:
             if score.get("state") != "NO_TRADE":
                 self.candidates_found += 1
+            metrics = score.get("metrics", {}) or {}
             self.recent_results.appendleft({
                 "symbol": symbol,
                 "direction": score.get("direction"),
@@ -58,6 +59,16 @@ class ScannerProgress:
                 "setup_score": score.get("setup_score"),
                 "risk_score": score.get("risk_score"),
                 "price": score.get("current_price"),
+                "confirmations": metrics.get("confirmations"),
+                "reject_reasons": metrics.get("reject_reasons", []),
+                "oi_change_pct": metrics.get("oi_change_pct"),
+                "taker_ratio": metrics.get("taker_avg_3"),
+                "relative_volume": metrics.get("relative_volume"),
+                "futures_delta_ratio": metrics.get("futures_delta_ratio"),
+                "spot_delta_ratio": metrics.get("spot_delta_ratio"),
+                "order_book_imbalance": metrics.get("order_book_imbalance"),
+                "trend_15m": metrics.get("trend_15m"),
+                "trend_1h": metrics.get("trend_1h"),
             })
 
     def finish(self, status: str = "completed") -> None:
