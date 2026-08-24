@@ -16,6 +16,12 @@ class Settings(BaseSettings):
 
     paper_trading_only: bool = True
 
+    # Optional contextual enrichment. News is deliberately secondary and capped.
+    news_enabled: bool = True
+    news_max_candidates: int = 8
+    news_max_headlines: int = 10
+    news_cache_ttl_seconds: int = 900
+
     # Automatic runtime loops. These values are deliberately conservative so
     # Railway usage and Binance API traffic remain controlled in v1.
     scheduler_enabled: bool = True
