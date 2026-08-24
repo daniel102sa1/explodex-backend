@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import check_database, get_db
 from app.services.binance import binance_client
+from app.services.coinglass import coinglass_client
+from app.services.coinglass_confirmation import apply_coinglass_confirmation
 from app.services.market_context import market_context
 from app.services.news_context import news_context_for_symbol
 from app.services.opportunities import calibration_by_score, ranked_opportunities
@@ -34,8 +37,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.8.0",
-    description="ExplodeX early LONG/SHORT scanner for USDT perpetual futures",
+    version="0.9.0",
+    description="ExplodeX early LONG/SHORT scanner with multi-exchange confirmation",
     lifespan=lifespan,
 )
 
@@ -71,10 +74,15 @@ def _float(value, default: float = 0.0) -> float:
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.8.0",
+        "version": "0.9.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
+        "coinglass": {
+            "enabled": settings.coinglass_enabled,
+            "configured": coinglass_client.configured,
+            "require_for_ready": settings.coinglass_require_for_ready,
+        },
         "message": "ExplodeX backend online",
     }
 
@@ -89,6 +97,7 @@ async def health():
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
         "provider_warning": binance_client.last_primary_error,
+        "coinglass": coinglass_client.status(),
     }
 
 
@@ -97,6 +106,7 @@ async def runtime_status():
     payload = runtime_state.as_dict()
     payload["market_data_source"] = binance_client.active_source
     payload["provider_warning"] = binance_client.last_primary_error
+    payload["coinglass"] = coinglass_client.status()
     return payload
 
 
@@ -105,7 +115,31 @@ async def scanner_live_progress():
     payload = scanner_progress.as_dict()
     payload["market_data_source"] = binance_client.active_source
     payload["provider_warning"] = binance_client.last_primary_error
+    payload["coinglass"] = coinglass_client.status()
     return payload
+
+
+@app.get("/api/v1/coinglass/status")
+async def coinglass_status(probe: bool = Query(default=False)):
+    # Never expose the API key. Probe performs one safe BTC OI request.
+    return await coinglass_client.status_probe() if probe else coinglass_client.status()
+
+
+@app.get("/api/v1/coinglass/{symbol}")
+async def coinglass_symbol(symbol: str):
+    safe_symbol = _safe_symbol(symbol)
+    try:
+        return await coinglass_client.enrich_symbol(safe_symbol)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"CoinGlass unavailable: {exc}") from exc
+
+
+@app.get("/api/v1/coinglass/{symbol}/heatmap")
+async def coinglass_heatmap(symbol: str, range_value: str = Query(default="24h")):
+    safe_symbol = _safe_symbol(symbol)
+    allowed = {"12h", "24h", "1d", "3d", "7d", "30d"}
+    safe_range = range_value if range_value in allowed else "24h"
+    return await coinglass_client.heatmap_summary(safe_symbol, safe_range)
 
 
 @app.get("/api/v1/market/context")
@@ -114,6 +148,7 @@ async def broad_market_context():
         payload = await market_context()
         payload["market_data_source"] = binance_client.active_source
         payload["provider_warning"] = binance_client.last_primary_error
+        payload["coinglass"] = coinglass_client.status()
         return payload
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Market context failed: {exc}") from exc
@@ -175,12 +210,15 @@ async def market_candles(
 async def live_symbol_analysis(symbol: str):
     safe_symbol = _safe_symbol(symbol)
     try:
-        snapshot, btc_klines = await __import__("asyncio").gather(
+        snapshot, btc_klines = await asyncio.gather(
             binance_client.deep_snapshot(safe_symbol),
             binance_client.klines("BTCUSDT", interval="5m", limit=120),
         )
         btc_context = build_btc_context(btc_klines)
-        scored = score_snapshot(snapshot, btc_context=btc_context)
+        local_scored = score_snapshot(snapshot, btc_context=btc_context)
+
+        cg = await coinglass_client.enrich_symbol(safe_symbol)
+        scored = apply_coinglass_confirmation(local_scored, cg)
 
         availability = {
             "price_structure": bool(snapshot.get("klines")),
@@ -196,22 +234,38 @@ async def live_symbol_analysis(symbol: str):
             "spot_flow": bool(snapshot.get("spot_agg_trades")),
             "top_trader_accounts": bool(snapshot.get("top_long_short_accounts")),
             "top_trader_positions": bool(snapshot.get("top_long_short_positions")),
+            "coinglass_aggregated_oi": bool(cg.get("open_interest", {}).get("available")),
+            "coinglass_aggregated_taker": bool(cg.get("taker", {}).get("available")),
+            "coinglass_funding": bool(cg.get("funding", {}).get("available")),
+            "coinglass_liquidations": bool(cg.get("liquidations", {}).get("available")),
         }
-        full_inputs = all(availability.values())
+        required = [
+            availability["price_structure"],
+            availability["multi_timeframe_15m"],
+            availability["multi_timeframe_1h"],
+            availability["order_book"],
+            availability["futures_flow"],
+            availability["coinglass_aggregated_oi"],
+            availability["coinglass_aggregated_taker"],
+        ]
+        data_quality = "FULL" if all(availability.values()) else ("TRADE_GRADE" if all(required) else "LIMITED")
 
         return {
             "symbol": safe_symbol,
             "source": snapshot.get("source") or binance_client.active_source,
             "provider_warning": snapshot.get("provider_warning") or binance_client.last_primary_error,
-            "data_quality": "FULL" if full_inputs else "LIMITED",
+            "data_quality": data_quality,
             "availability": availability,
+            "coinglass": cg,
             "current_open_interest": _float(snapshot.get("open_interest", {}).get("openInterest")),
             "direction": scored["direction"],
             "state": scored["state"],
             "setup_score": scored["setup_score"],
+            "local_setup_score_before_coinglass": local_scored["setup_score"],
             "long_score": scored["long_score"],
             "short_score": scored["short_score"],
             "risk_score": scored["risk_score"],
+            "local_risk_score_before_coinglass": local_scored["risk_score"],
             "current_price": scored["current_price"],
             "entry_low": scored["entry_low"],
             "entry_high": scored["entry_high"],
@@ -226,7 +280,12 @@ async def live_symbol_analysis(symbol: str):
             "components": scored["components"],
             "metrics": scored["metrics"],
             "btc_context": btc_context,
-            "note": "Score is a setup-quality score, not a guaranteed probability of profit.",
+            "risk_policy": {
+                "paper_only": settings.paper_trading_only,
+                "coinglass_required_for_ready": settings.coinglass_require_for_ready,
+                "score_is_probability": False,
+            },
+            "note": "Score is setup quality, not a guaranteed probability of profit.",
         }
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Live analysis unavailable: {exc}") from exc
