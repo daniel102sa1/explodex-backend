@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.10.0",
+    version="0.10.1",
     description="ExplodeX early LONG/SHORT scanner with multi-exchange confirmation and pre-move prediction",
     lifespan=lifespan,
 )
@@ -75,7 +75,7 @@ def _float(value, default: float = 0.0) -> float:
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.10.0",
+        "version": "0.10.1",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
@@ -224,9 +224,6 @@ async def live_symbol_analysis(symbol: str):
         scored = apply_coinglass_confirmation(local_scored, cg)
         prediction = build_pre_move_prediction(scored, snapshot, cg)
 
-        # READY is intentionally stricter than a high technical score. We only
-        # allow it when the pre-move sequence has actually activated and the plan
-        # is not already late/chasing. PREACTIVACION remains an early warning.
         if scored.get("state") == "READY" and prediction.get("phase") != "ACTIVADO":
             scored = dict(scored)
             scored["state"] = "PREPARING"
@@ -376,3 +373,93 @@ async def opportunities(
 @app.get("/api/v1/calibration")
 async def calibration(db: AsyncSession = Depends(get_db)):
     return await calibration_by_score(db)
+
+
+@app.post("/api/v1/paper/sync")
+async def paper_sync(db: AsyncSession = Depends(get_db)):
+    try:
+        return await sync_ready_signals(db)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Paper sync failed: {exc}") from exc
+
+
+@app.post("/api/v1/paper/manage")
+async def paper_manage(db: AsyncSession = Depends(get_db)):
+    try:
+        return await manage_open_paper_trades(db)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Paper manager failed: {exc}") from exc
+
+
+@app.get("/api/v1/paper/open")
+async def paper_open(
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            """
+            SELECT t.id::text, sy.symbol, t.direction, t.status, t.leverage,
+                   t.risk_pct, t.entry_price, t.quantity, t.notional_usdt,
+                   t.stop_loss, t.tp1, t.tp2, t.tp3, t.opened_at,
+                   t.pnl_usdt, t.r_multiple, t.metadata
+            FROM trades t
+            JOIN symbols sy ON sy.id = t.symbol_id
+            WHERE t.mode = 'PAPER' AND t.status IN ('OPEN','PARTIAL')
+            ORDER BY t.opened_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+@app.get("/api/v1/paper/history")
+async def paper_history(
+    limit: int = Query(default=50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            """
+            SELECT t.id::text, sy.symbol, t.direction, t.status,
+                   t.entry_price, t.exit_price, t.stop_loss, t.tp1, t.tp2, t.tp3,
+                   t.opened_at, t.closed_at, t.pnl_usdt, t.pnl_pct,
+                   t.r_multiple, t.fees_usdt, t.close_reason
+            FROM trades t
+            JOIN symbols sy ON sy.id = t.symbol_id
+            WHERE t.mode = 'PAPER' AND t.status IN ('CLOSED','STOPPED')
+            ORDER BY t.closed_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+@app.get("/api/v1/paper/performance")
+async def paper_stats(db: AsyncSession = Depends(get_db)):
+    return await paper_performance(db)
+
+
+@app.get("/api/v1/alerts/pending")
+async def pending_alerts(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        text(
+            """
+            SELECT id::text, signal_id::text, trade_id::text, created_at,
+                   channel, severity, title, message
+            FROM alerts
+            WHERE is_sent = FALSE
+            ORDER BY created_at ASC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    return [dict(row) for row in result.mappings().all()]
