@@ -10,20 +10,87 @@ from app.config import settings
 
 class BinancePublicClient:
     def __init__(self) -> None:
-        self.base_url = settings.binance_futures_base_url.rstrip("/")
-        self.spot_base_url = "https://api.binance.com"
+        primary = settings.binance_futures_base_url.rstrip("/")
+        futures_candidates = [
+            primary,
+            "https://fapi.binance.com",
+            "https://fapi1.binance.com",
+            "https://fapi2.binance.com",
+            "https://fapi3.binance.com",
+        ]
+        self.futures_bases = list(dict.fromkeys(futures_candidates))
+        self.spot_bases = [
+            "https://api.binance.com",
+            "https://api-gcp.binance.com",
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            "https://api3.binance.com",
+            "https://api4.binance.com",
+            "https://data-api.binance.vision",
+        ]
+        self._preferred_futures = 0
+        self._preferred_spot = 0
+        self.headers = {
+            "Accept": "application/json",
+            "User-Agent": "ExplodeX/0.7 market-data client",
+        }
+
+    @staticmethod
+    def _rotated(values: list[str], preferred: int) -> list[tuple[int, str]]:
+        if not values:
+            return []
+        preferred = max(0, min(preferred, len(values) - 1))
+        order = list(range(preferred, len(values))) + list(range(0, preferred))
+        return [(index, values[index]) for index in order]
+
+    async def _request_with_failover(
+        self,
+        *,
+        bases: list[str],
+        preferred_attr: str,
+        path: str,
+        params: dict[str, Any] | None,
+        timeout: float,
+    ) -> Any:
+        preferred = int(getattr(self, preferred_attr))
+        errors: list[str] = []
+
+        async with httpx.AsyncClient(timeout=timeout, headers=self.headers, follow_redirects=True) as client:
+            for index, base in self._rotated(bases, preferred):
+                url = f"{base}{path}"
+                try:
+                    response = await client.get(url, params=params)
+                    response.raise_for_status()
+                    setattr(self, preferred_attr, index)
+                    return response.json()
+                except Exception as exc:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    detail = f"{base}"
+                    if status is not None:
+                        detail += f" HTTP {status}"
+                    detail += f" {type(exc).__name__}: {str(exc)[:140]}"
+                    errors.append(detail)
+
+        joined = " | ".join(errors[-5:])
+        raise RuntimeError(f"Binance endpoints unavailable for {path}. {joined}")
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            response = await client.get(f"{self.base_url}{path}", params=params)
-            response.raise_for_status()
-            return response.json()
+        return await self._request_with_failover(
+            bases=self.futures_bases,
+            preferred_attr="_preferred_futures",
+            path=path,
+            params=params,
+            timeout=12.0,
+        )
 
     async def _get_spot(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{self.spot_base_url}{path}", params=params)
-            response.raise_for_status()
-            return response.json()
+        return await self._request_with_failover(
+            bases=self.spot_bases,
+            preferred_attr="_preferred_spot",
+            path=path,
+            params=params,
+            timeout=10.0,
+        )
 
     async def exchange_info(self) -> dict[str, Any]:
         return await self._get("/fapi/v1/exchangeInfo")
@@ -102,7 +169,6 @@ class BinancePublicClient:
     async def deep_snapshot(self, symbol: str) -> dict[str, Any]:
         symbol = symbol.upper()
 
-        # Core inputs are required for a valid signal.
         klines, oi, oi_hist, taker, premium, long_short = await asyncio.gather(
             self.klines(symbol, "5m", 120),
             self.open_interest(symbol),
@@ -112,7 +178,6 @@ class BinancePublicClient:
             self.long_short_ratio(symbol, "5m", 8),
         )
 
-        # Enrichment is intentionally optional: one provider endpoint must not kill a scan.
         extras = await asyncio.gather(
             self.klines(symbol, "15m", 80),
             self.klines(symbol, "1h", 80),
