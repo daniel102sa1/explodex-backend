@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.services.binance import binance_client
+from app.services.coinglass import coinglass_client
+from app.services.coinglass_confirmation import apply_coinglass_confirmation
 from app.services.scanner_progress import scanner_progress
 from app.services.scoring import build_btc_context, score_snapshot
 from app.services.signal_alerts import create_signal_alert
@@ -64,8 +66,6 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
     await db.commit()
 
     try:
-        # The tradable universe is mandatory. BTC context is useful but must never
-        # prevent the scanner from running by itself.
         ticker_result, btc_result = await asyncio.gather(
             binance_client.ticker_24h(),
             binance_client.klines("BTCUSDT", interval="5m", limit=120),
@@ -73,14 +73,19 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
         )
 
         if isinstance(ticker_result, Exception):
-            raise RuntimeError(f"Unable to load Binance Futures universe: {ticker_result}")
+            raise RuntimeError(f"Unable to load market universe: {ticker_result}")
         if not isinstance(ticker_result, list) or not ticker_result:
-            raise RuntimeError("Binance Futures returned an empty ticker universe")
+            raise RuntimeError("Market provider returned an empty ticker universe")
 
         tickers = ticker_result
         startup_errors: list[str] = []
         if isinstance(btc_result, Exception):
-            btc_context = {"trend": "NEUTRAL", "change_15m_pct": 0.0, "change_1h_pct": 0.0, "degraded": True}
+            btc_context = {
+                "trend": "NEUTRAL",
+                "change_15m_pct": 0.0,
+                "change_1h_pct": 0.0,
+                "degraded": True,
+            }
             startup_errors.append(f"BTC context unavailable: {str(btc_result)[:300]}")
         else:
             btc_context = build_btc_context(btc_result)
@@ -91,7 +96,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
 
         if not universe:
             raise RuntimeError(
-                f"Binance returned {len(tickers)} tickers but none passed the liquidity/filter rules"
+                f"Provider returned {len(tickers)} tickers but none passed liquidity/filter rules"
             )
 
         early = [
@@ -100,51 +105,116 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             if abs(float(t.get("priceChangePercent", 0) or 0)) <= 6.0
         ]
         selected = early[: max(1, min(deep_limit, 40))]
-
-        # If every liquid symbol is already outside the early-move filter, still
-        # analyze the least-expanded names instead of returning an empty scanner.
         if not selected:
-            fallback = sorted(
+            selected = sorted(
                 universe,
                 key=lambda t: abs(float(t.get("priceChangePercent", 0) or 0)),
+            )[: max(1, min(deep_limit, 40))]
+            startup_errors.append(
+                "No symbols passed the +/-6% early filter; using least-expanded liquid symbols as diagnostic fallback"
             )
-            selected = fallback[: max(1, min(deep_limit, 40))]
-            startup_errors.append("No symbols passed the +/-6% early filter; using least-expanded liquid symbols as diagnostic fallback")
 
-        scanner_progress.set_universe(len(universe), len(early), len(selected), data_source="BINANCE_FUTURES")
+        scanner_progress.set_universe(
+            len(universe),
+            len(early),
+            len(selected),
+            data_source=binance_client.active_source,
+        )
         for startup_error in startup_errors:
             scanner_progress.errors.appendleft(startup_error)
 
         semaphore = asyncio.Semaphore(5)
 
-        async def analyze(ticker: dict[str, Any]):
+        async def analyze_local(ticker: dict[str, Any]):
             symbol = ticker["symbol"]
             scanner_progress.symbol_started(symbol)
             try:
                 async with semaphore:
                     snapshot = await binance_client.deep_snapshot(symbol)
                     score = score_snapshot(snapshot, btc_context=btc_context)
-                scanner_progress.symbol_finished(symbol, score=score)
                 return ticker, snapshot, score
             except Exception as exc:
                 scanner_progress.symbol_finished(symbol, error=str(exc)[:500])
                 return exc
 
-        results_raw = await asyncio.gather(*(analyze(t) for t in selected))
+        local_results = await asyncio.gather(*(analyze_local(t) for t in selected))
+        successful = [item for item in local_results if not isinstance(item, Exception)]
+        errors: list[str] = list(startup_errors)
+        errors.extend(str(item)[:500] for item in local_results if isinstance(item, Exception))
+
+        # CoinGlass is intentionally reserved for the strongest local setups. The
+        # Hobbyist plan is 30 req/min and a confirmation bundle may use several
+        # cached endpoints, so querying every scanned symbol would be wasteful.
+        successful.sort(key=lambda item: float(item[2].get("setup_score", 0)), reverse=True)
+        cg_limit = max(0, min(settings.coinglass_max_scanner_candidates, len(successful)))
+        cg_targets = [item for item in successful[:cg_limit] if float(item[2].get("setup_score", 0)) >= 64]
+        cg_scores: dict[str, dict[str, Any]] = {}
+        cg_errors: list[str] = []
+
+        if coinglass_client.configured and cg_targets:
+            cg_sem = asyncio.Semaphore(2)
+
+            async def confirm(item: tuple[dict[str, Any], dict[str, Any], dict[str, Any]]):
+                ticker, _snapshot, local_score = item
+                symbol = ticker["symbol"]
+                try:
+                    async with cg_sem:
+                        cg = await coinglass_client.enrich_symbol(symbol)
+                    cg_scores[symbol] = apply_coinglass_confirmation(local_score, cg)
+                except Exception as exc:
+                    cg_errors.append(f"{symbol}: {str(exc)[:400]}")
+                    fallback = dict(local_score)
+                    fallback["coinglass"] = {
+                        "available": False,
+                        "configured": True,
+                        "errors": [str(exc)[:400]],
+                    }
+                    if settings.coinglass_require_for_ready and fallback.get("state") == "READY":
+                        fallback["state"] = "PREPARING"
+                        metrics = dict(fallback.get("metrics") or {})
+                        rejects = list(metrics.get("reject_reasons") or [])
+                        if "coinglass_unavailable_for_ready" not in rejects:
+                            rejects.append("coinglass_unavailable_for_ready")
+                        metrics["reject_reasons"] = rejects
+                        metrics["coinglass_available"] = False
+                        fallback["metrics"] = metrics
+                    cg_scores[symbol] = fallback
+
+            await asyncio.gather(*(confirm(item) for item in cg_targets))
+        elif not coinglass_client.configured:
+            startup_errors.append("CoinGlass not configured; READY cannot use multi-exchange confirmation")
 
         ranked: list[dict[str, Any]] = []
-        errors: list[str] = list(startup_errors)
         alerts_created = 0
+        coinglass_enriched = 0
 
-        for item in results_raw:
-            if isinstance(item, Exception):
-                errors.append(str(item)[:500])
-                continue
-
-            ticker, snapshot, score = item
+        for ticker, snapshot, local_score in successful:
             symbol = ticker["symbol"]
+            score = cg_scores.get(symbol, local_score)
+            if symbol in cg_scores:
+                coinglass_enriched += 1
+            elif settings.coinglass_require_for_ready and score.get("state") == "READY":
+                score = dict(score)
+                score["state"] = "PREPARING"
+                metrics = dict(score.get("metrics") or {})
+                rejects = list(metrics.get("reject_reasons") or [])
+                if "coinglass_not_checked" not in rejects:
+                    rejects.append("coinglass_not_checked")
+                metrics["reject_reasons"] = rejects
+                metrics["coinglass_available"] = False
+                score["metrics"] = metrics
+
+            scanner_progress.symbol_finished(symbol, score=score)
             symbol_id = await _ensure_symbol(db, symbol)
 
+            raw_bundle = {
+                "score": score,
+                "local_score_before_coinglass": local_score,
+                "ticker": ticker,
+                "btc_context": btc_context,
+                "market_data_source": snapshot.get("source") or binance_client.active_source,
+                "coinglass": score.get("coinglass"),
+            }
             await db.execute(
                 text(
                     """
@@ -167,18 +237,25 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "change_24h_pct": float(ticker.get("priceChangePercent", 0) or 0),
                     "volume_24h_usdt": float(ticker.get("quoteVolume", 0) or 0),
                     "open_interest": float(snapshot.get("open_interest", {}).get("openInterest", 0) or 0),
-                    "oi_change_pct": score["metrics"]["oi_change_pct"],
-                    "taker_ratio": score["metrics"]["taker_avg_3"],
-                    "funding_rate": score["metrics"]["funding_rate"],
+                    "oi_change_pct": score["metrics"].get("oi_change_pct", 0),
+                    "taker_ratio": score["metrics"].get("taker_avg_3", 1),
+                    "funding_rate": score["metrics"].get("funding_rate", 0),
                     "long_short_ratio": float((snapshot.get("long_short") or [{}])[-1].get("longShortRatio", 0) or 0),
-                    "relative_volume": score["metrics"]["relative_volume"],
-                    "atr_pct": score["metrics"]["atr_pct"],
-                    "btc_trend": score["metrics"]["btc_trend"],
-                    "raw_data": json.dumps({"score": score, "ticker": ticker, "btc_context": btc_context}),
+                    "relative_volume": score["metrics"].get("relative_volume", 1),
+                    "atr_pct": score["metrics"].get("atr_pct", 0),
+                    "btc_trend": score["metrics"].get("btc_trend", "NEUTRAL"),
+                    "raw_data": json.dumps(raw_bundle),
                 },
             )
 
             signal_id = str(uuid.uuid4())
+            reason_bundle = {
+                "metrics": score["metrics"],
+                "components": score["components"],
+                "coinglass": score.get("coinglass"),
+                "local_setup_score_before_coinglass": local_score.get("setup_score"),
+                "local_risk_score_before_coinglass": local_score.get("risk_score"),
+            }
             await db.execute(
                 text(
                     """
@@ -210,7 +287,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "setup_type": "early_expansion",
                     "setup_score": score["setup_score"],
                     "risk_score": score["risk_score"],
-                    "confidence_pct": score["confidence_pct"],
+                    "confidence_pct": score.get("confidence_pct"),
                     "current_price": score["current_price"],
                     "entry_low": score["entry_low"],
                     "entry_high": score["entry_high"],
@@ -222,7 +299,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "expected_move_max_pct": score["expected_move_max_pct"],
                     "expected_duration_min_minutes": score["expected_duration_min_minutes"],
                     "expected_duration_max_minutes": score["expected_duration_max_minutes"],
-                    "reason": json.dumps({"metrics": score["metrics"], "components": score["components"]}),
+                    "reason": json.dumps(reason_bundle),
                 },
             )
 
@@ -255,14 +332,14 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "absorption_score": score["components"].get("response"),
                     "volatility_score": score["components"].get("compression"),
                     "liquidity_score": score["components"].get("orderbook", 10),
-                    "oi_change_pct": score["metrics"]["oi_change_pct"],
-                    "taker_ratio": score["metrics"]["taker_avg_3"],
-                    "funding_rate": score["metrics"]["funding_rate"],
-                    "relative_volume": score["metrics"]["relative_volume"],
-                    "absorption_detected": score["metrics"]["absorption_conflict"],
+                    "oi_change_pct": score["metrics"].get("oi_change_pct", 0),
+                    "taker_ratio": score["metrics"].get("taker_avg_3", 1),
+                    "funding_rate": score["metrics"].get("funding_rate", 0),
+                    "relative_volume": score["metrics"].get("relative_volume", 1),
+                    "absorption_detected": score["metrics"].get("absorption_conflict", False),
                     "btc_filter_passed": not (
-                        (score["direction"] == "LONG" and score["metrics"]["btc_trend"] == "BEARISH")
-                        or (score["direction"] == "SHORT" and score["metrics"]["btc_trend"] == "BULLISH")
+                        (score["direction"] == "LONG" and score["metrics"].get("btc_trend") == "BEARISH")
+                        or (score["direction"] == "SHORT" and score["metrics"].get("btc_trend") == "BULLISH")
                     ),
                     "notes": json.dumps(score["metrics"]),
                 },
@@ -277,8 +354,13 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             ):
                 alerts_created += 1
 
-            ranked.append({"symbol": symbol, "change_24h_pct": float(ticker.get("priceChangePercent", 0) or 0), **score})
+            ranked.append({
+                "symbol": symbol,
+                "change_24h_pct": float(ticker.get("priceChangePercent", 0) or 0),
+                **score,
+            })
 
+        errors.extend(cg_errors)
         ranked.sort(key=lambda x: (x["setup_score"], -x["risk_score"]), reverse=True)
         candidates = [x for x in ranked if x["state"] != "NO_TRADE"]
         final_status = "completed" if ranked else "degraded"
@@ -307,6 +389,9 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
         return {
             "run_id": run_id,
             "btc_context": btc_context,
+            "market_data_source": binance_client.active_source,
+            "coinglass": coinglass_client.status(),
+            "coinglass_enriched": coinglass_enriched,
             "symbols_scanned": len(selected),
             "successful_analyses": len(ranked),
             "candidates_found": len(candidates),
