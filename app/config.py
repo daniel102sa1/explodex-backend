@@ -21,10 +21,11 @@ class Settings(BaseSettings):
     coinglass_api_key: str = ""
     coinglass_base_url: str = "https://open-api-v4.coinglass.com"
     coinglass_timeout_seconds: float = 12.0
-    # Hobbyist allows 30/min. Keep headroom for manual analysis and retries.
+    # Hobbyist allows 30/min. We deliberately use less so the scanner never
+    # starves interactive coin/market screens of confirmation requests.
     coinglass_rate_limit_per_minute: int = 24
-    coinglass_cache_ttl_seconds: int = 30
-    coinglass_max_scanner_candidates: int = 8
+    coinglass_cache_ttl_seconds: int = 45
+    coinglass_max_scanner_candidates: int = 5
     coinglass_require_for_ready: bool = True
 
     # Optional contextual enrichment. News is deliberately secondary and capped.
