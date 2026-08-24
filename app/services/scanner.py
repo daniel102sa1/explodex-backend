@@ -13,6 +13,7 @@ from app.config import settings
 from app.services.binance import binance_client
 from app.services.coinglass import coinglass_client
 from app.services.coinglass_confirmation import apply_coinglass_confirmation
+from app.services.prediction_engine import build_pre_move_prediction
 from app.services.scanner_progress import scanner_progress
 from app.services.scoring import build_btc_context, score_snapshot
 from app.services.signal_alerts import create_signal_alert
@@ -204,6 +205,83 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 metrics["coinglass_available"] = False
                 score["metrics"] = metrics
 
+            cg_payload = score.get("coinglass") or {}
+            prediction = build_pre_move_prediction(score, snapshot, cg_payload)
+            prediction_matches_direction = prediction.get("direction") == score.get("direction")
+            prediction_phase = str(prediction.get("phase", "SIN_SETUP"))
+            prediction_score = float(prediction.get("preactivation_score", 0) or 0)
+
+            # READY requires the actual pre-move trigger to be activated in the same
+            # direction and must not already be a chase. A good score by itself is
+            # never enough to open the paper trade.
+            if score.get("state") == "READY" and (
+                not prediction_matches_direction
+                or prediction_phase != "ACTIVADO"
+                or bool(prediction.get("sequence", {}).get("chase_risk"))
+            ):
+                score = dict(score)
+                score["state"] = "PREPARING"
+                metrics = dict(score.get("metrics") or {})
+                rejects = list(metrics.get("reject_reasons") or [])
+                reason = (
+                    "pre_move_direction_conflict"
+                    if not prediction_matches_direction
+                    else "pre_move_chase_risk"
+                    if bool(prediction.get("sequence", {}).get("chase_risk"))
+                    else "pre_move_not_activated"
+                )
+                if reason not in rejects:
+                    rejects.append(reason)
+                metrics["reject_reasons"] = rejects
+                score["metrics"] = metrics
+
+            # Early warning: a WATCH can become PREPARING before the large candle
+            # only when the prediction agrees with direction and has a strong enough
+            # preparation sequence. Hard NO_TRADE is never promoted here.
+            if (
+                score.get("state") == "WATCH"
+                and prediction_matches_direction
+                and prediction_phase in {"PREACTIVACION", "VIGILAR_CONFIRMACION"}
+                and prediction_score >= 72
+                and float(score.get("risk_score", 100)) <= 48
+            ):
+                score = dict(score)
+                score["state"] = "PREPARING"
+
+            score = dict(score)
+            score["prediction"] = prediction
+            metrics = dict(score.get("metrics") or {})
+            metrics["pre_move_type"] = prediction.get("type")
+            metrics["pre_move_phase"] = prediction_phase
+            metrics["pre_move_score"] = prediction_score
+            metrics["pre_move_trigger"] = prediction.get("trigger_price")
+            metrics["pre_move_direction_match"] = prediction_matches_direction
+            score["metrics"] = metrics
+
+            use_prediction_plan = (
+                prediction_matches_direction
+                and prediction_phase not in {"SIN_SETUP", "SIN_DATOS"}
+                and prediction_score >= 55
+            )
+            plan_entry_low = prediction.get("entry_low") if use_prediction_plan else score["entry_low"]
+            plan_entry_high = prediction.get("entry_high") if use_prediction_plan else score["entry_high"]
+            plan_stop = prediction.get("stop_loss") if use_prediction_plan else score["stop_loss"]
+            plan_tp1 = prediction.get("tp1") if use_prediction_plan else score["tp1"]
+            plan_tp2 = prediction.get("tp2") if use_prediction_plan else score["tp2"]
+            plan_tp3 = prediction.get("tp3") if use_prediction_plan else score["tp3"]
+            plan_duration_min = prediction.get("expected_duration_min_minutes") if use_prediction_plan else score["expected_duration_min_minutes"]
+            plan_duration_max = prediction.get("expected_duration_max_minutes") if use_prediction_plan else score["expected_duration_max_minutes"]
+
+            # Persist the exact plan the paper engine will later read.
+            score["entry_low"] = plan_entry_low
+            score["entry_high"] = plan_entry_high
+            score["stop_loss"] = plan_stop
+            score["tp1"] = plan_tp1
+            score["tp2"] = plan_tp2
+            score["tp3"] = plan_tp3
+            score["expected_duration_min_minutes"] = plan_duration_min
+            score["expected_duration_max_minutes"] = plan_duration_max
+
             scanner_progress.symbol_finished(symbol, score=score)
             symbol_id = await _ensure_symbol(db, symbol)
 
@@ -214,6 +292,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 "btc_context": btc_context,
                 "market_data_source": snapshot.get("source") or binance_client.active_source,
                 "coinglass": score.get("coinglass"),
+                "prediction": prediction,
             }
             await db.execute(
                 text(
@@ -253,6 +332,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 "metrics": score["metrics"],
                 "components": score["components"],
                 "coinglass": score.get("coinglass"),
+                "prediction": prediction,
                 "local_setup_score_before_coinglass": local_score.get("setup_score"),
                 "local_risk_score_before_coinglass": local_score.get("risk_score"),
             }
@@ -270,7 +350,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     ) VALUES (
                         :id, :symbol_id, :scanner_run_id, :direction, :state, :setup_type,
                         '5m', :setup_score, :risk_score, :confidence_pct,
-                        :current_price, :entry_low, :entry_high, :stop_loss,
+                        :current_price, :entry_low, :entry_high, :invalidation_price,
                         :stop_loss, :tp1, :tp2, :tp3,
                         :expected_move_min_pct, :expected_move_max_pct,
                         :expected_duration_min_minutes, :expected_duration_max_minutes,
@@ -284,13 +364,14 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "scanner_run_id": run_id,
                     "direction": score["direction"],
                     "state": score["state"],
-                    "setup_type": "early_expansion",
+                    "setup_type": str(prediction.get("type") or "early_expansion").lower(),
                     "setup_score": score["setup_score"],
                     "risk_score": score["risk_score"],
                     "confidence_pct": score.get("confidence_pct"),
                     "current_price": score["current_price"],
                     "entry_low": score["entry_low"],
                     "entry_high": score["entry_high"],
+                    "invalidation_price": prediction.get("invalidation_price", score["stop_loss"]),
                     "stop_loss": score["stop_loss"],
                     "tp1": score["tp1"],
                     "tp2": score["tp2"],
@@ -316,7 +397,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                         :signal_id, :structure_score, :oi_score, :taker_score, :volume_score,
                         :funding_score, :btc_score, :absorption_score, :volatility_score,
                         :liquidity_score, :oi_change_pct, :taker_ratio, :funding_rate,
-                        :relative_volume, :absorption_detected, FALSE,
+                        :relative_volume, :absorption_detected, :breakout_confirmed,
                         :btc_filter_passed, CAST(:notes AS JSONB)
                     )
                     """
@@ -337,11 +418,12 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                     "funding_rate": score["metrics"].get("funding_rate", 0),
                     "relative_volume": score["metrics"].get("relative_volume", 1),
                     "absorption_detected": score["metrics"].get("absorption_conflict", False),
+                    "breakout_confirmed": prediction_phase == "ACTIVADO",
                     "btc_filter_passed": not (
                         (score["direction"] == "LONG" and score["metrics"].get("btc_trend") == "BEARISH")
                         or (score["direction"] == "SHORT" and score["metrics"].get("btc_trend") == "BULLISH")
                     ),
-                    "notes": json.dumps(score["metrics"]),
+                    "notes": json.dumps({**score["metrics"], "prediction": prediction}),
                 },
             )
 
