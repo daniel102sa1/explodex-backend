@@ -16,6 +16,17 @@ class Settings(BaseSettings):
 
     paper_trading_only: bool = True
 
+    # CoinGlass is a confirmation layer, never a single-source trade trigger.
+    coinglass_enabled: bool = True
+    coinglass_api_key: str = ""
+    coinglass_base_url: str = "https://open-api-v4.coinglass.com"
+    coinglass_timeout_seconds: float = 12.0
+    # Hobbyist allows 30/min. Keep headroom for manual analysis and retries.
+    coinglass_rate_limit_per_minute: int = 24
+    coinglass_cache_ttl_seconds: int = 30
+    coinglass_max_scanner_candidates: int = 8
+    coinglass_require_for_ready: bool = False
+
     # Optional contextual enrichment. News is deliberately secondary and capped.
     news_enabled: bool = True
     news_max_candidates: int = 8
@@ -23,7 +34,7 @@ class Settings(BaseSettings):
     news_cache_ttl_seconds: int = 900
 
     # Automatic runtime loops. These values are deliberately conservative so
-    # Railway usage and Binance API traffic remain controlled in v1.
+    # Railway usage and exchange/API traffic remain controlled in v1.
     scheduler_enabled: bool = True
     scanner_interval_seconds: int = 300
     paper_manage_interval_seconds: int = 60
