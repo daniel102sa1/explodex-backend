@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,12 +13,25 @@ from app.services.paper_trading import (
     paper_performance,
     sync_ready_signals,
 )
+from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    tasks = await start_runtime()
+    app.state.runtime_tasks = tasks
+    try:
+        yield
+    finally:
+        await stop_runtime(tasks)
+
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.3.0",
+    version="0.4.0",
     description="ExplodeX early LONG/SHORT scanner for Binance USDT-M Futures",
+    lifespan=lifespan,
 )
 
 
@@ -24,8 +39,9 @@ app = FastAPI(
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.3.0",
+        "version": "0.4.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
+        "scheduler_enabled": settings.scheduler_enabled,
         "message": "ExplodeX backend online",
     }
 
@@ -37,7 +53,13 @@ async def health():
         "status": "ok" if db_ok else "degraded",
         "database": db_ok,
         "paper_trading_only": settings.paper_trading_only,
+        "scheduler_enabled": settings.scheduler_enabled,
     }
+
+
+@app.get("/api/v1/runtime/status")
+async def runtime_status():
+    return runtime_state.as_dict()
 
 
 @app.get("/api/v1/market/price/{symbol}")
@@ -108,23 +130,16 @@ async def opportunities(
     limit: int = Query(default=50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    """Rank active setups into ELITE, VERY_STRONG, STRONG, WATCH and NO_TRADE.
-
-    A 100/100 score is intentionally not exposed as a guaranteed 100% probability.
-    Historical win-rate estimates only appear after enough paper trades exist.
-    """
     return await ranked_opportunities(db, limit=limit)
 
 
 @app.get("/api/v1/calibration")
 async def calibration(db: AsyncSession = Depends(get_db)):
-    """Observed paper-trade win rate by score bucket for probability calibration."""
     return await calibration_by_score(db)
 
 
 @app.post("/api/v1/paper/sync")
 async def paper_sync(db: AsyncSession = Depends(get_db)):
-    """Create PAPER trades only from READY signals that still remain inside their entry zone."""
     try:
         return await sync_ready_signals(db)
     except Exception as exc:
@@ -133,7 +148,6 @@ async def paper_sync(db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/v1/paper/manage")
 async def paper_manage(db: AsyncSession = Depends(get_db)):
-    """Update open PAPER trades: HOLD, protect at TP1, close at TP2, or stop out."""
     try:
         return await manage_open_paper_trades(db)
     except Exception as exc:
