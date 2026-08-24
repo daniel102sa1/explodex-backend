@@ -7,11 +7,21 @@ class Settings(BaseSettings):
     app_env: str = "development"
     database_url: str
     binance_futures_base_url: str = "https://fapi.binance.com"
+
     scanner_min_quote_volume_usdt: float = 10_000_000
     scanner_max_symbols: int = 80
     scanner_min_setup_score: float = 80
     scanner_max_risk_score: float = 35
+    scanner_deep_limit: int = 20
+
     paper_trading_only: bool = True
+
+    # Automatic runtime loops. These values are deliberately conservative so
+    # Railway usage and Binance API traffic remain controlled in v1.
+    scheduler_enabled: bool = True
+    scanner_interval_seconds: int = 300
+    paper_manage_interval_seconds: int = 60
+    paper_sync_interval_seconds: int = 300
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
