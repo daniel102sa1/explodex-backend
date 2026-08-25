@@ -8,6 +8,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.edge_engine import edge_summary
+
 
 PHASE_PRIORITY = {
     "ACTIVADO": 90,
@@ -52,17 +54,10 @@ def _condition_summary(prediction: dict[str, Any]) -> tuple[int, int]:
         ready = sum(1 for item in conditions if isinstance(item, dict) and bool(item.get("ready")))
         return ready, len(conditions)
     confirmations = prediction.get("confirmations") or []
-    # The predictor historically used a soft 9-condition mental model. Preserve
-    # that denominator for older rows while newer rows expose explicit conditions.
     return min(len(confirmations), 9), 9
 
 
 async def live_predictions(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
-    """Return one latest prediction per symbol plus recent preparation trajectory.
-
-    The scanner can write a signal every cycle. This endpoint intentionally
-    collapses those rows so the UI never shows duplicated coins from old cycles.
-    """
     latest_result = await db.execute(
         text(
             """
@@ -171,12 +166,8 @@ async def live_predictions(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
     )
     items = items[:limit]
     operable_count = sum(1 for item in items if item["operable"])
-    preactivation_count = sum(
-        1 for item in items if str(item["prediction"].get("phase")) == "PREACTIVACION"
-    )
-    activated_count = sum(
-        1 for item in items if str(item["prediction"].get("phase")) == "ACTIVADO"
-    )
+    preactivation_count = sum(1 for item in items if str(item["prediction"].get("phase")) == "PREACTIVACION")
+    activated_count = sum(1 for item in items if str(item["prediction"].get("phase")) == "ACTIVADO")
     accelerating_count = sum(1 for item in items if item["preparation_accelerating"])
 
     return {
@@ -224,7 +215,8 @@ async def prediction_history(db: AsyncSession, symbol: str, limit: int = 12) -> 
                 "type": prediction.get("type") or "SIN_SETUP",
             }
         )
-    return {"symbol": symbol, "history": rows}
+    learned = await edge_summary(db, symbol=symbol)
+    return {"symbol": symbol, "history": rows, "edge": learned}
 
 
 async def live_event_feed(db: AsyncSession, limit: int = 80) -> list[dict[str, Any]]:
@@ -250,11 +242,7 @@ async def live_event_feed(db: AsyncSession, limit: int = 80) -> list[dict[str, A
         kind = str(prediction.get("type") or "SETUP")
         pre = _f(prediction.get("preactivation_score"))
         severity = "READY" if row["state"] == "READY" else "EARLY" if phase in {"ACTIVADO", "PREACTIVACION"} else "INFO"
-        title = (
-            f"{row['symbol']} READY {row['direction']}"
-            if row["state"] == "READY"
-            else f"{row['symbol']} {phase.replace('_', ' ')}"
-        )
+        title = f"{row['symbol']} READY {row['direction']}" if row["state"] == "READY" else f"{row['symbol']} {phase.replace('_', ' ')}"
         events.append(
             {
                 "at": _iso(row["created_at"]),
@@ -328,7 +316,6 @@ async def live_event_feed(db: AsyncSession, limit: int = 80) -> list[dict[str, A
         )
 
     events.sort(key=lambda item: item.get("at") or "", reverse=True)
-    # Remove exact repeats that can happen when the same scanner event also created an alert.
     deduped: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for item in events:
