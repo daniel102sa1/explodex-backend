@@ -9,7 +9,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.services.edge_engine import capture_recent_signals, label_due_observations
 from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
-from app.services.scanner import run_scanner
+from app.services.scanner_guarded import run_scanner
 from app.services.trade_time_manager import manage_trade_time_stops
 
 logger = logging.getLogger("explodex.runtime")
