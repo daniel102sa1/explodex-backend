@@ -19,21 +19,9 @@ async def check_database() -> bool:
 
 
 async def ensure_runtime_schema() -> None:
-    """Keep small enum-like CHECK constraints compatible with the live engine.
-
-    The original Railway database predates PREACTIVACION/ACTIVADO alerts and
-    paper time exits.  New application code must not be able to abort an entire
-    scanner cycle just because those newer labels are absent from an old CHECK.
-    """
+    """Keep the live Railway schema compatible with current ExplodeX engines."""
     async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                """
-                ALTER TABLE alerts
-                DROP CONSTRAINT IF EXISTS alerts_severity_check
-                """
-            )
-        )
+        await conn.execute(text("ALTER TABLE alerts DROP CONSTRAINT IF EXISTS alerts_severity_check"))
         await conn.execute(
             text(
                 """
@@ -48,14 +36,7 @@ async def ensure_runtime_schema() -> None:
             )
         )
 
-        await conn.execute(
-            text(
-                """
-                ALTER TABLE trade_events
-                DROP CONSTRAINT IF EXISTS trade_events_event_type_check
-                """
-            )
-        )
+        await conn.execute(text("ALTER TABLE trade_events DROP CONSTRAINT IF EXISTS trade_events_event_type_check"))
         await conn.execute(
             text(
                 """
@@ -68,3 +49,44 @@ async def ensure_runtime_schema() -> None:
                 """
             )
         )
+
+        # Edge Engine V2: each scanner prediction becomes a training example.
+        # The row is labeled later, after enough future candles exist, avoiding
+        # look-ahead leakage in the live decision itself.
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS edge_observations (
+                    signal_id UUID PRIMARY KEY REFERENCES signals(id) ON DELETE CASCADE,
+                    symbol_id UUID NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    due_at TIMESTAMPTZ NOT NULL,
+                    direction VARCHAR(8) NOT NULL,
+                    prediction_type VARCHAR(40),
+                    phase VARCHAR(40),
+                    setup_score NUMERIC(8,3),
+                    preactivation_score NUMERIC(8,3),
+                    risk_score NUMERIC(8,3),
+                    entry_price NUMERIC(30,12),
+                    stop_loss NUMERIC(30,12),
+                    tp1 NUMERIC(30,12),
+                    tp2 NUMERIC(30,12),
+                    tp3 NUMERIC(30,12),
+                    btc_regime VARCHAR(24),
+                    market_source VARCHAR(32),
+                    features JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+                    label VARCHAR(24),
+                    barrier_hit VARCHAR(24),
+                    barrier_hit_at TIMESTAMPTZ,
+                    end_price NUMERIC(30,12),
+                    mfe_pct NUMERIC(12,6),
+                    mae_pct NUMERIC(12,6),
+                    outcome_r NUMERIC(12,6),
+                    labeled_at TIMESTAMPTZ
+                )
+                """
+            )
+        )
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_edge_due ON edge_observations(status, due_at)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_edge_cohort ON edge_observations(direction, prediction_type, btc_regime, status)"))
