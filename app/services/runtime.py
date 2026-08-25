@@ -7,6 +7,7 @@ from typing import Any
 
 from app.config import settings
 from app.database import SessionLocal
+from app.services.edge_engine import capture_recent_signals, label_due_observations
 from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
 from app.services.scanner import run_scanner
 from app.services.trade_time_manager import manage_trade_time_stops
@@ -32,9 +33,15 @@ class RuntimeState:
         self.last_paper_sync_error: str | None = None
         self.last_paper_sync_result: dict[str, Any] | None = None
 
+        self.last_edge_at: datetime | None = None
+        self.last_edge_ok: bool | None = None
+        self.last_edge_error: str | None = None
+        self.last_edge_result: dict[str, Any] | None = None
+
         self.scanner_running = False
         self.paper_manage_running = False
         self.paper_sync_running = False
+        self.edge_running = False
 
     def as_dict(self) -> dict[str, Any]:
         def iso(value: datetime | None) -> str | None:
@@ -67,6 +74,14 @@ class RuntimeState:
                 "last_ok": self.last_paper_sync_ok,
                 "last_error": self.last_paper_sync_error,
                 "last_result": self.last_paper_sync_result,
+            },
+            "edge_engine": {
+                "running": self.edge_running,
+                "interval_seconds": 180,
+                "last_run_at": iso(self.last_edge_at),
+                "last_ok": self.last_edge_ok,
+                "last_error": self.last_edge_error,
+                "last_result": self.last_edge_result,
             },
         }
 
@@ -147,6 +162,26 @@ async def _run_paper_sync_once() -> None:
         runtime_state.paper_sync_running = False
 
 
+async def _run_edge_once() -> None:
+    if runtime_state.edge_running:
+        return
+    runtime_state.edge_running = True
+    try:
+        async with SessionLocal() as db:
+            captured = await capture_recent_signals(db, limit=150)
+            labeled = await label_due_observations(db, limit=40)
+        runtime_state.last_edge_result = {"capture": captured, "label": labeled}
+        runtime_state.last_edge_ok = True
+        runtime_state.last_edge_error = None
+    except Exception as exc:
+        logger.exception("Edge Engine cycle failed")
+        runtime_state.last_edge_ok = False
+        runtime_state.last_edge_error = str(exc)[:1000]
+    finally:
+        runtime_state.last_edge_at = datetime.now(timezone.utc)
+        runtime_state.edge_running = False
+
+
 async def _scanner_loop() -> None:
     await asyncio.sleep(8)
     while True:
@@ -168,6 +203,13 @@ async def _paper_sync_loop() -> None:
         await asyncio.sleep(settings.paper_sync_interval_seconds)
 
 
+async def _edge_loop() -> None:
+    await asyncio.sleep(45)
+    while True:
+        await _run_edge_once()
+        await asyncio.sleep(180)
+
+
 async def start_runtime() -> list[asyncio.Task[Any]]:
     runtime_state.started_at = datetime.now(timezone.utc)
     if not settings.scheduler_enabled:
@@ -177,6 +219,7 @@ async def start_runtime() -> list[asyncio.Task[Any]]:
         asyncio.create_task(_scanner_loop(), name="explodex-scanner-loop"),
         asyncio.create_task(_paper_manage_loop(), name="explodex-paper-manage-loop"),
         asyncio.create_task(_paper_sync_loop(), name="explodex-paper-sync-loop"),
+        asyncio.create_task(_edge_loop(), name="explodex-edge-loop"),
     ]
 
 
