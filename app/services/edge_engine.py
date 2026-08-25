@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -15,6 +15,18 @@ def _f(value: Any, default: float = 0.0) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return default
+
+
+def _json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def _hit(direction: str, high: float, low: float, level: float, profit: bool) -> bool:
@@ -46,6 +58,7 @@ async def record_edge_observation(
     score: dict[str, Any],
     prediction: dict[str, Any],
     market_source: str | None,
+    observed_at: datetime | None = None,
 ) -> None:
     entry_low = _f(score.get("entry_low"))
     entry_high = _f(score.get("entry_high"))
@@ -70,7 +83,8 @@ async def record_edge_observation(
                 entry_price, stop_loss, tp1, tp2, tp3,
                 btc_regime, market_source, features
             ) VALUES (
-                :signal_id, :symbol_id, NOW(), NOW() + (:minutes || ' minutes')::interval,
+                :signal_id, :symbol_id, COALESCE(:observed_at, NOW()),
+                COALESCE(:observed_at, NOW()) + (:minutes || ' minutes')::interval,
                 :direction, :prediction_type, :phase, :setup_score, :preactivation_score,
                 :risk_score, :entry_price, :stop_loss, :tp1, :tp2, :tp3,
                 :btc_regime, :market_source, CAST(:features AS JSONB)
@@ -80,6 +94,7 @@ async def record_edge_observation(
         {
             "signal_id": signal_id,
             "symbol_id": symbol_id,
+            "observed_at": observed_at,
             "minutes": str(max_minutes),
             "direction": score.get("direction"),
             "prediction_type": prediction.get("type"),
@@ -97,6 +112,67 @@ async def record_edge_observation(
             "features": json.dumps(features),
         },
     )
+
+
+async def capture_recent_signals(db: AsyncSession, limit: int = 100) -> dict[str, Any]:
+    result = await db.execute(
+        text(
+            """
+            SELECT s.id::text AS signal_id, s.symbol_id::text, sy.symbol, s.created_at,
+                   s.direction, s.state, s.setup_score, s.risk_score, s.current_price,
+                   s.entry_low, s.entry_high, s.stop_loss, s.tp1, s.tp2, s.tp3,
+                   s.expected_duration_max_minutes, s.reason
+            FROM signals s
+            JOIN symbols sy ON sy.id=s.symbol_id
+            LEFT JOIN edge_observations eo ON eo.signal_id=s.id
+            WHERE eo.signal_id IS NULL
+              AND s.created_at >= NOW() - INTERVAL '24 hours'
+            ORDER BY s.created_at ASC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    rows = [dict(r) for r in result.mappings().all()]
+    captured = 0
+    for row in rows:
+        reason = _json(row.get("reason"))
+        prediction = _json(reason.get("prediction"))
+        metrics = _json(reason.get("metrics"))
+        components = _json(reason.get("components"))
+        coinglass = _json(reason.get("coinglass"))
+        if not prediction:
+            continue
+        score = {
+            "direction": row.get("direction"),
+            "state": row.get("state"),
+            "setup_score": _f(row.get("setup_score")),
+            "risk_score": _f(row.get("risk_score")),
+            "current_price": _f(row.get("current_price")),
+            "entry_low": _f(row.get("entry_low")),
+            "entry_high": _f(row.get("entry_high")),
+            "stop_loss": _f(row.get("stop_loss")),
+            "tp1": _f(row.get("tp1")),
+            "tp2": _f(row.get("tp2")),
+            "tp3": _f(row.get("tp3")),
+            "expected_duration_max_minutes": row.get("expected_duration_max_minutes"),
+            "metrics": metrics,
+            "components": components,
+            "coinglass": coinglass,
+        }
+        await record_edge_observation(
+            db,
+            signal_id=row["signal_id"],
+            symbol_id=row["symbol_id"],
+            symbol=row["symbol"],
+            score=score,
+            prediction=prediction,
+            market_source=str(reason.get("market_data_source") or "scanner"),
+            observed_at=row.get("created_at"),
+        )
+        captured += 1
+    await db.commit()
+    return {"seen": len(rows), "captured": captured}
 
 
 async def label_due_observations(db: AsyncSession, limit: int = 40) -> dict[str, Any]:
@@ -146,7 +222,6 @@ async def label_due_observations(db: AsyncSession, limit: int = 40) -> dict[str,
                 high = _f(k[2]); low = _f(k[3])
                 stop_hit = _hit(direction, high, low, stop, False)
                 tp_hit = _hit(direction, high, low, tp1, True)
-                # Pessimistic ordering when both barriers exist in the same 1m candle.
                 if stop_hit and tp_hit:
                     barrier = "STOP"
                     barrier_at = datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc)
