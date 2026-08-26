@@ -9,6 +9,7 @@ from app.services.context_veto_shadow import build_graduated_veto_shadow
 from app.services.fusion_edge_research import build_fusion_edge_research
 from app.services.rolling_context_validation import build_rolling_context_validation
 from app.services.runner_shadow_model import build_runner_shadow_model
+from app.services.runner_walk_forward import build_runner_walk_forward
 from app.services.tp1_continuation_research import build_tp1_continuation_report, update_tp1_continuation_memory
 from app.services.verdict_context_enrichment import advanced_context_stats, enrich_verdict_memory_context
 from app.services.verdict_resolver_resilient import resolve_verdict_outcomes_resilient
@@ -43,6 +44,7 @@ def install_verdict_memory_overrides() -> None:
         base["fusion_edge_research"] = await build_fusion_edge_research(db)
         base["tp1_continuation_research"] = await build_tp1_continuation_report(db)
         base["runner_shadow_model"] = await build_runner_shadow_model(db)
+        base["runner_walk_forward"] = await build_runner_walk_forward(db)
         meta = await build_context_meta_shadow_report(db)
         rolling = await build_rolling_context_validation(db)
         base["context_meta_shadow"] = meta
