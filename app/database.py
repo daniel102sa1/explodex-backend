@@ -127,3 +127,31 @@ async def ensure_runtime_schema() -> None:
         )
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_verdict_memory_outcome_time ON verdict_memory(outcome, observed_at)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_verdict_memory_profile ON verdict_memory(direction, setup_score, risk_score, outcome)"))
+
+        # Persistent sequential microstructure memory. These are real observed L2
+        # snapshots, not synthetic history. Retention is intentionally short because
+        # the engine needs local microstructure context, not an unbounded order-book archive.
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS microstructure_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(32) NOT NULL,
+                    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    bid_price NUMERIC(30,12) NOT NULL,
+                    ask_price NUMERIC(30,12) NOT NULL,
+                    bid_size NUMERIC(30,12) NOT NULL,
+                    ask_size NUMERIC(30,12) NOT NULL,
+                    bid_depth NUMERIC(36,12) NOT NULL,
+                    ask_depth NUMERIC(36,12) NOT NULL,
+                    mid_price NUMERIC(30,12) NOT NULL,
+                    imbalance NUMERIC(14,8) NOT NULL,
+                    current_price NUMERIC(30,12) NOT NULL,
+                    futures_delta NUMERIC(14,8),
+                    source VARCHAR(32)
+                )
+                """
+            )
+        )
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_microstructure_symbol_time ON microstructure_snapshots(symbol, observed_at DESC)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_microstructure_time ON microstructure_snapshots(observed_at DESC)"))
