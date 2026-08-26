@@ -26,7 +26,7 @@ def build_pre_move_prediction(
     final = apply_exchange_lead_lag(coinglass, cascade)
     result = dict(final)
     result["verdict_fusion"] = build_server_verdict_fusion(scored, snapshot, result)
-    result["entry_zone_engine"] = build_entry_zone_engine(scored, result)
+    result["entry_zone_engine"] = build_entry_zone_engine(scored, result, snapshot)
     symbol = str(snapshot.get("symbol") or scored.get("symbol") or "UNKNOWN")
     result["confidence_progression"] = observe_confidence_progression(symbol, result)
     return result
