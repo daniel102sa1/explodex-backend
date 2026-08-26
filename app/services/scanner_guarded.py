@@ -7,6 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import scanner as scanner_module
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.scanner_edge_gate import apply_edge_gate_to_scanner_run
+from app.services.verdict_memory_override import install_verdict_memory_overrides
+
+# Install verdict-memory extensions before runtime imports verdict_memory callables.
+# This keeps provider failures isolated per symbol and enriches every decision with
+# the advanced context that existed at decision time.
+install_verdict_memory_overrides()
 
 # Preserve the raw scanner callable exactly once. This module is imported during
 # backend startup before main.py imports run_scanner from scanner.py.
