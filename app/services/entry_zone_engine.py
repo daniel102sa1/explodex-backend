@@ -15,17 +15,20 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 def build_entry_zone_engine(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[str, Any]:
-    """Refine the existing structural plan into optimal/acceptable/chase bands.
+    """Refine the active structural plan into optimal/acceptable/chase bands.
 
-    This never widens the original entry range, never moves the stop away from
-    invalidation and never creates an entry when the source plan is missing.
+    The prediction plan is preferred because scanner.py may adopt it only after
+    prediction returns. This never widens the source entry range, never moves the
+    stop away from invalidation and never creates an entry when the plan is missing.
     """
     direction = str(prediction.get("direction") or scored.get("direction") or "LONG").upper()
     price = _f(scored.get("current_price"))
-    raw_low = min(_f(scored.get("entry_low")), _f(scored.get("entry_high")))
-    raw_high = max(_f(scored.get("entry_low")), _f(scored.get("entry_high")))
-    stop = _f(scored.get("stop_loss"))
-    tp1 = _f(scored.get("tp1"))
+    source_low = _f(prediction.get("entry_low"), _f(scored.get("entry_low")))
+    source_high = _f(prediction.get("entry_high"), _f(scored.get("entry_high")))
+    raw_low = min(source_low, source_high)
+    raw_high = max(source_low, source_high)
+    stop = _f(prediction.get("stop_loss"), _f(scored.get("stop_loss")))
+    tp1 = _f(prediction.get("tp1"), _f(scored.get("tp1")))
     trigger = _f(prediction.get("trigger_price"))
     metrics = dict(scored.get("metrics") or {})
     atr_pct = max(_f(metrics.get("atr_pct")), 0.0)
@@ -40,10 +43,12 @@ def build_entry_zone_engine(scored: dict[str, Any], prediction: dict[str, Any]) 
 
     width = raw_high - raw_low
     midpoint = (raw_low + raw_high) / 2.0
-    # Favor the trigger-facing half for continuation entries, while keeping
-    # reversals centered. The original range remains the hard envelope.
     kind = str(prediction.get("type") or "")
     continuation = kind.startswith("IMPULSO")
+
+    # Continuations favor the trigger-facing side of the structural band so the
+    # entry is early without chasing. Reversal setups remain centered because the
+    # reclaim/rejection itself is the key condition.
     if continuation and direction == "LONG":
         optimal_low = raw_low
         optimal_high = raw_low + width * 0.55
@@ -56,11 +61,10 @@ def build_entry_zone_engine(scored: dict[str, Any], prediction: dict[str, Any]) 
 
     optimal_low = _clamp(optimal_low, raw_low, raw_high)
     optimal_high = _clamp(optimal_high, raw_low, raw_high)
-
-    # Acceptable zone is the original plan. Chase zone starts after the original
-    # band and is informational only: the system must wait for a retest there.
     acceptable_low = raw_low
     acceptable_high = raw_high
+
+    # Chase is outside the original plan and never considered an enter zone.
     chase_pad = atr_abs * 0.35 if atr_abs > 0 else width * 1.25
     if direction == "LONG":
         chase_low = raw_high
@@ -116,5 +120,5 @@ def build_entry_zone_engine(scored: dict[str, Any], prediction: dict[str, Any]) 
         "beyond_chase": beyond_chase,
         "distance_to_entry_atr": round(distance_atr, 3),
         "rr1_midpoint": round(rr1_mid, 2),
-        "rule": "Optimal is best price quality inside the structural plan; acceptable is still valid; chase means wait for retest. The engine never widens the original plan.",
+        "rule": "Optimal is the best price-quality slice inside the structural plan; acceptable is still valid; chase means wait for retest. The engine never widens the original plan.",
     }
