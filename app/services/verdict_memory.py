@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from math import sqrt
 from typing import Any
 
 from sqlalchemy import text
@@ -19,6 +20,26 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 def _ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
+
+
+def _wilson_lower_bound(wins: int, total: int, z: float = 1.96) -> float | None:
+    if total <= 0:
+        return None
+    p = wins / total
+    z2 = z * z
+    center = p + z2 / (2 * total)
+    margin = z * sqrt((p * (1 - p) + z2 / (4 * total)) / total)
+    denominator = 1 + z2 / total
+    return max(0.0, (center - margin) / denominator) * 100.0
+
+
+def _interval_for_age(age: timedelta) -> str:
+    """Choose enough candle coverage to resolve observations up to seven days old."""
+    if age <= timedelta(hours=24):
+        return "5m"       # 300 candles ~= 25h
+    if age <= timedelta(hours=72):
+        return "15m"      # 300 candles ~= 75h
+    return "1h"           # 300 candles ~= 12.5d
 
 
 async def capture_enter_verdicts(db: AsyncSession, limit: int = 200) -> dict[str, int]:
@@ -99,8 +120,7 @@ async def resolve_verdict_outcomes(db: AsyncSession, limit: int = 60) -> dict[st
 
     for symbol, group in grouped.items():
         oldest = min(r["observed_at"] for r in group)
-        age = now - oldest
-        interval = "5m" if age <= timedelta(hours=24) else "15m"
+        interval = _interval_for_age(now - oldest)
         candles = await binance_client.klines(symbol, interval=interval, limit=300)
         parsed = []
         for c in candles:
@@ -114,8 +134,8 @@ async def resolve_verdict_outcomes(db: AsyncSession, limit: int = 60) -> dict[st
             stop = _f(row["stop_loss"])
             tp1 = _f(row["tp1"])
             entry = _f(row["entry_price"])
-            if not entry:
-                entry = tp1 if tp1 else stop
+            if not entry or not stop or not tp1:
+                continue
 
             best = entry
             worst = entry
@@ -134,13 +154,13 @@ async def resolve_verdict_outcomes(db: AsyncSession, limit: int = 60) -> dict[st
                 if direction == "LONG":
                     best = max(best, high)
                     worst = min(worst, low)
-                    mfe_pct = ((best - entry) / entry * 100) if entry else 0.0
-                    mae_pct = ((entry - worst) / entry * 100) if entry else 0.0
+                    mfe_pct = (best - entry) / entry * 100
+                    mae_pct = (entry - worst) / entry * 100
                 else:
                     best = min(best, low)
                     worst = max(worst, high)
-                    mfe_pct = ((entry - best) / entry * 100) if entry else 0.0
-                    mae_pct = ((worst - entry) / entry * 100) if entry else 0.0
+                    mfe_pct = (entry - best) / entry * 100
+                    mae_pct = (worst - entry) / entry * 100
 
                 if hit_tp and hit_stop:
                     outcome = "AMBIGUOUS"
@@ -205,6 +225,14 @@ async def verdict_memory_stats(db: AsyncSession) -> dict[str, Any]:
     row = dict(result.mappings().one())
     decided = int(row.get("decided") or 0)
     wins = int(row.get("wins") or 0)
+    losses = int(row.get("losses") or 0)
+    row["decided"] = decided
+    row["wins"] = wins
+    row["losses"] = losses
+    row["ambiguous"] = int(row.get("ambiguous") or 0)
+    row["unresolved"] = int(row.get("unresolved") or 0)
     row["win_rate_pct"] = (wins / decided * 100.0) if decided else None
+    row["wilson_low_pct"] = _wilson_lower_bound(wins, decided)
     row["sample_status"] = "CALIBRATING" if decided < 30 else "USABLE"
+    row["can_influence_veto"] = decided >= 30
     return row
