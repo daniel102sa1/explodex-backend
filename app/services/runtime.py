@@ -11,7 +11,7 @@ from app.services.edge_engine import capture_recent_signals, label_due_observati
 from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
 from app.services.scanner_guarded import run_scanner
 from app.services.trade_time_manager import manage_trade_time_stops
-from app.services.verdict_memory import capture_enter_verdicts, resolve_verdict_outcomes
+from app.services.verdict_memory import capture_enter_verdicts, resolve_verdict_outcomes, verdict_memory_stats
 
 logger = logging.getLogger("explodex.runtime")
 
@@ -205,7 +205,12 @@ async def _run_verdict_memory_once() -> None:
         async with SessionLocal() as db:
             captured = await capture_enter_verdicts(db, limit=200)
             resolved = await resolve_verdict_outcomes(db, limit=60)
-        runtime_state.last_verdict_memory_result = {"capture": captured, "resolve": resolved}
+            stats = await verdict_memory_stats(db)
+        runtime_state.last_verdict_memory_result = {
+            "capture": captured,
+            "resolve": resolved,
+            "stats": stats,
+        }
         runtime_state.last_verdict_memory_ok = True
         runtime_state.last_verdict_memory_error = None
     except Exception as exc:
