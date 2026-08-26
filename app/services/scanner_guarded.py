@@ -8,19 +8,22 @@ from app.services import scanner as scanner_module
 from app.services.microstructure_persistence_resilient import install_microstructure_persistence_hardening
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.scanner_edge_gate import apply_edge_gate_to_scanner_run
+from app.services.server_snapshot_extensions import install_server_snapshot_extensions
 from app.services.verdict_memory_override import install_verdict_memory_overrides
 
 # Install runtime extensions before runtime.py imports direct service callables.
 # This keeps provider failures isolated per symbol, enriches decision-time context,
-# and makes microstructure persistence transactional/retry-safe.
+# makes microstructure persistence transactional/retry-safe and supplies the real
+# 1m candle stream required by the server-side Verdict Fusion calculation.
 install_verdict_memory_overrides()
 install_microstructure_persistence_hardening()
+install_server_snapshot_extensions()
 
 # Preserve the raw scanner callable exactly once. This module is imported during
 # backend startup before main.py imports run_scanner from scanner.py.
 _raw_run_scanner = scanner_module.run_scanner
 
-# Risk Guard V2 must be the predictor used inside scanner.py.
+# Risk Guard V2 + server Verdict Fusion must be the predictor used inside scanner.py.
 scanner_module.build_pre_move_prediction = build_pre_move_prediction
 
 
