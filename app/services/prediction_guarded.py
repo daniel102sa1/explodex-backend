@@ -10,7 +10,7 @@ from app.services.liquidation_cascade import apply_liquidation_cascade
 from app.services.prediction_engine import build_pre_move_prediction as build_raw_pre_move_prediction
 from app.services.prediction_safety import apply_prediction_safety
 from app.services.sequential_context import apply_sequential_context
-from app.services.server_verdict_fusion import build_server_verdict_fusion
+from app.services.verdict_entry_zone_guard import build_guarded_verdict_fusion
 
 
 def build_pre_move_prediction(
@@ -25,8 +25,11 @@ def build_pre_move_prediction(
     cascade = apply_liquidation_cascade(scored, coinglass, sequential)
     final = apply_exchange_lead_lag(coinglass, cascade)
     result = dict(final)
-    result["verdict_fusion"] = build_server_verdict_fusion(scored, snapshot, result)
-    result["entry_zone_engine"] = build_entry_zone_engine(scored, result, snapshot)
+
+    entry_zone = build_entry_zone_engine(scored, result, snapshot)
+    result["entry_zone_engine"] = entry_zone
+    result["verdict_fusion"] = build_guarded_verdict_fusion(scored, snapshot, result, entry_zone)
+
     symbol = str(snapshot.get("symbol") or scored.get("symbol") or "UNKNOWN")
     result["confidence_progression"] = observe_confidence_progression(symbol, result)
     return result
