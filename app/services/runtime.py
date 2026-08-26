@@ -11,6 +11,7 @@ from app.services.edge_engine import capture_recent_signals, label_due_observati
 from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
 from app.services.scanner_guarded import run_scanner
 from app.services.trade_time_manager import manage_trade_time_stops
+from app.services.verdict_memory import capture_enter_verdicts, resolve_verdict_outcomes
 
 logger = logging.getLogger("explodex.runtime")
 
@@ -38,10 +39,16 @@ class RuntimeState:
         self.last_edge_error: str | None = None
         self.last_edge_result: dict[str, Any] | None = None
 
+        self.last_verdict_memory_at: datetime | None = None
+        self.last_verdict_memory_ok: bool | None = None
+        self.last_verdict_memory_error: str | None = None
+        self.last_verdict_memory_result: dict[str, Any] | None = None
+
         self.scanner_running = False
         self.paper_manage_running = False
         self.paper_sync_running = False
         self.edge_running = False
+        self.verdict_memory_running = False
 
     def as_dict(self) -> dict[str, Any]:
         def iso(value: datetime | None) -> str | None:
@@ -82,6 +89,14 @@ class RuntimeState:
                 "last_ok": self.last_edge_ok,
                 "last_error": self.last_edge_error,
                 "last_result": self.last_edge_result,
+            },
+            "verdict_memory": {
+                "running": self.verdict_memory_running,
+                "interval_seconds": 120,
+                "last_run_at": iso(self.last_verdict_memory_at),
+                "last_ok": self.last_verdict_memory_ok,
+                "last_error": self.last_verdict_memory_error,
+                "last_result": self.last_verdict_memory_result,
             },
         }
 
@@ -182,6 +197,26 @@ async def _run_edge_once() -> None:
         runtime_state.edge_running = False
 
 
+async def _run_verdict_memory_once() -> None:
+    if runtime_state.verdict_memory_running:
+        return
+    runtime_state.verdict_memory_running = True
+    try:
+        async with SessionLocal() as db:
+            captured = await capture_enter_verdicts(db, limit=200)
+            resolved = await resolve_verdict_outcomes(db, limit=60)
+        runtime_state.last_verdict_memory_result = {"capture": captured, "resolve": resolved}
+        runtime_state.last_verdict_memory_ok = True
+        runtime_state.last_verdict_memory_error = None
+    except Exception as exc:
+        logger.exception("Verdict Memory cycle failed")
+        runtime_state.last_verdict_memory_ok = False
+        runtime_state.last_verdict_memory_error = str(exc)[:1000]
+    finally:
+        runtime_state.last_verdict_memory_at = datetime.now(timezone.utc)
+        runtime_state.verdict_memory_running = False
+
+
 async def _scanner_loop() -> None:
     await asyncio.sleep(8)
     while True:
@@ -210,6 +245,13 @@ async def _edge_loop() -> None:
         await asyncio.sleep(180)
 
 
+async def _verdict_memory_loop() -> None:
+    await asyncio.sleep(70)
+    while True:
+        await _run_verdict_memory_once()
+        await asyncio.sleep(120)
+
+
 async def start_runtime() -> list[asyncio.Task[Any]]:
     runtime_state.started_at = datetime.now(timezone.utc)
     if not settings.scheduler_enabled:
@@ -220,6 +262,7 @@ async def start_runtime() -> list[asyncio.Task[Any]]:
         asyncio.create_task(_paper_manage_loop(), name="explodex-paper-manage-loop"),
         asyncio.create_task(_paper_sync_loop(), name="explodex-paper-sync-loop"),
         asyncio.create_task(_edge_loop(), name="explodex-edge-loop"),
+        asyncio.create_task(_verdict_memory_loop(), name="explodex-verdict-memory-loop"),
     ]
 
 
