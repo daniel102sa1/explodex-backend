@@ -27,6 +27,8 @@ def _extract(reason: Any) -> dict[str, Any]:
     sequential = context.get("sequential_microstructure") if isinstance(context.get("sequential_microstructure"), dict) else {}
     cascade = context.get("liquidation_cascade") if isinstance(context.get("liquidation_cascade"), dict) else {}
     leadlag = prediction.get("exchange_lead_lag") if isinstance(prediction.get("exchange_lead_lag"), dict) else {}
+    fusion = prediction.get("verdict_fusion") if isinstance(prediction.get("verdict_fusion"), dict) else {}
+    locks = fusion.get("locks") if isinstance(fusion.get("locks"), dict) else {}
 
     return {
         "sequential_ready": sequential.get("ready"),
@@ -53,12 +55,31 @@ def _extract(reason: Any) -> dict[str, Any]:
         "exchange_dispersion": leadlag.get("dispersion"),
         "exchange_support_direction": leadlag.get("support_direction"),
         "exchange_conflict_direction": leadlag.get("conflict_direction"),
-        "advanced_context_version": "v2",
+        "server_fusion_version": fusion.get("version"),
+        "lock_core": locks.get("core"),
+        "lock_mtf": locks.get("mtf"),
+        "lock_flow": locks.get("flow"),
+        "lock_trap": locks.get("trap"),
+        "lock_momentum": locks.get("momentum"),
+        "lock_entry": locks.get("entry"),
+        "lock_count": fusion.get("pass_count"),
+        "candidate_enter": fusion.get("candidate_enter"),
+        "fast_track": fusion.get("fast_track"),
+        "burst_detected": fusion.get("burst_detected"),
+        "technical_confidence": fusion.get("technical_confidence"),
+        "trap_risk": fusion.get("trap_risk"),
+        "decay_risk": fusion.get("decay_risk"),
+        "acceleration_score": fusion.get("acceleration_score"),
+        "mtf_strength": fusion.get("mtf_strength"),
+        "flow_strength": fusion.get("flow_strength"),
+        "entry_quality": fusion.get("entry_quality"),
+        "fusion_data_limited": fusion.get("data_limited"),
+        "advanced_context_version": "v3",
     }
 
 
 async def enrich_verdict_memory_context(db: AsyncSession, limit: int = 300) -> dict[str, int]:
-    """Backfill/refresh advanced decision-time context from immutable signal.reason.
+    """Backfill/refresh decision-time context from immutable signal.reason.
 
     This never uses future outcome data. It only copies fields that were already
     present when the signal was created, so the learning dataset remains leakage-safe.
@@ -69,7 +90,7 @@ async def enrich_verdict_memory_context(db: AsyncSession, limit: int = 300) -> d
             SELECT vm.id::text AS id, vm.metadata, s.reason
             FROM verdict_memory vm
             JOIN signals s ON s.id = vm.signal_id
-            WHERE COALESCE(vm.metadata->>'advanced_context_version','') <> 'v2'
+            WHERE COALESCE(vm.metadata->>'advanced_context_version','') <> 'v3'
             ORDER BY vm.observed_at DESC
             LIMIT :limit
             """
@@ -98,7 +119,7 @@ async def enrich_verdict_memory_context(db: AsyncSession, limit: int = 300) -> d
 
 
 async def advanced_context_stats(db: AsyncSession) -> dict[str, Any]:
-    """Outcome cohorts for the newest contextual engines, still sample-gated."""
+    """Outcome cohorts for contextual engines and server Verdict Fusion."""
     result = await db.execute(
         text(
             """
@@ -110,17 +131,20 @@ async def advanced_context_stats(db: AsyncSession) -> dict[str, Any]:
                 WHEN metadata->>'sequential_ready' = 'false' THEN 'WARMING_UP'
                 ELSE 'N/D'
               END AS sequential_status,
+              COALESCE(metadata->>'lock_count','N/D') AS lock_count,
+              CASE WHEN metadata->>'burst_detected' = 'true' THEN 'BURST' ELSE 'NO_BURST' END AS burst_status,
+              CASE WHEN metadata->>'fast_track' = 'true' THEN 'FAST_TRACK' ELSE 'NORMAL' END AS track_status,
               COUNT(*) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS decided,
               COUNT(*) FILTER (WHERE outcome='TP1_FIRST') AS wins,
               COUNT(*) FILTER (WHERE outcome='STOP_FIRST') AS losses,
               AVG(mfe_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mfe_pct,
               AVG(mae_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mae_pct
             FROM verdict_memory
-            WHERE metadata->>'advanced_context_version' = 'v2'
-            GROUP BY cascade_status, exchange_status, sequential_status
+            WHERE metadata->>'advanced_context_version' = 'v3'
+            GROUP BY cascade_status, exchange_status, sequential_status, lock_count, burst_status, track_status
             HAVING COUNT(*) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) > 0
             ORDER BY decided DESC
-            LIMIT 60
+            LIMIT 100
             """
         )
     )
@@ -141,5 +165,6 @@ async def advanced_context_stats(db: AsyncSession) -> dict[str, Any]:
         "mode": "SHADOW_LEARNING",
         "cohorts": cohorts,
         "usable_cohorts": sum(1 for row in cohorts if row["decided"] >= 30),
-        "rule": "Advanced context is descriptive below 30 comparable decided outcomes and never creates an entry or raises leverage.",
+        "server_fusion_fields": ["6_locks", "lock_count", "burst", "fast_track"],
+        "rule": "Server Verdict Fusion cohorts are descriptive below 30 comparable decided outcomes and never create an entry or raise leverage.",
     }
