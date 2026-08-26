@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from math import sqrt
@@ -34,7 +35,6 @@ def _wilson_lower_bound(wins: int, total: int, z: float = 1.96) -> float | None:
 
 
 def _interval_for_age(age: timedelta) -> str:
-    """Choose enough candle coverage to resolve observations up to seven days old."""
     if age <= timedelta(hours=24):
         return "5m"
     if age <= timedelta(hours=72):
@@ -58,8 +58,48 @@ def _normalize_group(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reason_bundle(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _learning_metadata(reason: Any) -> dict[str, Any]:
+    bundle = _reason_bundle(reason)
+    prediction = bundle.get("prediction") if isinstance(bundle.get("prediction"), dict) else {}
+    context = prediction.get("context_engine") if isinstance(prediction.get("context_engine"), dict) else {}
+    regime = context.get("regime") if isinstance(context.get("regime"), dict) else {}
+    micro = context.get("microstructure") if isinstance(context.get("microstructure"), dict) else {}
+    sequence = prediction.get("sequence") if isinstance(prediction.get("sequence"), dict) else {}
+    decision_guard = prediction.get("decision_guard") if isinstance(prediction.get("decision_guard"), dict) else {}
+
+    return {
+        "prediction_type": prediction.get("type"),
+        "prediction_phase": prediction.get("phase"),
+        "preactivation_score": prediction.get("preactivation_score"),
+        "market_regime": regime.get("regime") or sequence.get("market_regime"),
+        "regime_bias": regime.get("directional_bias") or sequence.get("regime_directional_bias"),
+        "regime_confidence": regime.get("confidence") or sequence.get("regime_confidence"),
+        "early_context_score": context.get("early_context_score") or sequence.get("early_context_score"),
+        "microstructure_score": micro.get("score") or sequence.get("microstructure_score"),
+        "microstructure_inputs": micro.get("available_inputs") or sequence.get("microstructure_inputs"),
+        "context_guard_pass": context.get("context_guard_pass") if "context_guard_pass" in context else sequence.get("context_guard_pass"),
+        "absorption_proxy": micro.get("absorption_proxy"),
+        "risk_guard_pass": decision_guard.get("risk_guard_pass", sequence.get("risk_guard_pass")),
+        "direction_stability": decision_guard.get("direction_stability", sequence.get("direction_stability")),
+        "reward_risk_tp1": decision_guard.get("reward_risk_tp1", sequence.get("reward_risk_tp1")),
+        "source": "server_signal_reason",
+    }
+
+
 async def capture_enter_verdicts(db: AsyncSession, limit: int = 200) -> dict[str, int]:
-    """Persist READY signals as immutable learning observations."""
+    """Persist READY decisions with the exact context known at decision time."""
     result = await db.execute(
         text(
             """
@@ -79,23 +119,25 @@ async def capture_enter_verdicts(db: AsyncSession, limit: int = 200) -> dict[str
     )
     rows = result.mappings().all()
     inserted = 0
-    for row in rows:
+    for source_row in rows:
+        row = dict(source_row)
+        row["metadata"] = json.dumps(_learning_metadata(row.get("reason")), separators=(",", ":"))
         await db.execute(
             text(
                 """
                 INSERT INTO verdict_memory (
                     signal_id, symbol_id, symbol, observed_at, direction,
                     setup_score, risk_score, entry_price, entry_low, entry_high,
-                    stop_loss, tp1, tp2, tp3, reason, outcome
+                    stop_loss, tp1, tp2, tp3, reason, metadata, outcome
                 ) VALUES (
                     CAST(:signal_id AS uuid), CAST(:symbol_id AS uuid), :symbol, :observed_at, :direction,
                     :setup_score, :risk_score, :entry_price, :entry_low, :entry_high,
-                    :stop_loss, :tp1, :tp2, :tp3, :reason, 'UNRESOLVED'
+                    :stop_loss, :tp1, :tp2, :tp3, :reason, CAST(:metadata AS JSONB), 'UNRESOLVED'
                 )
                 ON CONFLICT (signal_id) DO NOTHING
                 """
             ),
-            dict(row),
+            row,
         )
         inserted += 1
     await db.commit()
@@ -103,7 +145,6 @@ async def capture_enter_verdicts(db: AsyncSession, limit: int = 200) -> dict[str
 
 
 async def resolve_verdict_outcomes(db: AsyncSession, limit: int = 60) -> dict[str, int]:
-    """Resolve TP1_FIRST / STOP_FIRST from market candles while the UI is closed."""
     result = await db.execute(
         text(
             """
@@ -217,6 +258,35 @@ async def resolve_verdict_outcomes(db: AsyncSession, limit: int = 60) -> dict[st
     return {"checked": len(rows), "resolved": resolved, "ambiguous": ambiguous}
 
 
+async def _json_cohort(db: AsyncSession, expression: str, alias: str, *, limit: int = 40) -> list[dict[str, Any]]:
+    result = await db.execute(
+        text(
+            f"""
+            SELECT {expression} AS {alias},
+                   COUNT(*) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS decided,
+                   COUNT(*) FILTER (WHERE outcome = 'TP1_FIRST') AS wins,
+                   COUNT(*) FILTER (WHERE outcome = 'STOP_FIRST') AS losses,
+                   COUNT(*) FILTER (WHERE outcome = 'UNRESOLVED') AS unresolved,
+                   AVG(mfe_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mfe_pct,
+                   AVG(mae_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mae_pct,
+                   AVG(minutes_to_outcome) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_minutes
+            FROM verdict_memory
+            WHERE {expression} IS NOT NULL
+            GROUP BY {alias}
+            ORDER BY decided DESC NULLS LAST, {alias}
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    output: list[dict[str, Any]] = []
+    for source in result.mappings().all():
+        item = _normalize_group(dict(source))
+        item["unresolved"] = int(item.get("unresolved") or 0)
+        output.append(item)
+    return output
+
+
 async def verdict_memory_stats(db: AsyncSession) -> dict[str, Any]:
     global_result = await db.execute(
         text(
@@ -300,9 +370,70 @@ async def verdict_memory_stats(db: AsyncSession) -> dict[str, Any]:
         )
     )
     by_symbol = []
-    for item in symbol_result.mappings().all():
-        normalized = _normalize_group(dict(item))
-        normalized["unresolved"] = int(normalized.get("unresolved") or 0)
-        by_symbol.append(normalized)
+    for source in symbol_result.mappings().all():
+        item = _normalize_group(dict(source))
+        item["unresolved"] = int(item.get("unresolved") or 0)
+        by_symbol.append(item)
     row["by_symbol"] = by_symbol
+
+    row["by_regime"] = await _json_cohort(db, "metadata->>'market_regime'", "market_regime")
+    row["by_prediction_type"] = await _json_cohort(db, "metadata->>'prediction_type'", "prediction_type")
+    row["by_absorption"] = await _json_cohort(db, "metadata->>'absorption_proxy'", "absorption_proxy")
+
+    context_result = await db.execute(
+        text(
+            """
+            SELECT CASE
+                     WHEN NULLIF(metadata->>'early_context_score','')::numeric >= 80 THEN '80-100'
+                     WHEN NULLIF(metadata->>'early_context_score','')::numeric >= 65 THEN '65-79'
+                     WHEN NULLIF(metadata->>'early_context_score','')::numeric >= 50 THEN '50-64'
+                     ELSE '<50_OR_ND'
+                   END AS context_bucket,
+                   COUNT(*) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS decided,
+                   COUNT(*) FILTER (WHERE outcome = 'TP1_FIRST') AS wins,
+                   COUNT(*) FILTER (WHERE outcome = 'STOP_FIRST') AS losses,
+                   COUNT(*) FILTER (WHERE outcome = 'UNRESOLVED') AS unresolved,
+                   AVG(mfe_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mfe_pct,
+                   AVG(mae_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mae_pct,
+                   AVG(minutes_to_outcome) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_minutes
+            FROM verdict_memory
+            GROUP BY context_bucket
+            ORDER BY context_bucket DESC
+            """
+        )
+    )
+    row["by_context_score"] = []
+    for source in context_result.mappings().all():
+        item = _normalize_group(dict(source))
+        item["unresolved"] = int(item.get("unresolved") or 0)
+        row["by_context_score"].append(item)
+
+    micro_result = await db.execute(
+        text(
+            """
+            SELECT CASE
+                     WHEN NULLIF(metadata->>'microstructure_score','')::numeric >= 70 THEN '70-100'
+                     WHEN NULLIF(metadata->>'microstructure_score','')::numeric >= 55 THEN '55-69'
+                     WHEN NULLIF(metadata->>'microstructure_score','')::numeric >= 40 THEN '40-54'
+                     ELSE '<40_OR_ND'
+                   END AS micro_bucket,
+                   COUNT(*) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS decided,
+                   COUNT(*) FILTER (WHERE outcome = 'TP1_FIRST') AS wins,
+                   COUNT(*) FILTER (WHERE outcome = 'STOP_FIRST') AS losses,
+                   COUNT(*) FILTER (WHERE outcome = 'UNRESOLVED') AS unresolved,
+                   AVG(mfe_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mfe_pct,
+                   AVG(mae_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mae_pct
+            FROM verdict_memory
+            GROUP BY micro_bucket
+            ORDER BY micro_bucket DESC
+            """
+        )
+    )
+    row["by_microstructure_score"] = []
+    for source in micro_result.mappings().all():
+        item = _normalize_group(dict(source))
+        item["unresolved"] = int(item.get("unresolved") or 0)
+        row["by_microstructure_score"].append(item)
+
+    row["context_learning_note"] = "Context/regime cohorts stay CALIBRATING below 30 decided cases and cannot create entries or raise leverage."
     return row
