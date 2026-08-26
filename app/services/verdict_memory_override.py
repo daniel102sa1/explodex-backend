@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.context_meta_shadow import build_context_meta_shadow_report
 from app.services.context_veto_shadow import build_graduated_veto_shadow
+from app.services.rolling_context_validation import build_rolling_context_validation
 from app.services.verdict_context_enrichment import advanced_context_stats, enrich_verdict_memory_context
 from app.services.verdict_resolver_resilient import resolve_verdict_outcomes_resilient
 
@@ -13,12 +14,7 @@ _INSTALLED = False
 
 
 def install_verdict_memory_overrides() -> None:
-    """Install conservative extensions before runtime imports verdict_memory callables.
-
-    This keeps the original capture/statistics implementation intact while adding
-    decision-time context enrichment, per-symbol resolver fault isolation, a combined
-    shadow meta-model and a graduated veto-evidence layer that cannot alter entries.
-    """
+    """Install conservative verdict-memory extensions before runtime imports them."""
     global _INSTALLED
     if _INSTALLED:
         return
@@ -37,8 +33,10 @@ def install_verdict_memory_overrides() -> None:
         base = await original_stats(db)
         base["advanced_context"] = await advanced_context_stats(db)
         meta = await build_context_meta_shadow_report(db)
+        rolling = await build_rolling_context_validation(db)
         base["context_meta_shadow"] = meta
-        base["context_veto_shadow"] = build_graduated_veto_shadow(meta)
+        base["rolling_context_validation"] = rolling
+        base["context_veto_shadow"] = build_graduated_veto_shadow(meta, rolling)
         return base
 
     module.capture_enter_verdicts = capture_enter_verdicts_v2
