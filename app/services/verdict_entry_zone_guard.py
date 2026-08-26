@@ -86,7 +86,11 @@ def build_guarded_verdict_fusion(
     if high_quality_zone:
         fusion["entry_quality"] = round(max(_f(fusion.get("entry_quality")), min(100.0, quality_score)), 2)
 
-    fusion["version"] = "server_guarded_v2"
+    # Keep the version understood by the current web client while exposing the
+    # stronger contract explicitly in separate metadata. This avoids a fallback
+    # to browser-only fusion until the typed frontend migration lands.
+    fusion["version"] = "server_parity_v1"
+    fusion["guard_version"] = "entry_zone_guard_v2"
     fusion["plan_contract"] = {
         "used_prediction_plan": used_prediction_plan,
         "matches_scanner_plan_selection": True,
