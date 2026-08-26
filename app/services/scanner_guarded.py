@@ -5,14 +5,16 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import scanner as scanner_module
+from app.services.microstructure_persistence_resilient import install_microstructure_persistence_hardening
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.scanner_edge_gate import apply_edge_gate_to_scanner_run
 from app.services.verdict_memory_override import install_verdict_memory_overrides
 
-# Install verdict-memory extensions before runtime imports verdict_memory callables.
-# This keeps provider failures isolated per symbol and enriches every decision with
-# the advanced context that existed at decision time.
+# Install runtime extensions before runtime.py imports direct service callables.
+# This keeps provider failures isolated per symbol, enriches decision-time context,
+# and makes microstructure persistence transactional/retry-safe.
 install_verdict_memory_overrides()
+install_microstructure_persistence_hardening()
 
 # Preserve the raw scanner callable exactly once. This module is imported during
 # backend startup before main.py imports run_scanner from scanner.py.
