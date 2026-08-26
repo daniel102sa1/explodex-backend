@@ -90,3 +90,40 @@ async def ensure_runtime_schema() -> None:
         )
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_edge_due ON edge_observations(status, due_at)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_edge_cohort ON edge_observations(direction, prediction_type, btc_regime, status)"))
+
+        # Verdict Memory: server-side learning survives browser closes and device changes.
+        # Only records decisions already produced by ExplodeX; it never creates entries.
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS verdict_memory (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    signal_id UUID UNIQUE NOT NULL REFERENCES signals(id) ON DELETE CASCADE,
+                    symbol_id UUID NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+                    symbol VARCHAR(32) NOT NULL,
+                    observed_at TIMESTAMPTZ NOT NULL,
+                    direction VARCHAR(8) NOT NULL,
+                    setup_score NUMERIC(8,3),
+                    risk_score NUMERIC(8,3),
+                    entry_price NUMERIC(30,12),
+                    entry_low NUMERIC(30,12),
+                    entry_high NUMERIC(30,12),
+                    stop_loss NUMERIC(30,12),
+                    tp1 NUMERIC(30,12),
+                    tp2 NUMERIC(30,12),
+                    tp3 NUMERIC(30,12),
+                    reason TEXT,
+                    outcome VARCHAR(20) NOT NULL DEFAULT 'UNRESOLVED',
+                    outcome_at TIMESTAMPTZ,
+                    evaluated_at TIMESTAMPTZ,
+                    minutes_to_outcome NUMERIC(14,4),
+                    mfe_pct NUMERIC(14,6),
+                    mae_pct NUMERIC(14,6),
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    CHECK (outcome IN ('UNRESOLVED','TP1_FIRST','STOP_FIRST','AMBIGUOUS'))
+                )
+                """
+            )
+        )
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_verdict_memory_outcome_time ON verdict_memory(outcome, observed_at)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_verdict_memory_profile ON verdict_memory(direction, setup_score, risk_score, outcome)"))
