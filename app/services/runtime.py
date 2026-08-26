@@ -14,6 +14,7 @@ from app.services.scanner_guarded import run_scanner
 from app.services.sequential_microstructure import flush_pending_snapshots, hydrate_recent_histories, prune_persistent_history
 from app.services.trade_time_manager import manage_trade_time_stops
 from app.services.verdict_memory import capture_enter_verdicts, resolve_verdict_outcomes, verdict_memory_stats
+from app.services.walk_forward import build_walk_forward_report
 
 logger = logging.getLogger("explodex.runtime")
 
@@ -223,11 +224,13 @@ async def _run_verdict_memory_once() -> None:
             resolved = await resolve_verdict_outcomes(db, limit=60)
             stats = await verdict_memory_stats(db)
             shadow_model = await build_tp1_stop_shadow_report(db)
+            walk_forward = await build_walk_forward_report(db)
         runtime_state.last_verdict_memory_result = {
             "capture": captured,
             "resolve": resolved,
             "stats": stats,
             "tp1_stop_shadow_model": shadow_model,
+            "walk_forward": walk_forward,
         }
         runtime_state.last_verdict_memory_ok = True
         runtime_state.last_verdict_memory_error = None
