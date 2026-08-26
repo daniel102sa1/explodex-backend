@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.context_meta_shadow import build_context_meta_shadow_report
 from app.services.context_veto_shadow import build_graduated_veto_shadow
+from app.services.fusion_edge_research import build_fusion_edge_research
 from app.services.rolling_context_validation import build_rolling_context_validation
 from app.services.verdict_context_enrichment import advanced_context_stats, enrich_verdict_memory_context
 from app.services.verdict_resolver_resilient import resolve_verdict_outcomes_resilient
@@ -32,6 +33,7 @@ def install_verdict_memory_overrides() -> None:
     async def verdict_memory_stats_v2(db: AsyncSession) -> dict[str, Any]:
         base = await original_stats(db)
         base["advanced_context"] = await advanced_context_stats(db)
+        base["fusion_edge_research"] = await build_fusion_edge_research(db)
         meta = await build_context_meta_shadow_report(db)
         rolling = await build_rolling_context_validation(db)
         base["context_meta_shadow"] = meta
