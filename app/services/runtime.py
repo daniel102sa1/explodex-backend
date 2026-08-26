@@ -8,6 +8,7 @@ from typing import Any
 from app.config import settings
 from app.database import SessionLocal
 from app.services.edge_engine import capture_recent_signals, label_due_observations
+from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
 from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
 from app.services.scanner_guarded import run_scanner
 from app.services.trade_time_manager import manage_trade_time_stops
@@ -206,10 +207,12 @@ async def _run_verdict_memory_once() -> None:
             captured = await capture_enter_verdicts(db, limit=200)
             resolved = await resolve_verdict_outcomes(db, limit=60)
             stats = await verdict_memory_stats(db)
+            shadow_model = await build_tp1_stop_shadow_report(db)
         runtime_state.last_verdict_memory_result = {
             "capture": captured,
             "resolve": resolved,
             "stats": stats,
+            "tp1_stop_shadow_model": shadow_model,
         }
         runtime_state.last_verdict_memory_ok = True
         runtime_state.last_verdict_memory_error = None
