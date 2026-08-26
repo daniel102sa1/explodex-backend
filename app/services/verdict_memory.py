@@ -36,18 +36,30 @@ def _wilson_lower_bound(wins: int, total: int, z: float = 1.96) -> float | None:
 def _interval_for_age(age: timedelta) -> str:
     """Choose enough candle coverage to resolve observations up to seven days old."""
     if age <= timedelta(hours=24):
-        return "5m"       # 300 candles ~= 25h
+        return "5m"
     if age <= timedelta(hours=72):
-        return "15m"      # 300 candles ~= 75h
-    return "1h"           # 300 candles ~= 12.5d
+        return "15m"
+    return "1h"
+
+
+def _normalize_group(row: dict[str, Any]) -> dict[str, Any]:
+    decided = int(row.get("decided") or 0)
+    wins = int(row.get("wins") or 0)
+    losses = int(row.get("losses") or 0)
+    return {
+        **row,
+        "decided": decided,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": (wins / decided * 100.0) if decided else None,
+        "wilson_low_pct": _wilson_lower_bound(wins, decided),
+        "sample_status": "CALIBRATING" if decided < 30 else "USABLE",
+        "can_influence_veto": decided >= 30,
+    }
 
 
 async def capture_enter_verdicts(db: AsyncSession, limit: int = 200) -> dict[str, int]:
-    """Persist READY signals as immutable learning observations.
-
-    This intentionally does not create new trades or change execution logic. It only
-    records what ExplodeX already decided so outcomes can be measured server-side.
-    """
+    """Persist READY signals as immutable learning observations."""
     result = await db.execute(
         text(
             """
@@ -206,7 +218,7 @@ async def resolve_verdict_outcomes(db: AsyncSession, limit: int = 60) -> dict[st
 
 
 async def verdict_memory_stats(db: AsyncSession) -> dict[str, Any]:
-    result = await db.execute(
+    global_result = await db.execute(
         text(
             """
             SELECT
@@ -217,22 +229,80 @@ async def verdict_memory_stats(db: AsyncSession) -> dict[str, Any]:
                 COUNT(*) FILTER (WHERE outcome = 'UNRESOLVED') AS unresolved,
                 AVG(mfe_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mfe_pct,
                 AVG(mae_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mae_pct,
-                AVG(minutes_to_outcome) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_minutes
+                AVG(minutes_to_outcome) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_minutes,
+                MAX(evaluated_at) AS last_evaluated_at,
+                MAX(observed_at) AS last_observed_at
             FROM verdict_memory
             """
         )
     )
-    row = dict(result.mappings().one())
-    decided = int(row.get("decided") or 0)
-    wins = int(row.get("wins") or 0)
-    losses = int(row.get("losses") or 0)
-    row["decided"] = decided
-    row["wins"] = wins
-    row["losses"] = losses
+    row = _normalize_group(dict(global_result.mappings().one()))
     row["ambiguous"] = int(row.get("ambiguous") or 0)
     row["unresolved"] = int(row.get("unresolved") or 0)
-    row["win_rate_pct"] = (wins / decided * 100.0) if decided else None
-    row["wilson_low_pct"] = _wilson_lower_bound(wins, decided)
-    row["sample_status"] = "CALIBRATING" if decided < 30 else "USABLE"
-    row["can_influence_veto"] = decided >= 30
+
+    direction_result = await db.execute(
+        text(
+            """
+            SELECT direction,
+                   COUNT(*) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS decided,
+                   COUNT(*) FILTER (WHERE outcome = 'TP1_FIRST') AS wins,
+                   COUNT(*) FILTER (WHERE outcome = 'STOP_FIRST') AS losses,
+                   AVG(mfe_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mfe_pct,
+                   AVG(mae_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mae_pct,
+                   AVG(minutes_to_outcome) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_minutes
+            FROM verdict_memory
+            GROUP BY direction
+            ORDER BY direction
+            """
+        )
+    )
+    row["by_direction"] = [_normalize_group(dict(r)) for r in direction_result.mappings().all()]
+
+    score_result = await db.execute(
+        text(
+            """
+            SELECT CASE
+                     WHEN setup_score >= 90 THEN '90-100'
+                     WHEN setup_score >= 85 THEN '85-89'
+                     WHEN setup_score >= 80 THEN '80-84'
+                     ELSE '<80'
+                   END AS score_bucket,
+                   COUNT(*) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS decided,
+                   COUNT(*) FILTER (WHERE outcome = 'TP1_FIRST') AS wins,
+                   COUNT(*) FILTER (WHERE outcome = 'STOP_FIRST') AS losses,
+                   AVG(mfe_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mfe_pct,
+                   AVG(mae_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mae_pct
+            FROM verdict_memory
+            GROUP BY score_bucket
+            ORDER BY score_bucket DESC
+            """
+        )
+    )
+    row["by_score"] = [_normalize_group(dict(r)) for r in score_result.mappings().all()]
+
+    symbol_result = await db.execute(
+        text(
+            """
+            SELECT symbol,
+                   COUNT(*) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS decided,
+                   COUNT(*) FILTER (WHERE outcome = 'TP1_FIRST') AS wins,
+                   COUNT(*) FILTER (WHERE outcome = 'STOP_FIRST') AS losses,
+                   COUNT(*) FILTER (WHERE outcome = 'UNRESOLVED') AS unresolved,
+                   AVG(mfe_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mfe_pct,
+                   AVG(mae_pct) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_mae_pct,
+                   AVG(minutes_to_outcome) FILTER (WHERE outcome IN ('TP1_FIRST','STOP_FIRST')) AS avg_minutes
+            FROM verdict_memory
+            GROUP BY symbol
+            HAVING COUNT(*) > 0
+            ORDER BY decided DESC, symbol ASC
+            LIMIT 80
+            """
+        )
+    )
+    by_symbol = []
+    for item in symbol_result.mappings().all():
+        normalized = _normalize_group(dict(item))
+        normalized["unresolved"] = int(normalized.get("unresolved") or 0)
+        by_symbol.append(normalized)
+    row["by_symbol"] = by_symbol
     return row
