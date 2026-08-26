@@ -11,6 +11,7 @@ from app.services.edge_engine import capture_recent_signals, label_due_observati
 from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
 from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
 from app.services.scanner_guarded import run_scanner
+from app.services.sequential_microstructure import flush_pending_snapshots, hydrate_recent_histories, prune_persistent_history
 from app.services.trade_time_manager import manage_trade_time_stops
 from app.services.verdict_memory import capture_enter_verdicts, resolve_verdict_outcomes, verdict_memory_stats
 
@@ -45,11 +46,17 @@ class RuntimeState:
         self.last_verdict_memory_error: str | None = None
         self.last_verdict_memory_result: dict[str, Any] | None = None
 
+        self.last_microstructure_memory_at: datetime | None = None
+        self.last_microstructure_memory_ok: bool | None = None
+        self.last_microstructure_memory_error: str | None = None
+        self.last_microstructure_memory_result: dict[str, Any] | None = None
+
         self.scanner_running = False
         self.paper_manage_running = False
         self.paper_sync_running = False
         self.edge_running = False
         self.verdict_memory_running = False
+        self.microstructure_memory_running = False
 
     def as_dict(self) -> dict[str, Any]:
         def iso(value: datetime | None) -> str | None:
@@ -98,6 +105,14 @@ class RuntimeState:
                 "last_ok": self.last_verdict_memory_ok,
                 "last_error": self.last_verdict_memory_error,
                 "last_result": self.last_verdict_memory_result,
+            },
+            "microstructure_memory": {
+                "running": self.microstructure_memory_running,
+                "interval_seconds": 30,
+                "last_run_at": iso(self.last_microstructure_memory_at),
+                "last_ok": self.last_microstructure_memory_ok,
+                "last_error": self.last_microstructure_memory_error,
+                "last_result": self.last_microstructure_memory_result,
             },
         }
 
@@ -225,6 +240,32 @@ async def _run_verdict_memory_once() -> None:
         runtime_state.verdict_memory_running = False
 
 
+async def _run_microstructure_memory_once(*, hydrate: bool = False, prune: bool = False) -> None:
+    if runtime_state.microstructure_memory_running:
+        return
+    runtime_state.microstructure_memory_running = True
+    try:
+        async with SessionLocal() as db:
+            restored = await hydrate_recent_histories(db) if hydrate else None
+            flushed = await flush_pending_snapshots(db, limit=500)
+            pruned = await prune_persistent_history(db, retention_hours=24) if prune else 0
+        runtime_state.last_microstructure_memory_result = {
+            "restored": restored,
+            "flushed": flushed,
+            "pruned": pruned,
+            "retention_hours": 24,
+        }
+        runtime_state.last_microstructure_memory_ok = True
+        runtime_state.last_microstructure_memory_error = None
+    except Exception as exc:
+        logger.exception("Microstructure Memory cycle failed")
+        runtime_state.last_microstructure_memory_ok = False
+        runtime_state.last_microstructure_memory_error = str(exc)[:1000]
+    finally:
+        runtime_state.last_microstructure_memory_at = datetime.now(timezone.utc)
+        runtime_state.microstructure_memory_running = False
+
+
 async def _scanner_loop() -> None:
     await asyncio.sleep(8)
     while True:
@@ -260,6 +301,16 @@ async def _verdict_memory_loop() -> None:
         await asyncio.sleep(120)
 
 
+async def _microstructure_memory_loop() -> None:
+    await asyncio.sleep(3)
+    await _run_microstructure_memory_once(hydrate=True, prune=True)
+    cycles = 0
+    while True:
+        await asyncio.sleep(30)
+        cycles += 1
+        await _run_microstructure_memory_once(prune=(cycles % 120 == 0))
+
+
 async def start_runtime() -> list[asyncio.Task[Any]]:
     runtime_state.started_at = datetime.now(timezone.utc)
     if not settings.scheduler_enabled:
@@ -271,6 +322,7 @@ async def start_runtime() -> list[asyncio.Task[Any]]:
         asyncio.create_task(_paper_sync_loop(), name="explodex-paper-sync-loop"),
         asyncio.create_task(_edge_loop(), name="explodex-edge-loop"),
         asyncio.create_task(_verdict_memory_loop(), name="explodex-verdict-memory-loop"),
+        asyncio.create_task(_microstructure_memory_loop(), name="explodex-microstructure-memory-loop"),
     ]
 
 
