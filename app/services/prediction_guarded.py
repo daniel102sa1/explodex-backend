@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.context_engine import apply_context_engine
+from app.services.exchange_lead_lag import apply_exchange_lead_lag
 from app.services.liquidation_cascade import apply_liquidation_cascade
 from app.services.prediction_engine import build_pre_move_prediction as build_raw_pre_move_prediction
 from app.services.prediction_safety import apply_prediction_safety
@@ -18,4 +19,5 @@ def build_pre_move_prediction(
     safe = apply_prediction_safety(scored, raw)
     contextual = apply_context_engine(scored, snapshot, coinglass, safe)
     sequential = apply_sequential_context(scored, snapshot, contextual)
-    return apply_liquidation_cascade(scored, coinglass, sequential)
+    cascade = apply_liquidation_cascade(scored, coinglass, sequential)
+    return apply_exchange_lead_lag(coinglass, cascade)
