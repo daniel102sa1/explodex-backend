@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from time import time
 from typing import Any
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -14,6 +18,23 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def _trade_delta_ratio(trades: list[dict[str, Any]]) -> float | None:
+    buy = 0.0
+    sell = 0.0
+    for trade in trades:
+        price = _f(trade.get("p") or trade.get("price"))
+        qty = _f(trade.get("q") or trade.get("qty"))
+        notional = price * qty
+        if notional <= 0:
+            continue
+        if bool(trade.get("m", False)):
+            sell += notional
+        else:
+            buy += notional
+    total = buy + sell
+    return ((buy - sell) / total) if total > 0 else None
 
 
 def _book_state(
@@ -119,10 +140,8 @@ def _sequential_absorption(rows: list[dict[str, Any]]) -> tuple[float | None, st
     avg_delta = sum(deltas) / len(deltas)
     move_pct = (end_price - start_price) / start_price * 100.0
 
-    # Persistent aggressive buying without upward progress is bearish absorption.
     if avg_delta >= 0.08 and move_pct <= 0.05:
         return -1.0, "BUYS_ABSORBED"
-    # Persistent aggressive selling without downward progress is bullish absorption.
     if avg_delta <= -0.08 and move_pct >= -0.05:
         return 1.0, "SELLS_ABSORBED"
     return 0.0, "NONE"
@@ -175,6 +194,124 @@ def _metrics(history: deque[dict[str, Any]]) -> dict[str, Any]:
 
 
 _HISTORY: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=18))
+_HYDRATED: set[str] = set()
+
+
+def _epoch(value: datetime | None) -> float:
+    if value is None:
+        return time()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+async def hydrate_symbol_history(db: AsyncSession, symbol: str, limit: int = 18) -> int:
+    key = (symbol or "UNKNOWN").upper()
+    if key in _HYDRATED:
+        return len(_HISTORY[key])
+
+    result = await db.execute(
+        text(
+            """
+            SELECT observed_at, bid_price, ask_price, bid_size, ask_size,
+                   bid_depth, ask_depth, mid_price, imbalance,
+                   current_price, futures_delta
+            FROM microstructure_snapshots
+            WHERE symbol = :symbol
+              AND observed_at >= NOW() - INTERVAL '90 minutes'
+            ORDER BY observed_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"symbol": key, "limit": max(3, min(limit, 60))},
+    )
+    rows = list(reversed(result.mappings().all()))
+    history = _HISTORY[key]
+    history.clear()
+    for row in rows:
+        history.append({
+            "ts": _epoch(row["observed_at"]),
+            "bid_price": _f(row["bid_price"]),
+            "ask_price": _f(row["ask_price"]),
+            "bid_size": _f(row["bid_size"]),
+            "ask_size": _f(row["ask_size"]),
+            "bid_depth": _f(row["bid_depth"]),
+            "ask_depth": _f(row["ask_depth"]),
+            "mid": _f(row["mid_price"]),
+            "imbalance": _f(row["imbalance"]),
+            "price": _f(row["current_price"]),
+            "futures_delta": _f(row["futures_delta"]) if row["futures_delta"] is not None else None,
+        })
+    _HYDRATED.add(key)
+    return len(history)
+
+
+async def persist_snapshot_from_market(
+    db: AsyncSession,
+    symbol: str,
+    snapshot: dict[str, Any],
+    current_price: float,
+) -> dict[str, Any]:
+    """Persist one real L2 observation and hydrate recent history after restarts."""
+    key = (symbol or "UNKNOWN").upper()
+    await hydrate_symbol_history(db, key)
+
+    futures_delta = _trade_delta_ratio(snapshot.get("agg_trades") or [])
+    state = _book_state(snapshot.get("order_book") or {}, current_price, futures_delta)
+    if state is None:
+        return {"persisted": False, "symbol": key, "reason": "order_book_unavailable"}
+
+    history = _HISTORY[key]
+    now_ts = _f(state.get("ts"))
+    if history and now_ts - _f(history[-1].get("ts")) < 2.0:
+        history[-1] = state
+    else:
+        history.append(state)
+
+    await db.execute(
+        text(
+            """
+            INSERT INTO microstructure_snapshots (
+                symbol, observed_at, bid_price, ask_price, bid_size, ask_size,
+                bid_depth, ask_depth, mid_price, imbalance, current_price,
+                futures_delta, source
+            ) VALUES (
+                :symbol, NOW(), :bid_price, :ask_price, :bid_size, :ask_size,
+                :bid_depth, :ask_depth, :mid_price, :imbalance, :current_price,
+                :futures_delta, :source
+            )
+            """
+        ),
+        {
+            "symbol": key,
+            "bid_price": state["bid_price"],
+            "ask_price": state["ask_price"],
+            "bid_size": state["bid_size"],
+            "ask_size": state["ask_size"],
+            "bid_depth": state["bid_depth"],
+            "ask_depth": state["ask_depth"],
+            "mid_price": state["mid"],
+            "imbalance": state["imbalance"],
+            "current_price": state["price"],
+            "futures_delta": state["futures_delta"],
+            "source": str(snapshot.get("source") or "UNKNOWN")[:32],
+        },
+    )
+    return {"persisted": True, "symbol": key, "history": len(history)}
+
+
+async def prune_persistent_history(db: AsyncSession, retention_hours: int = 24) -> int:
+    result = await db.execute(
+        text(
+            """
+            DELETE FROM microstructure_snapshots
+            WHERE observed_at < NOW() - (:hours * INTERVAL '1 hour')
+            """
+        ),
+        {"hours": max(2, min(retention_hours, 168))},
+    )
+    await db.commit()
+    return int(result.rowcount or 0)
 
 
 def observe_sequential_microstructure(
@@ -183,17 +320,14 @@ def observe_sequential_microstructure(
     current_price: float,
     futures_delta: float | None,
 ) -> dict[str, Any]:
-    """Build sequential metrics only from real order-book snapshots observed by this process.
-
-    The history is intentionally process-local in v1: no values are fabricated after a
-    deploy/restart, and metrics remain in warm-up until enough fresh snapshots arrive.
-    """
+    """Build sequential metrics from hydrated persistent history plus the live snapshot."""
     key = (symbol or "UNKNOWN").upper()
     state = _book_state(book, current_price, futures_delta)
     history = _HISTORY[key]
     if state is None:
         result = _metrics(history)
-        result["data_note"] = "Order-book snapshot unavailable; sequential metrics keep the last real in-process window and do not fabricate data."
+        result["persistent_history"] = key in _HYDRATED
+        result["data_note"] = "Order-book snapshot unavailable; ExplodeX keeps only previously observed real history and does not fabricate data."
         return result
 
     if history and _f(state.get("ts")) - _f(history[-1].get("ts")) < 2.0:
@@ -202,8 +336,9 @@ def observe_sequential_microstructure(
         history.append(state)
 
     result = _metrics(history)
+    result["persistent_history"] = key in _HYDRATED
     result["data_note"] = (
-        "Sequential L2 metrics use real snapshots observed by the running backend. "
-        "They need at least 3 snapshots and reset to warm-up after a deploy/restart."
+        "Sequential L2 metrics use real snapshots. Recent history is restored from PostgreSQL after restart; "
+        "new metrics still require enough fresh/retained observations."
     )
     return result
