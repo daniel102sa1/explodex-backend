@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.position_continuation_engine import build_continuation_outlook, build_entry_readiness
+
 
 def _f(value: Any, default: float = 0.0) -> float:
     try:
@@ -12,11 +14,7 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 def _protective_orders(orders: list[dict[str, Any]], direction: str) -> dict[str, Any]:
     close_side = "SELL" if direction == "LONG" else "BUY"
-    relevant = [
-        row for row in orders
-        if str(row.get("side") or "").upper() == close_side
-        and (bool(row.get("reduce_only")) or bool(row.get("close_position")))
-    ]
+    relevant = [row for row in orders if str(row.get("side") or "").upper() == close_side and (bool(row.get("reduce_only")) or bool(row.get("close_position")))]
     stops: list[float] = []
     targets: list[float] = []
     for row in relevant:
@@ -30,19 +28,10 @@ def _protective_orders(orders: list[dict[str, Any]], direction: str) -> dict[str
             stops.append(trigger)
         elif "TAKE_PROFIT" in order_type or order_type in {"LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"}:
             targets.append(trigger)
-    return {
-        "stop_prices": sorted(stops),
-        "target_prices": sorted(targets),
-        "has_protective_stop": bool(stops),
-        "has_take_profit": bool(targets),
-    }
+    return {"stop_prices": sorted(stops), "target_prices": sorted(targets), "has_protective_stop": bool(stops), "has_take_profit": bool(targets)}
 
 
-def build_position_coach(
-    position: dict[str, Any],
-    analysis: dict[str, Any] | None,
-    open_orders: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def build_position_coach(position: dict[str, Any], analysis: dict[str, Any] | None, open_orders: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     analysis = dict(analysis or {})
     prediction = dict(analysis.get("prediction") or {})
     fusion = dict(prediction.get("verdict_fusion") or {})
@@ -55,13 +44,11 @@ def build_position_coach(
     notional = abs(_f(position.get("notional")))
     leverage = max(1, int(_f(position.get("leverage"), 1)))
     unrealized = _f(position.get("unrealized_pnl"))
-
     move_pct = ((mark - entry) / entry * 100.0 * side) if entry > 0 and mark > 0 else 0.0
     pnl_on_notional_pct = unrealized / notional * 100.0 if notional > 0 else move_pct
     approximate_margin_roi_pct = pnl_on_notional_pct * leverage
 
     analysis_direction = str(analysis.get("direction") or prediction.get("direction") or "N/D").upper()
-    direction_aligned = analysis_direction == direction
     locks = dict(fusion.get("locks") or {})
     pass_count = int(_f(fusion.get("pass_count")))
     trap = _f(fusion.get("trap_risk"), 50.0)
@@ -76,89 +63,39 @@ def build_position_coach(
     zone_quality = _f(zone.get("quality_score"), -1.0)
 
     protective = _protective_orders(list(open_orders or []), direction)
+    entry_readiness = build_entry_readiness(fusion=fusion, zone=zone, phase=phase, invalidated=invalidated)
+    continuation = build_continuation_outlook(direction=direction, analysis_direction=analysis_direction, fusion=fusion, move_pct=move_pct, invalidated=invalidated)
 
-    score = 50.0
-    score += 14 if direction_aligned else -22
-    score += 12 if pass_count >= 5 else 5 if pass_count == 4 else -10
-    score += 8 if bool(locks.get("mtf")) else -5
-    score += 8 if bool(locks.get("flow")) else -6
-    score += 8 if trap <= 45 else -12 if trap >= 65 else 0
-    score += 8 if decay <= 50 else -12 if decay >= 72 else 0
-    score += 7 if acceleration >= 58 else 0
-    score += 5 if phase == "ACTIVADO" else -4 if phase in {"SIN_SETUP", "SIN_DATOS"} else 0
-    if invalidated:
-        score -= 35
-    score = max(0.0, min(100.0, score))
-
-    strengthening = (
-        direction_aligned
-        and pass_count >= 5
-        and trap <= 45
-        and decay <= 52
-        and acceleration >= 58
-        and flow >= 55
-    )
-    structurally_healthy = (
-        direction_aligned
-        and pass_count >= 4
-        and trap < 62
-        and decay < 68
-        and not invalidated
-    )
-    deterioration = (
-        invalidated
-        or (not direction_aligned and pass_count >= 4)
-        or trap >= 72
-        or decay >= 78
-    )
-
-    if invalidated:
-        state = "THESIS_DAMAGED"
-        title = "TESIS DAÑADA"
-        message = "El análisis actual cruzó su invalidación técnica. No se interpreta como un retroceso normal."
-    elif deterioration:
-        state = "DETERIORATING"
-        title = "CUIDADO · DETERIORO"
-        message = "Aumentaron señales contrarias, riesgo de trampa o agotamiento. La operación necesita vigilancia."
-    elif strengthening and move_pct >= 0:
+    continuation_state = str(continuation.get("state") or "MIXED")
+    if continuation_state == "THESIS_DAMAGED":
+        state, title, message = "THESIS_DAMAGED", "TESIS DAÑADA", "La estructura principal se invalidó; esto ya no se clasifica como un retroceso normal."
+    elif continuation_state == "CAUTION":
+        state, title, message = "DETERIORATING", "CUIDADO · DETERIORO", "La continuación perdió calidad por riesgo de trampa, agotamiento o conflicto de dirección."
+    elif continuation_state == "CONTINUATION_STRONG" and move_pct >= 0:
         state = "STRENGTHENING"
         title = "SUBIDA FORTALECIÉNDOSE" if direction == "LONG" else "BAJADA FORTALECIÉNDOSE"
-        message = "La dirección, flujo y momentum siguen alineados; todavía no aparece deterioro técnico fuerte."
-    elif move_pct < 0 and structurally_healthy:
-        state = "NORMAL_PULLBACK"
-        title = "RETROCESO NORMAL · POR AHORA"
-        message = "El precio va contra la entrada, pero la estructura técnica principal todavía se mantiene."
-    elif structurally_healthy:
-        state = "HEALTHY"
-        title = "OPERACIÓN SALUDABLE"
-        message = "La tesis principal sigue viva y los filtros técnicos permanecen razonablemente alineados."
+        message = "La posición mantiene continuación técnica fuerte. Puede ocurrir aunque una nueva entrada ya no tenga 6/6 locks."
+    elif continuation_state in {"CONTINUATION_STRONG", "CONTINUATION_MODERATE"} and move_pct < 0:
+        state, title, message = "NORMAL_PULLBACK", "RETROCESO NORMAL · POR AHORA", "El precio retrocede, pero estructura, flujo y contexto todavía conservan soporte técnico."
+    elif continuation_state == "CONTINUATION_MODERATE":
+        state, title, message = "HEALTHY", "OPERACIÓN SALUDABLE", "La continuación sigue favorable, aunque no con fuerza máxima."
     else:
-        state = "WATCH"
-        title = "VIGILAR"
-        message = "No hay invalidación clara, pero la confluencia actual tampoco es suficientemente fuerte para llamarla saludable."
+        state, title, message = "WATCH", "VIGILAR", "La continuación actual es mixta o débil; todavía no hay invalidación definitiva."
 
-    next_watch: list[str] = []
-    if not direction_aligned:
-        next_watch.append("La dirección actual de ExplodeX no coincide con tu posición.")
-    if trap >= 60:
-        next_watch.append(f"Riesgo de trampa elevado: {trap:.0f}/100.")
-    if decay >= 65:
-        next_watch.append(f"Momentum cansado: decay {decay:.0f}/100.")
-    if acceleration >= 58 and direction_aligned:
-        next_watch.append(f"Aceleración favorable: {acceleration:.0f}/100.")
+    next_watch = list(continuation.get("warnings") or [])
     if not protective.get("has_protective_stop"):
         next_watch.append("No se detectó una orden reduce-only/close-position de stop en las órdenes abiertas.")
 
     return {
-        "version": "live_position_coach_v1",
+        "version": "live_position_coach_v2",
         "state": state,
         "title": title,
         "message": message,
-        "health_score": round(score, 1),
+        "health_score": round(_f(continuation.get("score"), 50.0), 1),
         "score_is_probability": False,
         "direction": direction,
         "analysis_direction": analysis_direction,
-        "direction_aligned": direction_aligned,
+        "direction_aligned": analysis_direction == direction,
         "entry_price": entry,
         "mark_price": mark,
         "move_pct": round(move_pct, 4),
@@ -168,9 +105,13 @@ def build_position_coach(
         "leverage": leverage,
         "locks_passed": pass_count,
         "locks": locks,
+        "entry_readiness": entry_readiness,
+        "continuation_outlook": continuation,
         "technical_confidence": round(confidence, 2),
         "trap_risk": round(trap, 2),
+        "trap_safety": round(100.0 - trap, 2),
         "decay_risk": round(decay, 2),
+        "momentum_quality": round(100.0 - decay, 2),
         "acceleration_score": round(acceleration, 2),
         "flow_strength": round(flow, 2),
         "mtf_strength": round(mtf, 2),
@@ -179,9 +120,6 @@ def build_position_coach(
         "entry_zone_quality": None if zone_quality < 0 else round(zone_quality, 2),
         "invalidated": invalidated,
         "protective_orders": protective,
-        "next_watch": next_watch,
-        "note": (
-            "Live Position Coach is observational/read-only. Health score is a technical state score, "
-            "not a probability and not an instruction to hold, close, add size, or move a stop."
-        ),
+        "next_watch": next_watch[:6],
+        "note": "Entry Locks answer whether a new entry is ready. Continuation Outlook answers whether an already-open position still has technical support. Neither is a probability or guarantee.",
     }
