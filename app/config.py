@@ -8,6 +8,11 @@ class Settings(BaseSettings):
     database_url: str
     binance_futures_base_url: str = "https://fapi.binance.com"
 
+    # Optional private Binance account connection. Read-only by design in ExplodeX.
+    binance_user_api_key: str = ""
+    binance_user_api_secret: str = ""
+    binance_user_api_read_only: bool = True
+
     scanner_min_quote_volume_usdt: float = 10_000_000
     scanner_max_symbols: int = 80
     scanner_min_setup_score: float = 80
