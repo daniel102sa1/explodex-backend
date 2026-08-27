@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import hmac
 import json
@@ -181,10 +182,18 @@ def main() -> None:
     api_key = os.getenv("BINANCE_USER_API_KEY", "").strip()
     api_secret = os.getenv("BINANCE_USER_API_SECRET", "").strip()
     backend_url = str(args.backend or "").strip()
+
+    if not backend_url:
+        backend_url = input("URL pública del backend Railway (https://...): ").strip()
+    if not api_key:
+        api_key = input("Binance API Key: ").strip()
+    if not api_secret:
+        api_secret = getpass.getpass("Binance Secret Key (oculta): ").strip()
+
     if not api_key or not api_secret:
-        raise SystemExit("Missing BINANCE_USER_API_KEY / BINANCE_USER_API_SECRET environment variables.")
+        raise SystemExit("API Key / Secret are required.")
     if not backend_url.startswith("https://") and not backend_url.startswith("http://localhost"):
-        raise SystemExit("EXPLODEX_BACKEND_URL must be HTTPS (or localhost for development).")
+        raise SystemExit("La URL del backend debe empezar con https:// (o localhost en desarrollo).")
 
     run(backend_url, api_key, api_secret, max(5, int(args.interval)))
 
