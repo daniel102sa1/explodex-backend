@@ -6,6 +6,7 @@ from app.services.confidence_progression import observe_confidence_progression
 from app.services.context_engine import apply_context_engine
 from app.services.entry_zone_engine import build_entry_zone_engine
 from app.services.exchange_lead_lag import apply_exchange_lead_lag
+from app.services.forced_path_forecast import build_forced_path_forecast
 from app.services.liquidation_cascade import apply_liquidation_cascade
 from app.services.prediction_engine import build_pre_move_prediction as build_raw_pre_move_prediction
 from app.services.prediction_safety import apply_prediction_safety
@@ -29,6 +30,7 @@ def build_pre_move_prediction(
     entry_zone = build_entry_zone_engine(scored, result, snapshot)
     result["entry_zone_engine"] = entry_zone
     result["verdict_fusion"] = build_guarded_verdict_fusion(scored, snapshot, result, entry_zone)
+    result["path_forecast"] = build_forced_path_forecast(scored, snapshot, result)
 
     symbol = str(snapshot.get("symbol") or scored.get("symbol") or "UNKNOWN")
     result["confidence_progression"] = observe_confidence_progression(symbol, result)
