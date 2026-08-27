@@ -62,18 +62,51 @@ class BinanceUserClient:
             },
         }
 
+    @staticmethod
+    def _response_message(response: httpx.Response) -> tuple[str, int | None]:
+        code: int | None = None
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            raw_code = payload.get("code")
+            if isinstance(raw_code, int):
+                code = raw_code
+            message = str(payload.get("msg") or payload.get("message") or "").strip()
+            if message:
+                return message[:500], code
+        text = (response.text or "").strip()
+        return (text[:500] if text else f"HTTP {response.status_code}"), code
+
     async def _refresh_time_offset(self) -> None:
         now = time.monotonic()
         if now - self._offset_updated_at < 30:
             return
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(f"{self.base_url}/fapi/v1/time")
-        response.raise_for_status()
-        payload = response.json()
-        server_time = int(payload.get("serverTime") or 0)
-        if server_time > 0:
-            self._server_offset_ms = server_time - int(time.time() * 1000)
-            self._offset_updated_at = now
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(f"{self.base_url}/fapi/v1/time")
+            self.last_http_status = response.status_code
+            if response.status_code >= 400:
+                message, code = self._response_message(response)
+                self.last_error = f"Binance {response.status_code}: {message}"
+                raise BinanceUserApiError(message, status_code=response.status_code, code=code)
+            payload = response.json()
+            server_time = int(payload.get("serverTime") or 0)
+            if server_time > 0:
+                self._server_offset_ms = server_time - int(time.time() * 1000)
+                self._offset_updated_at = now
+        except BinanceUserApiError:
+            raise
+        except httpx.TimeoutException as exc:
+            self.last_error = "Binance time endpoint timeout"
+            raise BinanceUserApiError(self.last_error, status_code=504) from exc
+        except httpx.HTTPError as exc:
+            self.last_error = f"Binance network error: {str(exc)[:300]}"
+            raise BinanceUserApiError(self.last_error, status_code=502) from exc
+        except Exception as exc:
+            self.last_error = f"Binance time sync error: {type(exc).__name__}: {str(exc)[:300]}"
+            raise BinanceUserApiError(self.last_error, status_code=502) from exc
 
     async def _signed_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         if not self.configured:
@@ -84,38 +117,39 @@ class BinanceUserClient:
         if not path.startswith("/fapi/"):
             raise BinanceUserApiError("Blocked non-Futures path.", status_code=400)
 
-        await self._refresh_time_offset()
-        query_params: dict[str, Any] = dict(params or {})
-        query_params["recvWindow"] = self.recv_window
-        query_params["timestamp"] = int(time.time() * 1000) + self._server_offset_ms
-        query = urlencode(query_params, doseq=True)
-        signature = hmac.new(
-            self.api_secret.encode("utf-8"),
-            query.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        signed_query = f"{query}&signature={signature}"
-        headers = {"X-MBX-APIKEY": self.api_key}
-
         try:
+            await self._refresh_time_offset()
+            query_params: dict[str, Any] = dict(params or {})
+            query_params["recvWindow"] = self.recv_window
+            query_params["timestamp"] = int(time.time() * 1000) + self._server_offset_ms
+            query = urlencode(query_params, doseq=True)
+            signature = hmac.new(
+                self.api_secret.encode("utf-8"),
+                query.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            signed_query = f"{query}&signature={signature}"
+            headers = {"X-MBX-APIKEY": self.api_key}
+
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.get(f"{self.base_url}{path}?{signed_query}", headers=headers)
             self.last_http_status = response.status_code
-            payload = response.json()
             if response.status_code >= 400:
-                code = payload.get("code") if isinstance(payload, dict) else None
-                message = payload.get("msg") if isinstance(payload, dict) else response.text[:300]
+                message, code = self._response_message(response)
                 self.last_error = f"Binance {response.status_code}: {message}"
-                raise BinanceUserApiError(
-                    str(message or "Binance private API error"),
-                    status_code=response.status_code,
-                    code=int(code) if isinstance(code, int) else None,
-                )
+                raise BinanceUserApiError(message, status_code=response.status_code, code=code)
+            payload = response.json()
             self.last_ok_at = time.time()
             self.last_error = None
             return payload
         except BinanceUserApiError:
             raise
+        except httpx.TimeoutException as exc:
+            self.last_error = "Binance private API timeout"
+            raise BinanceUserApiError(self.last_error, status_code=504) from exc
+        except httpx.HTTPError as exc:
+            self.last_error = f"Binance network error: {str(exc)[:300]}"
+            raise BinanceUserApiError(self.last_error, status_code=502) from exc
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
             raise BinanceUserApiError(self.last_error, status_code=502) from exc
