@@ -6,13 +6,14 @@ from typing import Any, Awaitable, Callable
 
 from app.config import settings
 from app.database import SessionLocal
+from app.services.paper_portfolio import run_paper_cycle
 from app.services.validation_mode import run_validation_cycle
 
 logger = logging.getLogger("explodex.validation")
 
 
 class ValidationScheduler:
-    """ASGI wrapper that runs paper-research validation without touching trade logic."""
+    """ASGI wrapper that runs research validation and PAPER simulation only."""
 
     def __init__(self, app: Any, interval_seconds: int = 300, startup_delay_seconds: int = 90) -> None:
         self.app = app
@@ -26,10 +27,11 @@ class ValidationScheduler:
             try:
                 async with SessionLocal() as db:
                     await run_validation_cycle(db)
+                    await run_paper_cycle(db)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Validation Mode cycle failed")
+                logger.exception("Validation/PAPER cycle failed")
             await asyncio.sleep(self.interval_seconds)
 
     async def __call__(
@@ -42,7 +44,7 @@ class ValidationScheduler:
             await self.app(scope, receive, send)
             return
 
-        self.task = asyncio.create_task(self._loop(), name="explodex-validation-mode-loop")
+        self.task = asyncio.create_task(self._loop(), name="explodex-validation-paper-loop")
         try:
             await self.app(scope, receive, send)
         finally:
