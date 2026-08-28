@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.paper_orders import sync_paper_orders
 
 
 def _valid_geometry(side: str, entry: float, stop: float, tp: float) -> bool:
@@ -94,6 +95,7 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     await base.ensure_paper_schema(db)
     closed = await base._close_due_positions(db)
     opened = await open_new_positions_live_fill(db)
+    order_sync = await sync_paper_orders(db)
     summary = await base.paper_summary(db)
     await db.execute(text("""
         INSERT INTO paper_equity_curve (cash_balance, unrealized_pnl, equity, open_positions)
@@ -107,5 +109,6 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
         "execution_version": "paper_execution_v2",
         **closed,
         **opened,
+        "orders": order_sync,
         "equity": summary["equity"],
     }
