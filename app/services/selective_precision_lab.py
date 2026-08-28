@@ -101,6 +101,7 @@ def evaluate_spec(rows: list[dict[str, Any]], spec: dict[str, Any]) -> dict[str,
         "avg_directional_return_pct": round(avg_return, 6) if avg_return is not None else None,
         "avg_mfe_pct": round(avg_mfe, 6) if avg_mfe is not None else None,
         "avg_mae_abs_pct": round(avg_mae_abs, 6) if avg_mae_abs is not None else None,
+        "enough_sample": len(decided) >= MIN_TRAIN_DECIDED,
     }
 
 
@@ -109,7 +110,7 @@ def evaluate_filter_grid(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = [row for row in out if row["selected"] > 0]
     out.sort(
         key=lambda r: (
-            r["decided"] >= MIN_TRAIN_DECIDED,
+            r["enough_sample"],
             _f(r.get("wilson_low_pct"), -1.0),
             _f(r.get("precision_pct"), -1.0),
             _f(r.get("coverage_pct")),
