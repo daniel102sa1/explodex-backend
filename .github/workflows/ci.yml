@@ -10,6 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
+      PYTHONPATH: .
       DATABASE_URL: postgresql://test:test@localhost:5432/explodex_test
       SCHEDULER_ENABLED: "false"
       COINGLASS_ENABLED: "false"
@@ -34,4 +35,4 @@ jobs:
         run: python -m compileall -q app
 
       - name: Run tests
-        run: pytest -q
+        run: python -m pytest -q
