@@ -11,6 +11,7 @@ from app.services.market_context import market_context
 from app.services.market_impact_engine import apply_market_impact_gate, build_market_impact
 from app.services.news_context import news_context_for_symbol
 from app.services.prediction_guarded import build_pre_move_prediction
+from app.services.prediction_stack_v5 import build_prediction_stack_v5
 from app.services.scoring import build_btc_context, score_snapshot
 
 
@@ -44,13 +45,22 @@ async def market_impact_for_symbol(symbol: str):
         prediction = build_pre_move_prediction(scored, snapshot, cg)
         impact = build_market_impact(scored, prediction, cg, symbol_news, global_news, broad)
         gated_prediction = apply_market_impact_gate(prediction, impact)
+        gated_prediction["prediction_stack_v5"] = build_prediction_stack_v5(
+            scored,
+            snapshot,
+            gated_prediction,
+            cg,
+        )
         return {
             "symbol": safe_symbol,
             "impact": impact,
-            "armed_trigger": gated_prediction.get("armed_trigger"),
             "premove_fingerprint": gated_prediction.get("premove_fingerprint"),
+            "prediction_stack_v5": gated_prediction.get("prediction_stack_v5"),
             "path_forecast": gated_prediction.get("path_forecast"),
-            "note": "Market Impact puede advertir o degradar una entrada técnica; noticias por sí solas no crean TRADE NOW.",
+            "note": (
+                "Market Impact ya forma parte de Prediction Stack v5. Puede advertir o degradar una entrada técnica; "
+                "noticias por sí solas no crean TRADE NOW."
+            ),
         }
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Market impact unavailable: {exc}") from exc
