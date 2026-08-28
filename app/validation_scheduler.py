@@ -27,6 +27,9 @@ class ValidationScheduler:
             try:
                 async with SessionLocal() as db:
                     await run_validation_cycle(db)
+                    # The PAPER cycle now includes TREND/PRE-MOVE plus an independent
+                    # all-eligible-universe RANGE MICRO scanner. RANGE MICRO is cached
+                    # internally to ~5m, so this loop can stay conservative.
                     await run_paper_cycle_v2(db)
             except asyncio.CancelledError:
                 raise

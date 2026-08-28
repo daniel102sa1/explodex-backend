@@ -7,6 +7,7 @@ from app.database import get_db
 from app.services.paper_execution_v2 import run_paper_cycle_v2
 from app.services.paper_orders import paper_order_history, paper_order_stats
 from app.services.paper_portfolio import paper_history, paper_summary
+from app.services.paper_range_micro import range_summary, scan_all_eligible_ranges
 
 router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
 
@@ -15,6 +16,7 @@ router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
 async def summary(db: AsyncSession = Depends(get_db)):
     result = await paper_summary(db)
     result["orders"] = await paper_order_stats(db)
+    result["range_micro"] = await range_summary(db)
     return result
 
 
@@ -25,7 +27,7 @@ async def history(
 ):
     return {
         "version": "paper_portfolio_v1",
-        "execution_version": "paper_execution_v2",
+        "execution_version": "paper_execution_v2_range_micro_v1",
         "paper_only": True,
         "rows": await paper_history(db, limit=limit),
     }
@@ -48,12 +50,26 @@ async def orders(
     }
 
 
+@router.get("/range-micro")
+async def range_micro_summary(db: AsyncSession = Depends(get_db)):
+    return await range_summary(db)
+
+
+@router.post("/range-micro/scan")
+async def range_micro_scan(db: AsyncSession = Depends(get_db)):
+    return {
+        "paper_only": True,
+        "result": await scan_all_eligible_ranges(db, force=True),
+        "note": "Escanea todas las Futures USDT elegibles por liquidez para detectar rangos laterales PAPER. No envía órdenes reales.",
+    }
+
+
 @router.post("/run")
 async def run_cycle(db: AsyncSession = Depends(get_db)):
     return {
         "version": "paper_portfolio_v1",
-        "execution_version": "paper_execution_v2",
+        "execution_version": "paper_execution_v2_range_micro_v1",
         "paper_only": True,
         "result": await run_paper_cycle_v2(db),
-        "note": "Simulación únicamente. Las órdenes, posiciones y cierres se guardan en PostgreSQL; no se envían órdenes reales ni se usan credenciales privadas de trading.",
+        "note": "Simulación únicamente. TREND/PRE-MOVE y RANGE MICRO comparten la cuenta PAPER; posiciones, órdenes, costos y cierres se guardan en PostgreSQL. No se envían órdenes reales.",
     }
