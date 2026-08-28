@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable
 
 from app.config import settings
 from app.database import SessionLocal
-from app.services.paper_portfolio import run_paper_cycle
+from app.services.paper_execution_v2 import run_paper_cycle_v2
 from app.services.validation_mode import run_validation_cycle
 
 logger = logging.getLogger("explodex.validation")
@@ -27,7 +27,7 @@ class ValidationScheduler:
             try:
                 async with SessionLocal() as db:
                     await run_validation_cycle(db)
-                    await run_paper_cycle(db)
+                    await run_paper_cycle_v2(db)
             except asyncio.CancelledError:
                 raise
             except Exception:
