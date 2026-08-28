@@ -8,6 +8,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.paper_micro_scalp import (
+    close_expired_micro_positions,
+    open_micro_positions,
+    scan_micro_scalps,
+)
 from app.services.paper_orders import sync_paper_orders
 from app.services.paper_range_micro import (
     close_expired_range_positions,
@@ -100,17 +105,21 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
 async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     await base.ensure_paper_schema(db)
 
-    # Always check every observed 1m candle for TP/STOP before applying the
-    # shorter RANGE time stop. Otherwise a RANGE trade could be closed by time
-    # even though its TP or STOP was already touched earlier in the interval.
+    # First evaluate observed candles for TP/STOP. Strategy-specific time exits run
+    # after that so a position is never time-closed if its stop/target was touched.
     closed = await base._close_due_positions(db)
     range_expired = await close_expired_range_positions(db)
+    micro_expired = await close_expired_micro_positions(db)
 
-    # Trend signals keep first priority. Any unused PAPER slots can then be used by
-    # the independent range strategy, which never manufactures a TREND TRADE_NOW.
+    # Priority remains: validated trend > structured range > micro scalp. MICRO_SCALP
+    # only uses unused PAPER slots and never changes the real-entry classifier.
     trend_opened = await open_new_positions_live_fill(db)
+
     range_scan = await scan_all_eligible_ranges(db)
     range_opened = await open_range_positions(db)
+
+    micro_scan = await scan_micro_scalps(db)
+    micro_opened = await open_micro_positions(db)
 
     order_sync = await sync_paper_orders(db)
     summary = await base.paper_summary(db)
@@ -123,7 +132,7 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     })
     await db.commit()
     return {
-        "execution_version": "paper_execution_v2_range_micro_v1",
+        "execution_version": "paper_execution_v2_multi_strategy_v2",
         "trend": {
             **closed,
             **trend_opened,
@@ -132,6 +141,11 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
             "expired": range_expired.get("closed", 0),
             "scan": range_scan,
             **range_opened,
+        },
+        "micro_scalp": {
+            "expired": micro_expired.get("closed", 0),
+            "scan": micro_scan,
+            **micro_opened,
         },
         "orders": order_sync,
         "equity": summary["equity"],
