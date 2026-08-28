@@ -20,6 +20,7 @@ from app.services.paper_range_micro import (
     open_range_positions,
     scan_all_eligible_ranges,
 )
+from app.services.paper_regime_router import current_paper_regime
 
 
 def _valid_geometry(side: str, entry: float, stop: float, tp: float) -> bool:
@@ -110,14 +111,32 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     range_expired = await close_expired_range_positions(db)
     micro_expired = await close_expired_micro_positions(db)
 
+    regime = await current_paper_regime()
+    policy = regime.get("policy") or {}
+    range_enabled = bool((policy.get("range_micro") or {}).get("enabled", True))
+    micro_enabled = bool((policy.get("micro_scalp") or {}).get("enabled", True))
+
+    # Validated TREND/PRE-MOVE remains the highest-priority path. The regime router
+    # currently only suppresses incompatible secondary strategies; it never invents
+    # a TREND entry and never promotes a non-TRADE_NOW signal.
     trend_opened = await open_new_positions_live_fill(db)
 
+    # Keep scanning even when opening is disabled so the laboratory retains evidence
+    # of what would have been available under the wrong regime.
     range_scan = await scan_all_eligible_ranges(db)
-    range_opened = await open_range_positions(db)
+    range_opened = (
+        await open_range_positions(db)
+        if range_enabled
+        else {"opened": 0, "skipped": 0, "regime_blocked": True}
+    )
 
     micro_scan = await scan_micro_scalps(db)
     advanced_prefilter = await prefilter_new_micro_signals(db)
-    micro_opened = await open_micro_positions(db)
+    micro_opened = (
+        await open_micro_positions(db)
+        if micro_enabled
+        else {"opened": 0, "skipped": 0, "regime_blocked": True}
+    )
 
     order_sync = await sync_paper_orders(db)
     summary = await base.paper_summary(db)
@@ -130,18 +149,21 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     })
     await db.commit()
     return {
-        "execution_version": "paper_execution_v2_multi_strategy_v3_advanced_entry",
+        "execution_version": "paper_execution_v2_multi_strategy_v4_regime_router",
+        "regime_router": regime,
         "trend": {
             **closed,
             **trend_opened,
         },
         "range_micro": {
             "expired": range_expired.get("closed", 0),
+            "enabled_by_regime": range_enabled,
             "scan": range_scan,
             **range_opened,
         },
         "micro_scalp": {
             "expired": micro_expired.get("closed", 0),
+            "enabled_by_regime": micro_enabled,
             "scan": micro_scan,
             "advanced_prefilter": advanced_prefilter,
             **micro_opened,
