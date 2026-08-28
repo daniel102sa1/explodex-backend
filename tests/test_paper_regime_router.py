@@ -25,10 +25,12 @@ def _flat(start: float, count: int = 80):
 
 
 def test_strong_aligned_trend_disables_range():
-    btc5 = _rows(100.0, 0.22)
-    btc15 = _rows(100.0, 0.55, 50)
-    eth5 = _rows(50.0, 0.11)
-    eth15 = _rows(50.0, 0.28, 50)
+    # Moderate, persistent trend: strong enough for TREND_UP but deliberately below
+    # the high-volatility/shock thresholds.
+    btc5 = _rows(100.0, 0.045, wick=0.05)
+    btc15 = _rows(100.0, 0.10, 50, wick=0.07)
+    eth5 = _rows(50.0, 0.022, wick=0.025)
+    eth15 = _rows(50.0, 0.05, 50, wick=0.035)
     result = classify_regime(btc5, btc15, eth5, eth15)
     assert result["regime"] == "TREND_UP"
     assert result["policy"]["range_micro"]["enabled"] is False
