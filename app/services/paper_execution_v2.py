@@ -100,10 +100,11 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
 async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     await base.ensure_paper_schema(db)
 
-    # RANGE MICRO positions have a shorter time horizon than trend positions, so
-    # expire them first before the generic 120m manager evaluates the remainder.
-    range_expired = await close_expired_range_positions(db)
+    # Always check every observed 1m candle for TP/STOP before applying the
+    # shorter RANGE time stop. Otherwise a RANGE trade could be closed by time
+    # even though its TP or STOP was already touched earlier in the interval.
     closed = await base._close_due_positions(db)
+    range_expired = await close_expired_range_positions(db)
 
     # Trend signals keep first priority. Any unused PAPER slots can then be used by
     # the independent range strategy, which never manufactures a TREND TRADE_NOW.
