@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.services.paper_edge_lab import edge_lab_report
 from app.services.paper_execution_v2 import run_paper_cycle_v2
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
@@ -30,8 +31,6 @@ async def _safe_component(
     try:
         return await loader(db)
     except Exception as exc:
-        # A failed SQL statement leaves PostgreSQL transactions aborted. Roll it
-        # back so the next optional component can still load.
         await db.rollback()
         return {
             "available": False,
@@ -49,6 +48,15 @@ async def summary(db: AsyncSession = Depends(get_db)):
     result["range_micro"] = await _safe_component(db, "range_micro", range_summary)
     result["micro_scalp"] = await _safe_component(db, "micro_scalp", micro_summary)
     return result
+
+
+@router.get("/edge-lab")
+async def adaptive_edge_lab(
+    days: int = Query(default=30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    await _ensure_paper_dependencies(db)
+    return await edge_lab_report(db, days=days)
 
 
 @router.get("/history")
