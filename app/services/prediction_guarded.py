@@ -16,6 +16,29 @@ from app.services.sequential_context import apply_sequential_context
 from app.services.verdict_entry_zone_guard import build_guarded_verdict_fusion
 
 
+_NEUTRAL_PATH_FUSION_DEFAULTS = {
+    "mtf_strength": 50.0,
+    "flow_strength": 50.0,
+    "trap_risk": 50.0,
+    "decay_risk": 50.0,
+    "acceleration_score": 50.0,
+}
+
+
+def _path_forecast_input(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep missing neutral metrics neutral instead of letting downstream parsers turn them into zero."""
+    prepared = dict(result)
+    fusion = dict(prepared.get("verdict_fusion") or {})
+    for key, default in _NEUTRAL_PATH_FUSION_DEFAULTS.items():
+        if fusion.get(key) is None or fusion.get(key) == "":
+            fusion[key] = default
+    if fusion.get("technical_confidence") is None or fusion.get("technical_confidence") == "":
+        fallback = prepared.get("preactivation_score")
+        fusion["technical_confidence"] = 50.0 if fallback is None or fallback == "" else fallback
+    prepared["verdict_fusion"] = fusion
+    return prepared
+
+
 def build_pre_move_prediction(
     scored: dict[str, Any],
     snapshot: dict[str, Any],
@@ -32,7 +55,7 @@ def build_pre_move_prediction(
     entry_zone = build_entry_zone_engine(scored, result, snapshot)
     result["entry_zone_engine"] = entry_zone
     result["verdict_fusion"] = build_guarded_verdict_fusion(scored, snapshot, result, entry_zone)
-    result["path_forecast"] = build_forced_path_forecast(scored, snapshot, result)
+    result["path_forecast"] = build_forced_path_forecast(scored, snapshot, _path_forecast_input(result))
     result["premove_fingerprint"] = build_premove_fingerprint(scored, snapshot, result)
     result["prediction_stack_v5"] = build_prediction_stack_v5(scored, snapshot, result, coinglass)
 
