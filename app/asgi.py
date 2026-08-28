@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.main import app as inner_app
 from app.binance_user_routes import router as binance_user_router
 from app.market_impact_routes import router as market_impact_router
+from app.paper_trading_routes import router as paper_trading_router
 from app.validation_routes import router as validation_router
 from app.validation_scheduler import ValidationScheduler
 
@@ -10,6 +11,7 @@ from app.validation_scheduler import ValidationScheduler
 inner_app.include_router(binance_user_router)
 inner_app.include_router(market_impact_router)
 inner_app.include_router(validation_router)
+inner_app.include_router(paper_trading_router)
 
 validation_app = ValidationScheduler(inner_app, interval_seconds=300, startup_delay_seconds=90)
 
