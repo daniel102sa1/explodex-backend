@@ -4,8 +4,10 @@ from typing import Any
 
 
 def _f(value: Any, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
     try:
-        return float(value or 0)
+        return float(value)
     except (TypeError, ValueError):
         return default
 
