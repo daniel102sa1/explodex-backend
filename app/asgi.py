@@ -2,9 +2,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.main import app as inner_app
 from app.binance_user_routes import router as binance_user_router
+from app.market_impact_routes import router as market_impact_router
 
 
 inner_app.include_router(binance_user_router)
+inner_app.include_router(market_impact_router)
 
 # Keep CORS as the outermost ASGI layer too. This guarantees that browser
 # clients still receive Access-Control-Allow-Origin even when a private Binance
