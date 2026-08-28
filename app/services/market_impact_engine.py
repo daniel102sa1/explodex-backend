@@ -38,8 +38,8 @@ def build_market_impact(
 ) -> dict[str, Any]:
     """Fuse external catalysts with observable market reaction.
 
-    The engine estimates whether the environment supports the *current predicted
-    direction*. It never creates a trade by itself and its score is not a
+    The engine estimates whether the environment supports the current predicted
+    direction. It never creates a trade by itself and its score is not a
     calibrated probability.
     """
 
@@ -214,48 +214,65 @@ def build_market_impact(
 
 
 def apply_market_impact_gate(prediction: dict[str, Any], impact: dict[str, Any]) -> dict[str, Any]:
-    """Attach impact and conservatively gate an existing technical classification.
+    """Attach Catalyst context and conservatively gate the current trade classification.
 
-    External context may warn/demote a trade, but it never manufactures TRADE NOW.
+    The active classification lives in ``premove_fingerprint``. Market Impact may
+    demote an existing TRADE_NOW / TRADE_SOON, but it never upgrades WATCHLIST or
+    NO_TRADE into an entry. That preserves technical-entry ownership while making
+    news/macro risk part of the final decision path.
     """
     result = dict(prediction)
-    result["market_impact"] = impact
-    armed = dict(result.get("armed_trigger") or {})
-    if not armed:
-        return result
-
-    original_class = str(armed.get("trade_class") or "NO_TRADE")
-    original_label = str(armed.get("trade_label") or original_class)
-    state = str(impact.get("state") or "NEUTRAL")
-
-    if state == "SHOCK_RISK":
-        if original_class == "TRADE_NOW":
-            armed["trade_class"] = "TRADE_SOON"
-            armed["trade_label"] = "WAIT CATALYST"
-            armed["grade"] = "B"
-        elif original_class == "TRADE_SOON":
-            armed["trade_class"] = "WATCHLIST"
-            armed["trade_label"] = "WATCH · CATALYST RISK"
-            armed["grade"] = "C"
-    elif state == "CONFLICT" and original_class == "TRADE_NOW":
-        armed["trade_class"] = "TRADE_SOON"
-        armed["trade_label"] = "WAIT MARKET ALIGNMENT"
-        if str(armed.get("grade") or "") == "A+":
-            armed["grade"] = "A"
-
-    armed["market_impact_gate"] = {
-        "state": state,
-        "support_score": impact.get("support_score"),
-        "original_trade_class": original_class,
-        "original_trade_label": original_label,
-        "demoted": armed.get("trade_class") != original_class,
-        "news_can_create_trade": False,
-    }
-    result["armed_trigger"] = armed
+    result["market_impact"] = dict(impact or {})
 
     fingerprint = dict(result.get("premove_fingerprint") or {})
-    if fingerprint:
-        fingerprint["market_impact_state"] = state
-        fingerprint["market_impact_score"] = impact.get("support_score")
-        result["premove_fingerprint"] = fingerprint
+    if not fingerprint:
+        return result
+
+    original_class = str(fingerprint.get("trade_class") or "NO_TRADE").upper()
+    original_label = str(fingerprint.get("trade_label") or original_class)
+    original_grade = str(fingerprint.get("grade") or "C")
+    state = str((impact or {}).get("state") or "NEUTRAL").upper()
+    support_score = _f((impact or {}).get("support_score"), 50.0)
+
+    trade_class = original_class
+    trade_label = original_label
+    grade = original_grade
+    catalyst_block = False
+
+    if state == "SHOCK_RISK":
+        catalyst_block = original_class in {"TRADE_NOW", "TRADE_SOON"}
+        if original_class == "TRADE_NOW":
+            trade_class = "TRADE_SOON"
+            trade_label = "WAIT CATALYST"
+            grade = "B"
+        elif original_class == "TRADE_SOON":
+            trade_class = "WATCHLIST"
+            trade_label = "WATCH · CATALYST RISK"
+            grade = "C"
+    elif state == "CONFLICT":
+        if original_class == "TRADE_NOW":
+            trade_class = "TRADE_SOON"
+            trade_label = "WAIT MARKET ALIGNMENT"
+            grade = "A" if original_grade == "A+" else original_grade
+        elif original_class == "TRADE_SOON" and support_score <= 30:
+            trade_class = "WATCHLIST"
+            trade_label = "WATCH · MARKET CONFLICT"
+            grade = "C"
+
+    fingerprint["trade_class"] = trade_class
+    fingerprint["trade_label"] = trade_label
+    fingerprint["grade"] = grade
+    fingerprint["market_impact_state"] = state
+    fingerprint["market_impact_score"] = round(support_score, 1)
+    fingerprint["market_impact_gate"] = {
+        "state": state,
+        "support_score": round(support_score, 1),
+        "original_trade_class": original_class,
+        "original_trade_label": original_label,
+        "original_grade": original_grade,
+        "demoted": trade_class != original_class,
+        "catalyst_block": catalyst_block,
+        "news_can_create_trade": False,
+    }
+    result["premove_fingerprint"] = fingerprint
     return result
