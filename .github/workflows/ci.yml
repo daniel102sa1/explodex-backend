@@ -9,6 +9,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://test:test@localhost:5432/explodex_test
+      SCHEDULER_ENABLED: "false"
+      COINGLASS_ENABLED: "false"
+      NEWS_ENABLED: "false"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
