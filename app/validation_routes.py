@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.services.trade_now_diagnostics import trade_now_reachability_report
 from app.services.validation_mode import recent_validation_rows, run_validation_cycle, validation_report
 
 
@@ -13,6 +14,14 @@ router = APIRouter(prefix="/api/v1/validation", tags=["validation"])
 @router.get("/report")
 async def validation_mode_report(db: AsyncSession = Depends(get_db)):
     return await validation_report(db)
+
+
+@router.get("/trade-now-reachability")
+async def validation_trade_now_reachability(
+    limit: int = Query(default=2000, ge=10, le=10000),
+    db: AsyncSession = Depends(get_db),
+):
+    return await trade_now_reachability_report(db, limit=limit)
 
 
 @router.get("/recent")
