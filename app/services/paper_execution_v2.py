@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.paper_advanced_prefilter import prefilter_new_micro_signals
 from app.services.paper_micro_scalp import (
     close_expired_micro_positions,
     open_micro_positions,
@@ -105,20 +106,17 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
 async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     await base.ensure_paper_schema(db)
 
-    # First evaluate observed candles for TP/STOP. Strategy-specific time exits run
-    # after that so a position is never time-closed if its stop/target was touched.
     closed = await base._close_due_positions(db)
     range_expired = await close_expired_range_positions(db)
     micro_expired = await close_expired_micro_positions(db)
 
-    # Priority remains: validated trend > structured range > micro scalp. MICRO_SCALP
-    # only uses unused PAPER slots and never changes the real-entry classifier.
     trend_opened = await open_new_positions_live_fill(db)
 
     range_scan = await scan_all_eligible_ranges(db)
     range_opened = await open_range_positions(db)
 
     micro_scan = await scan_micro_scalps(db)
+    advanced_prefilter = await prefilter_new_micro_signals(db)
     micro_opened = await open_micro_positions(db)
 
     order_sync = await sync_paper_orders(db)
@@ -132,7 +130,7 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     })
     await db.commit()
     return {
-        "execution_version": "paper_execution_v2_multi_strategy_v2",
+        "execution_version": "paper_execution_v2_multi_strategy_v3_advanced_entry",
         "trend": {
             **closed,
             **trend_opened,
@@ -145,6 +143,7 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
         "micro_scalp": {
             "expired": micro_expired.get("closed", 0),
             "scan": micro_scan,
+            "advanced_prefilter": advanced_prefilter,
             **micro_opened,
         },
         "orders": order_sync,
