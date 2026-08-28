@@ -9,6 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
 from app.services.paper_orders import sync_paper_orders
+from app.services.paper_range_micro import (
+    close_expired_range_positions,
+    open_range_positions,
+    scan_all_eligible_ranges,
+)
 
 
 def _valid_geometry(side: str, entry: float, stop: float, tp: float) -> bool:
@@ -20,7 +25,7 @@ def _valid_geometry(side: str, entry: float, stop: float, tp: float) -> bool:
 
 
 async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
-    """Open PAPER positions only at the price observable when this cycle executes."""
+    """Open PAPER trend positions only at the price observable when this cycle executes."""
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one())
@@ -63,6 +68,7 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
         opened_at = datetime.now(timezone.utc)
         metadata = json.dumps({
             "execution_version": "paper_execution_v2",
+            "strategy_mode": "TREND_PREMOVE",
             "signal_observed_at": row["observed_at"].isoformat() if row.get("observed_at") else None,
             "signal_entry_price": signal_entry,
             "simulated_fill_price": fill,
@@ -93,8 +99,18 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
 
 async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     await base.ensure_paper_schema(db)
+
+    # RANGE MICRO positions have a shorter time horizon than trend positions, so
+    # expire them first before the generic 120m manager evaluates the remainder.
+    range_expired = await close_expired_range_positions(db)
     closed = await base._close_due_positions(db)
-    opened = await open_new_positions_live_fill(db)
+
+    # Trend signals keep first priority. Any unused PAPER slots can then be used by
+    # the independent range strategy, which never manufactures a TREND TRADE_NOW.
+    trend_opened = await open_new_positions_live_fill(db)
+    range_scan = await scan_all_eligible_ranges(db)
+    range_opened = await open_range_positions(db)
+
     order_sync = await sync_paper_orders(db)
     summary = await base.paper_summary(db)
     await db.execute(text("""
@@ -106,9 +122,16 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     })
     await db.commit()
     return {
-        "execution_version": "paper_execution_v2",
-        **closed,
-        **opened,
+        "execution_version": "paper_execution_v2_range_micro_v1",
+        "trend": {
+            **closed,
+            **trend_opened,
+        },
+        "range_micro": {
+            "expired": range_expired.get("closed", 0),
+            "scan": range_scan,
+            **range_opened,
+        },
         "orders": order_sync,
         "equity": summary["equity"],
     }
