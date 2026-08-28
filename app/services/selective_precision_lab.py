@@ -171,27 +171,63 @@ def reliability_table(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
-def summarize_targets(validated: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    summary = []
+def summarize_targets(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Summarize precision targets for v2 holdout results and legacy retrospective grids.
+
+    The compatibility alias `achieved_out_of_sample_proxy` is retained because older
+    callers/tests expect it. In legacy-grid mode it remains explicitly labeled as a
+    retrospective proxy and must not be interpreted as true out-of-sample validation.
+    """
+    validated_mode = any(isinstance(row.get("holdout"), dict) for row in items)
+    summary: list[dict[str, Any]] = []
+
     for target in TARGETS:
+        if validated_mode:
+            candidates = [
+                row for row in items
+                if row.get("stable_out_of_sample")
+                and isinstance(row.get("holdout"), dict)
+                and row["holdout"].get("precision_pct") is not None
+                and _f(row["holdout"]["precision_pct"]) >= target
+            ]
+            best = max(
+                candidates,
+                key=lambda row: (
+                    _f(row["holdout"].get("coverage_pct")),
+                    int(row["holdout"].get("decided") or 0),
+                    _f(row["holdout"].get("wilson_low_pct")),
+                ),
+                default=None,
+            )
+            achieved = best is not None
+            summary.append({
+                "target_precision_pct": target,
+                "achieved_on_chronological_holdout": achieved,
+                "achieved_out_of_sample_proxy": achieved,
+                "legacy_retrospective_proxy": False,
+                "best": best,
+            })
+            continue
+
         candidates = [
-            row for row in validated
-            if row.get("stable_out_of_sample")
-            and row["holdout"].get("precision_pct") is not None
-            and _f(row["holdout"]["precision_pct"]) >= target
+            row for row in items
+            if row.get("enough_sample")
+            and row.get("precision_pct") is not None
+            and _f(row.get("precision_pct")) >= target
         ]
         best = max(
             candidates,
             key=lambda row: (
-                _f(row["holdout"].get("coverage_pct")),
-                int(row["holdout"].get("decided") or 0),
-                _f(row["holdout"].get("wilson_low_pct")),
+                _f(row.get("coverage_pct")),
+                int(row.get("decided") or 0),
             ),
             default=None,
         )
         summary.append({
             "target_precision_pct": target,
-            "achieved_on_chronological_holdout": best is not None,
+            "achieved_out_of_sample_proxy": best is not None,
+            "achieved_on_chronological_holdout": False,
+            "legacy_retrospective_proxy": True,
             "best": best,
         })
     return summary
