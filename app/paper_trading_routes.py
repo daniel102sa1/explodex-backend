@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.services.paper_edge_lab import edge_lab_report
 from app.services.paper_execution_v2 import run_paper_cycle_v2
+from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
 from app.services.paper_portfolio import paper_history, paper_summary
@@ -47,6 +48,7 @@ async def summary(db: AsyncSession = Depends(get_db)):
     result["orders"] = await _safe_component(db, "orders", paper_order_stats)
     result["range_micro"] = await _safe_component(db, "range_micro", range_summary)
     result["micro_scalp"] = await _safe_component(db, "micro_scalp", micro_summary)
+    result["loss_autopsy"] = await _safe_component(db, "loss_autopsy", lambda session: loss_autopsy_report(session, days=30))
     return result
 
 
@@ -59,6 +61,15 @@ async def adaptive_edge_lab(
     return await edge_lab_report(db, days=days)
 
 
+@router.get("/loss-autopsy")
+async def paper_loss_autopsy(
+    days: int = Query(default=30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    await _ensure_paper_dependencies(db)
+    return await loss_autopsy_report(db, days=days)
+
+
 @router.get("/history")
 async def history(
     limit: int = Query(default=100, ge=1, le=500),
@@ -67,7 +78,7 @@ async def history(
     await _ensure_paper_dependencies(db)
     return {
         "version": "paper_portfolio_v1",
-        "execution_version": "paper_execution_v2_multi_strategy_v2",
+        "execution_version": "paper_execution_v2_multi_strategy_v5_anti_loss",
         "paper_only": True,
         "rows": await paper_history(db, limit=limit),
     }
@@ -128,8 +139,8 @@ async def run_cycle(db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
     return {
         "version": "paper_portfolio_v1",
-        "execution_version": "paper_execution_v2_multi_strategy_v2",
+        "execution_version": "paper_execution_v2_multi_strategy_v5_anti_loss",
         "paper_only": True,
         "result": await run_paper_cycle_v2(db),
-        "note": "Simulación únicamente. TREND/PRE-MOVE, RANGE MICRO y MICRO SCALP comparten la cuenta PAPER; costos, posiciones y cierres se guardan en PostgreSQL. No se envían órdenes reales.",
+        "note": "Simulación únicamente. El Anti-Loss Gate puede vetar patrones PAPER repetidamente perdedores y activar modo defensivo; no envía órdenes reales.",
     }
