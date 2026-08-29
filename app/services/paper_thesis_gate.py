@@ -74,6 +74,35 @@ async def _latest(db: AsyncSession, symbol: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+async def _reconcile_in_position(db: AsyncSession, latest: dict[str, Any], now: datetime) -> dict[str, Any]:
+    if str(latest.get("status") or "") != "IN_POSITION":
+        return latest
+    open_exists = bool((await db.execute(text("""
+        SELECT EXISTS(
+            SELECT 1 FROM paper_positions
+            WHERE symbol=:symbol AND status='OPEN'
+        )
+    """), {"symbol": latest["symbol"]})).scalar_one())
+    if open_exists:
+        return latest
+    cooldown = now + timedelta(minutes=15)
+    await db.execute(text("""
+        UPDATE paper_trade_theses
+        SET status='CLOSED', cooldown_until=:cooldown, updated_at=NOW(),
+            metadata=metadata || CAST(:patch AS JSONB)
+        WHERE id=:id
+    """), {
+        "id": latest["id"],
+        "cooldown": cooldown,
+        "patch": json.dumps({"close_reason": "paper_position_no_longer_open"}),
+    })
+    await db.commit()
+    latest = dict(latest)
+    latest["status"] = "CLOSED"
+    latest["cooldown_until"] = cooldown
+    return latest
+
+
 async def gate_candidate(
     db: AsyncSession,
     *,
@@ -92,6 +121,7 @@ async def gate_candidate(
     latest = await _latest(db, symbol)
 
     if latest:
+        latest = await _reconcile_in_position(db, latest, now)
         status = str(latest.get("status") or "")
         cooldown_until = latest.get("cooldown_until")
         expires_at = latest.get("expires_at")
@@ -178,8 +208,6 @@ async def gate_candidate(
                     "frozen_tp": _f(latest.get("take_profit")),
                 }
 
-    # Create a new thesis from the first qualified candidate. We deliberately use
-    # a narrow zone around the planned observable entry and freeze it thereafter.
     width = max(abs(planned_entry - stop_loss) * 0.12, planned_entry * 0.0015)
     entry_low = planned_entry - width
     entry_high = planned_entry + width
