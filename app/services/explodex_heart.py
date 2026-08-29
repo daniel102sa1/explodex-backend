@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.trade_thesis import apply_thesis_to_score, apply_trade_thesis
 
-HEART_VERSION = "explodex_heart_v1"
+HEART_VERSION = "explodex_heart_v2_actionable"
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -23,8 +23,44 @@ def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _stack_actionable(prediction: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Return whether the advanced stack itself already authorizes an entry.
+
+    This deliberately does not require the legacy phase label ACTIVADO. The
+    fingerprint and Prediction Stack can reach TRADE_NOW/YES slightly earlier;
+    requiring both systems to flip at the same instant caused false negatives.
+    """
+    fingerprint = _dict(prediction.get("premove_fingerprint"))
+    stack = _dict(prediction.get("prediction_stack_v5"))
+    master = _dict(stack.get("master_decision"))
+    risk_veto = _dict(stack.get("risk_veto"))
+    timing = _dict(stack.get("entry_timing"))
+    sequence = _dict(prediction.get("sequence"))
+    decision_guard = _dict(prediction.get("decision_guard"))
+
+    trade_now = bool(fingerprint.get("trade_now_ready")) or str(fingerprint.get("trade_class") or "").upper() == "TRADE_NOW"
+    master_yes = str(master.get("state") or "").upper() == "YES"
+    timing_enter = str(timing.get("state") or "").upper() in {"ENTER_NOW", "TRADE_NOW"} or trade_now
+    veto_clear = not bool(risk_veto.get("blocked"))
+    chase_clear = not bool(sequence.get("chase_risk")) and not bool(risk_veto.get("chase"))
+    invalidation_clear = not bool(risk_veto.get("invalidated")) and not bool(risk_veto.get("hard_block"))
+    risk_guard_pass = bool(sequence.get("risk_guard_pass", decision_guard.get("risk_guard_pass", True)))
+
+    checks = {
+        "fingerprint_trade_now": trade_now,
+        "master_yes": master_yes,
+        "timing_enter": timing_enter,
+        "veto_clear": veto_clear,
+        "not_chasing": chase_clear,
+        "not_invalidated": invalidation_clear,
+        "risk_guard_pass": risk_guard_pass,
+    }
+    missing = [key for key, ok in checks.items() if not ok]
+    return all(checks.values()), missing
+
+
 def _canonical_gate(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[str, Any]:
-    """Apply one READY/PREPARING policy for scanner, live analysis and PAPER inputs."""
+    """One actionable READY policy for scanner, live analysis and PAPER."""
     out = dict(scored)
     direction_match = str(prediction.get("direction") or "") == str(out.get("direction") or "")
     phase = str(prediction.get("phase") or "SIN_SETUP")
@@ -34,13 +70,29 @@ def _canonical_gate(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[
     chase_risk = bool(sequence.get("chase_risk"))
     risk_guard_pass = bool(sequence.get("risk_guard_pass", decision_guard.get("risk_guard_pass", True)))
     risk_guard_blocks = list(sequence.get("risk_guard_blocks") or decision_guard.get("risk_guard_blocks") or [])
+    stack_actionable, stack_missing = _stack_actionable(prediction)
+    risk_score = _f(out.get("risk_score"), 100.0)
 
     metrics = dict(out.get("metrics") or {})
     rejects = list(metrics.get("reject_reasons") or [])
 
-    if out.get("state") == "READY" and not (
-        direction_match and phase == "ACTIVADO" and not chase_risk and risk_guard_pass
-    ):
+    legacy_ready = direction_match and phase == "ACTIVADO" and not chase_risk and risk_guard_pass
+    advanced_ready = (
+        direction_match
+        and stack_actionable
+        and risk_score <= 48.0
+        and str(out.get("state") or "") != "NO_TRADE"
+    )
+
+    if legacy_ready or advanced_ready:
+        out["state"] = "READY"
+        # Remove stale timing-only rejects when the advanced stack has now
+        # explicitly authorized the entry.
+        rejects = [
+            item for item in rejects
+            if item not in {"heart_trigger_not_activated", "pre_move_not_activated"}
+        ]
+    elif out.get("state") == "READY":
         out["state"] = "PREPARING"
         reason = (
             "heart_direction_conflict"
@@ -54,14 +106,12 @@ def _canonical_gate(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[
         if reason not in rejects:
             rejects.append(reason)
 
-    # Early warning is informational/preparatory only. It never promotes a
-    # NO_TRADE candidate and never fabricates READY from a high score.
     if (
         out.get("state") == "WATCH"
         and direction_match
         and phase in {"PREACTIVACION", "VIGILAR_CONFIRMACION"}
         and prediction_score >= 72.0
-        and _f(out.get("risk_score"), 100.0) <= 48.0
+        and risk_score <= 48.0
     ):
         out["state"] = "PREPARING"
 
@@ -72,14 +122,8 @@ def _canonical_gate(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[
     )
     if use_prediction_plan:
         for key in (
-            "entry_low",
-            "entry_high",
-            "stop_loss",
-            "tp1",
-            "tp2",
-            "tp3",
-            "expected_duration_min_minutes",
-            "expected_duration_max_minutes",
+            "entry_low", "entry_high", "stop_loss", "tp1", "tp2", "tp3",
+            "expected_duration_min_minutes", "expected_duration_max_minutes",
         ):
             if prediction.get(key) is not None:
                 out[key] = prediction.get(key)
@@ -96,13 +140,15 @@ def _canonical_gate(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[
     metrics["pre_move_chase_risk"] = chase_risk
     metrics["risk_guard_pass"] = risk_guard_pass
     metrics["risk_guard_blocks"] = risk_guard_blocks
+    metrics["advanced_stack_actionable"] = stack_actionable
+    metrics["advanced_stack_missing"] = stack_missing
+    metrics["ready_via"] = "ADVANCED_STACK" if advanced_ready and not legacy_ready else "LEGACY_TRIGGER" if legacy_ready else None
     out["metrics"] = metrics
     out["prediction"] = prediction
     return out
 
 
 def _market_event(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[str, Any]:
-    """Describe what the market appears to be doing without pretending it is certainty."""
     metrics = _dict(scored.get("metrics"))
     seq = _dict(prediction.get("sequence"))
     fingerprint = _dict(prediction.get("premove_fingerprint"))
@@ -127,6 +173,7 @@ def _market_event(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[st
     evidence: list[str] = []
     risk_flags: list[str] = []
     event = "NORMAL"
+    stack_actionable, _ = _stack_actionable(prediction)
 
     if seq.get("sweep_low") and kind == "REBOTE_LONG":
         event = "LIQUIDITY_SWEEP_REBOUND"
@@ -134,9 +181,9 @@ def _market_event(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[st
     elif seq.get("sweep_high") and kind == "RECHAZO_SHORT":
         event = "LIQUIDITY_SWEEP_REJECTION"
         evidence.append("sweep_high_rejected")
-    elif phase == "ACTIVADO":
+    elif phase == "ACTIVADO" or stack_actionable:
         event = "EXPLOSION_TRIGGERED"
-        evidence.append("planned_trigger_activated")
+        evidence.append("entry_stack_authorized" if stack_actionable else "planned_trigger_activated")
     elif phase == "ESPERAR_RETEST":
         event = "EXPLOSION_MOVED_WAIT_RETEST"
         risk_flags.append("late_entry_chase_risk")
@@ -188,7 +235,6 @@ def _market_event(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[st
     if master and str(master.get("state") or "").upper() not in {"YES", "READY", "TRADE_NOW"}:
         risk_flags.append(f"master_{str(master.get('state') or 'unknown').lower()}")
 
-    # This is a technical preparation index, not a calibrated probability.
     pressure_index = max(pre_score, fp_score)
     if event in {"PRE_EXPLOSION_LOADING", "EXPLOSION_TRIGGERED"}:
         pressure_index = min(100.0, pressure_index + min(8.0, len(evidence) * 1.2))
@@ -203,7 +249,7 @@ def _market_event(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[st
         "index_is_probability": False,
         "evidence": list(dict.fromkeys(evidence))[:14],
         "risk_flags": list(dict.fromkeys(risk_flags))[:12],
-        "message": "Índice técnico de preparación/expansión; no es probabilidad garantizada de subida o bajada.",
+        "message": "Índice técnico de preparación/expansión; no es probabilidad garantizada.",
     }
 
 
@@ -225,18 +271,10 @@ def _plan(scored: dict[str, Any], prediction: dict[str, Any], thesis: dict[str, 
             "chase_limit": thesis.get("chase_limit"),
             "do_not_recalculate": True,
         }
-
     return {
         "source": "CURRENT_HEART",
         "direction": prediction.get("direction") or scored.get("direction"),
         "status": prediction.get("phase"),
-        "action": (
-            "NO_PERSIGAS_ESPERA_RETEST"
-            if bool(_dict(prediction.get("sequence")).get("chase_risk"))
-            else "ENTRAR_SOLO_SI_ACTIVADO_Y_EN_ZONA"
-            if prediction.get("phase") == "ACTIVADO"
-            else "ESPERAR_CONFIRMACION"
-        ),
         "entry_low": prediction.get("entry_low", scored.get("entry_low")),
         "entry_high": prediction.get("entry_high", scored.get("entry_high")),
         "trigger_price": prediction.get("trigger_price"),
@@ -249,6 +287,60 @@ def _plan(scored: dict[str, Any], prediction: dict[str, Any], thesis: dict[str, 
     }
 
 
+def _price_in_plan(current: float, plan: dict[str, Any]) -> bool:
+    low = _f(plan.get("entry_low"))
+    high = _f(plan.get("entry_high"))
+    return current > 0 and low > 0 and high > 0 and min(low, high) <= current <= max(low, high)
+
+
+def _action_decision(*, canonical: dict[str, Any], prediction: dict[str, Any], thesis: dict[str, Any] | None, plan: dict[str, Any]) -> dict[str, Any]:
+    direction = str(canonical.get("direction") or prediction.get("direction") or "").upper()
+    current = _f(canonical.get("current_price"))
+    sequence = _dict(prediction.get("sequence"))
+    stack = _dict(prediction.get("prediction_stack_v5"))
+    risk_veto = _dict(stack.get("risk_veto"))
+    stack_ready, stack_missing = _stack_actionable(prediction)
+    in_zone = _price_in_plan(current, plan)
+
+    terminal = bool(thesis and str(thesis.get("status") or "") in {"INVALIDATED", "EXPIRED", "CLOSED"})
+    cooldown = bool(thesis and str(thesis.get("action") or "") == "COOLDOWN_NO_CAMBIAR_DE_LADO")
+    chase = bool(sequence.get("chase_risk")) or bool(risk_veto.get("chase")) or str(thesis.get("status") if thesis else "") == "NO_CHASE"
+    hard_block = bool(risk_veto.get("blocked")) or bool(risk_veto.get("invalidated")) or bool(risk_veto.get("hard_block"))
+
+    execution_allowed = (
+        str(canonical.get("state") or "") == "READY"
+        and stack_ready
+        and in_zone
+        and not chase
+        and not hard_block
+        and not terminal
+        and not cooldown
+    )
+
+    if execution_allowed:
+        action = "ENTRAR_LONG" if direction == "LONG" else "ENTRAR_SHORT"
+        reason = "Stack avanzado en TRADE_NOW/YES, sin veto ni chase y precio dentro de la zona."
+    elif terminal or cooldown or hard_block:
+        action = "NO_ENTRAR"
+        reason = "Hay invalidación, veto o cooldown activo."
+    elif chase:
+        action = "ESPERAR_RETEST"
+        reason = "La oportunidad puede existir, pero el precio ya salió de la zona; no perseguir."
+    else:
+        action = "ESPERAR"
+        reason = "Todavía falta autorización completa o que el precio llegue a la zona."
+
+    return {
+        "action": action,
+        "should_enter": execution_allowed,
+        "direction": direction,
+        "price_in_entry_zone": in_zone,
+        "advanced_stack_ready": stack_ready,
+        "advanced_stack_missing": stack_missing,
+        "reason": reason,
+    }
+
+
 async def run_explodex_heart(
     db: AsyncSession | None,
     *,
@@ -258,37 +350,41 @@ async def run_explodex_heart(
     coinglass: dict[str, Any] | None = None,
     persist_thesis: bool = True,
 ) -> dict[str, Any]:
-    """Single canonical decision path for live analysis, scanner and PAPER research."""
     cg = coinglass or {}
     prediction = build_pre_move_prediction(scored, snapshot, cg)
     canonical = _canonical_gate(scored, prediction)
 
     thesis: dict[str, Any] | None = None
     if db is not None and persist_thesis:
-        thesis = await apply_trade_thesis(
-            db,
-            symbol=symbol,
-            score=canonical,
-            prediction=prediction,
-        )
+        thesis = await apply_trade_thesis(db, symbol=symbol, score=canonical, prediction=prediction)
         canonical, prediction = apply_thesis_to_score(canonical, prediction, thesis)
 
-    market_event = _market_event(canonical, prediction)
     plan = _plan(canonical, prediction, thesis)
-    execution_allowed = (
-        str(canonical.get("state") or "") == "READY"
-        and str(prediction.get("phase") or "") == "ACTIVADO"
-        and not bool(_dict(prediction.get("sequence")).get("chase_risk"))
-        and (not thesis or not thesis.get("frozen_plan") or str(thesis.get("status")) == "ENTER_NOW")
-    )
+
+    # A frozen thesis may still be WAITING_ENTRY because it was created one scan
+    # before the advanced stack became actionable. Re-evaluate action now without
+    # changing its direction/levels.
+    stack_ready, _ = _stack_actionable(prediction)
+    if (
+        stack_ready
+        and str(canonical.get("state") or "") == "PREPARING"
+        and str(scored.get("state") or "") != "NO_TRADE"
+        and _f(canonical.get("risk_score"), 100.0) <= 48.0
+    ):
+        canonical["state"] = "READY"
+
+    decision = _action_decision(canonical=canonical, prediction=prediction, thesis=thesis, plan=plan)
+    market_event = _market_event(canonical, prediction)
+    execution_allowed = bool(decision["should_enter"])
 
     heart = {
         "version": HEART_VERSION,
         "symbol": symbol,
-        "mission": "detectar preparación, barridas, presión y próxima expansión antes de perseguir la vela",
+        "mission": "detectar la próxima expansión y dar una decisión clara de entrar o no entrar",
         "direction": canonical.get("direction"),
         "state": canonical.get("state"),
         "execution_allowed": execution_allowed,
+        "action_decision": decision,
         "market_event": market_event,
         "plan": plan,
         "thesis": thesis,
@@ -302,9 +398,6 @@ async def run_explodex_heart(
         "market_event": market_event,
         "plan": plan,
         "execution_allowed": execution_allowed,
+        "action_decision": decision,
     }
-    return {
-        "score": canonical,
-        "prediction": prediction,
-        "heart": heart,
-    }
+    return {"score": canonical, "prediction": prediction, "heart": heart}
