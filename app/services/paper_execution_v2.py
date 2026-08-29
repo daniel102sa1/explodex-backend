@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
 from app.services.paper_advanced_prefilter import prefilter_new_micro_signals
+from app.services.paper_loss_autopsy import portfolio_loss_brake
 from app.services.paper_micro_scalp import (
     close_expired_micro_positions,
     open_micro_positions,
@@ -31,14 +32,25 @@ def _valid_geometry(side: str, entry: float, stop: float, tp: float) -> bool:
     return False
 
 
-async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
+def _scale_sizing(sizing: dict[str, Any], multiplier: float) -> dict[str, Any]:
+    multiplier = max(0.0, min(1.0, float(multiplier)))
+    if multiplier >= 0.999:
+        return dict(sizing)
+    out = dict(sizing)
+    for key in ("quantity", "notional", "margin", "risk_usdt"):
+        if key in out:
+            out[key] = round(base._f(out.get(key)) * multiplier, 10)
+    return out
+
+
+async def open_new_positions_live_fill(db: AsyncSession, *, risk_multiplier: float = 1.0) -> dict[str, Any]:
     """Open PAPER trend positions only at the price observable when this cycle executes."""
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one())
     slots = max(0, base.MAX_OPEN_POSITIONS - open_count)
     if slots <= 0:
-        return {"opened": 0, "stale_skipped": 0}
+        return {"opened": 0, "stale_skipped": 0, "risk_multiplier": risk_multiplier}
 
     candidates = (await db.execute(text("""
         SELECT vo.signal_id::text, vo.symbol, vo.observed_at, vo.direction, vo.entry_price AS signal_entry_price,
@@ -56,6 +68,7 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
 
     opened = 0
     stale_skipped = 0
+    anti_loss_skipped = 0
     for raw in candidates:
         row = dict(raw)
         side = str(row.get("direction") or "").upper()
@@ -69,7 +82,9 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
 
         leverage = base.choose_leverage(row.get("grade"), base._f(row.get("fingerprint_score")), row.get("catalyst_state"))
         sizing = base.size_position(balance, fill, stop, leverage)
+        sizing = _scale_sizing(sizing, risk_multiplier)
         if sizing["quantity"] <= 0 or sizing["margin"] <= 0:
+            anti_loss_skipped += 1
             continue
 
         opened_at = datetime.now(timezone.utc)
@@ -80,6 +95,7 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
             "signal_entry_price": signal_entry,
             "simulated_fill_price": fill,
             "uses_current_observable_price": True,
+            "portfolio_loss_risk_multiplier": risk_multiplier,
         })
         result = await db.execute(text("""
             INSERT INTO paper_positions (
@@ -101,7 +117,12 @@ async def open_new_positions_live_fill(db: AsyncSession) -> dict[str, int]:
             opened += 1
 
     await db.commit()
-    return {"opened": opened, "stale_skipped": stale_skipped}
+    return {
+        "opened": opened,
+        "stale_skipped": stale_skipped,
+        "anti_loss_skipped": anti_loss_skipped,
+        "risk_multiplier": risk_multiplier,
+    }
 
 
 async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
@@ -113,21 +134,33 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
 
     regime = await current_paper_regime()
     policy = regime.get("policy") or {}
-    range_enabled = bool((policy.get("range_micro") or {}).get("enabled", True))
-    micro_enabled = bool((policy.get("micro_scalp") or {}).get("enabled", True))
+    range_enabled_by_regime = bool((policy.get("range_micro") or {}).get("enabled", True))
+    micro_enabled_by_regime = bool((policy.get("micro_scalp") or {}).get("enabled", True))
 
-    # Validated TREND/PRE-MOVE remains the highest-priority path. The regime router
-    # currently only suppresses incompatible secondary strategies; it never invents
-    # a TREND entry and never promotes a non-TRADE_NOW signal.
-    trend_opened = await open_new_positions_live_fill(db)
+    loss_brake = await portfolio_loss_brake(db)
+    defensive = str(loss_brake.get("mode") or "NORMAL").upper() == "DEFENSIVE"
+    secondary_entries_enabled = bool(loss_brake.get("secondary_entries_enabled", True))
+    trend_risk_multiplier = float(loss_brake.get("trend_risk_multiplier") or 1.0)
+
+    range_enabled = range_enabled_by_regime and secondary_entries_enabled
+    micro_enabled = micro_enabled_by_regime and secondary_entries_enabled
+
+    # Validated TREND/PRE-MOVE remains the highest-priority path. The loss brake can
+    # only reduce PAPER sizing; it never creates or promotes a signal.
+    trend_opened = await open_new_positions_live_fill(db, risk_multiplier=trend_risk_multiplier)
 
     # Keep scanning even when opening is disabled so the laboratory retains evidence
-    # of what would have been available under the wrong regime.
+    # of what would have been available during defensive periods.
     range_scan = await scan_all_eligible_ranges(db)
     range_opened = (
         await open_range_positions(db)
         if range_enabled
-        else {"opened": 0, "skipped": 0, "regime_blocked": True}
+        else {
+            "opened": 0,
+            "skipped": 0,
+            "regime_blocked": not range_enabled_by_regime,
+            "loss_brake_blocked": defensive and not secondary_entries_enabled,
+        }
     )
 
     micro_scan = await scan_micro_scalps(db)
@@ -135,7 +168,12 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     micro_opened = (
         await open_micro_positions(db)
         if micro_enabled
-        else {"opened": 0, "skipped": 0, "regime_blocked": True}
+        else {
+            "opened": 0,
+            "skipped": 0,
+            "regime_blocked": not micro_enabled_by_regime,
+            "loss_brake_blocked": defensive and not secondary_entries_enabled,
+        }
     )
 
     order_sync = await sync_paper_orders(db)
@@ -149,21 +187,24 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     })
     await db.commit()
     return {
-        "execution_version": "paper_execution_v2_multi_strategy_v4_regime_router",
+        "execution_version": "paper_execution_v2_multi_strategy_v5_anti_loss",
         "regime_router": regime,
+        "loss_brake": loss_brake,
         "trend": {
             **closed,
             **trend_opened,
         },
         "range_micro": {
             "expired": range_expired.get("closed", 0),
-            "enabled_by_regime": range_enabled,
+            "enabled_by_regime": range_enabled_by_regime,
+            "enabled_after_loss_brake": range_enabled,
             "scan": range_scan,
             **range_opened,
         },
         "micro_scalp": {
             "expired": micro_expired.get("closed", 0),
-            "enabled_by_regime": micro_enabled,
+            "enabled_by_regime": micro_enabled_by_regime,
+            "enabled_after_loss_brake": micro_enabled,
             "scan": micro_scan,
             "advanced_prefilter": advanced_prefilter,
             **micro_opened,
