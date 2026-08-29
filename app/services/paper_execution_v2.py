@@ -56,7 +56,7 @@ async def open_new_positions_live_fill(
     regime: dict[str, Any] | None = None,
     defensive: bool = False,
 ) -> dict[str, Any]:
-    """Open PAPER trend positions only when a fixed thesis says ENTER_NOW."""
+    """Open PAPER trend positions only when the unified heart and fixed thesis agree."""
     regime = regime or {}
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
@@ -67,18 +67,24 @@ async def open_new_positions_live_fill(
             "opened": 0,
             "stale_skipped": 0,
             "direction_blocked": 0,
+            "heart_blocked": 0,
             "thesis_blocked": 0,
             "no_chase": 0,
             "risk_multiplier": risk_multiplier,
         }
 
     candidates = (await db.execute(text("""
-        SELECT vo.signal_id::text, vo.symbol, vo.observed_at, vo.direction, vo.entry_price AS signal_entry_price,
-               vo.stop_loss, vo.tp1, vo.trade_class, vo.grade, vo.fingerprint_score,
+        SELECT vo.signal_id::text, vo.symbol, vo.observed_at,
+               s.direction, s.state AS signal_state, s.reason AS signal_reason,
+               vo.entry_price AS signal_entry_price,
+               s.stop_loss, s.tp1, vo.trade_class, vo.grade, vo.fingerprint_score,
                vo.catalyst_state, vo.master_state
         FROM validation_observations vo
+        JOIN signals s ON s.id=vo.signal_id
         LEFT JOIN paper_positions pp ON pp.signal_id=vo.signal_id
         WHERE pp.signal_id IS NULL
+          AND s.state='READY'
+          AND COALESCE((s.reason->'explodex_heart'->>'execution_allowed')::boolean, FALSE)=TRUE
           AND vo.trade_class='TRADE_NOW'
           AND COALESCE(vo.master_state,'YES')='YES'
           AND vo.observed_at >= NOW() - INTERVAL '20 minutes'
@@ -90,6 +96,7 @@ async def open_new_positions_live_fill(
     stale_skipped = 0
     anti_loss_skipped = 0
     direction_blocked = 0
+    heart_blocked = 0
     thesis_blocked = 0
     no_chase = 0
     adaptive_errors = 0
@@ -103,6 +110,12 @@ async def open_new_positions_live_fill(
         original_tp = base._f(row.get("tp1"))
         signal_entry = base._f(row.get("signal_entry_price"))
         fingerprint_score = base._f(row.get("fingerprint_score"))
+        reason = row.get("signal_reason") if isinstance(row.get("signal_reason"), dict) else {}
+        heart = reason.get("explodex_heart") if isinstance(reason.get("explodex_heart"), dict) else {}
+        if not bool(heart.get("execution_allowed")) or str(row.get("signal_state")) != "READY":
+            heart_blocked += 1
+            continue
+
         fill = await base._latest_price(row["symbol"])
         if fill <= 0 or signal_entry <= 0 or original_stop <= 0 or original_tp <= 0:
             stale_skipped += 1
@@ -113,8 +126,8 @@ async def open_new_positions_live_fill(
             direction_blocked += 1
             continue
 
-        # Freeze the first qualified plan for a symbol. Later scanner reads may
-        # disagree, but they cannot flip LONG<->SHORT while the thesis is active.
+        # This local gate remains as an execution-time sanity check. The source
+        # of truth is already the unified heart persisted on the signal.
         thesis = await gate_candidate(
             db,
             symbol=row["symbol"],
@@ -132,8 +145,6 @@ async def open_new_positions_live_fill(
                 no_chase += 1
             continue
 
-        # From this point on we use the frozen thesis levels, not a newly
-        # recalculated signal plan.
         frozen_side = str(thesis.get("locked_direction") or side).upper()
         frozen_stop = base._f(thesis.get("frozen_stop"), original_stop)
         frozen_tp = base._f(thesis.get("frozen_tp"), original_tp)
@@ -184,13 +195,15 @@ async def open_new_positions_live_fill(
 
         opened_at = datetime.now(timezone.utc)
         metadata = json.dumps({
-            "execution_version": "paper_execution_v2_multi_strategy_v7_fixed_thesis",
+            "execution_version": "paper_execution_v2_multi_strategy_v8_unified_heart",
             "strategy_mode": "TREND_PREMOVE",
             "signal_observed_at": row["observed_at"].isoformat() if row.get("observed_at") else None,
             "signal_entry_price": signal_entry,
             "simulated_fill_price": fill,
             "uses_current_observable_price": True,
             "portfolio_loss_risk_multiplier": risk_multiplier,
+            "explodex_heart": heart,
+            "heart_approved": True,
             "market_direction_guard": direction_guard,
             "trade_thesis": thesis,
             "plan_is_frozen": True,
@@ -228,6 +241,7 @@ async def open_new_positions_live_fill(
         "stale_skipped": stale_skipped,
         "anti_loss_skipped": anti_loss_skipped,
         "direction_blocked": direction_blocked,
+        "heart_blocked": heart_blocked,
         "thesis_blocked": thesis_blocked,
         "no_chase": no_chase,
         "adaptive_errors": adaptive_errors,
@@ -300,7 +314,7 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     })
     await db.commit()
     return {
-        "execution_version": "paper_execution_v2_multi_strategy_v7_fixed_thesis",
+        "execution_version": "paper_execution_v2_multi_strategy_v8_unified_heart",
         "regime_router": regime,
         "loss_brake": loss_brake,
         "trend": {
