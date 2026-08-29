@@ -12,19 +12,19 @@ from app.services.binance import binance_client
 from app.services.coinglass import coinglass_client
 from app.services.coinglass_confirmation import apply_coinglass_confirmation
 from app.services.dashboard import live_event_feed, live_predictions, prediction_history
+from app.services.explodex_heart import run_explodex_heart
 from app.services.market_context import market_context
 from app.services.news_context import news_context_for_symbol
 from app.services.opportunities import calibration_by_score, ranked_opportunities
 from app.services.paper_time_management import manage_open_paper_trades_with_time
 from app.services.paper_trading import paper_performance, sync_ready_signals
-from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
 from app.services.scanner_progress import scanner_progress
 from app.services.scoring import build_btc_context, score_snapshot
 
 
-READY_POLICY = "direction_match + ACTIVADO + no_chase + Risk Guard V2"
+READY_POLICY = "ExplodeX Heart: guarded prediction + fixed thesis + no_chase + risk guard"
 
 
 @asynccontextmanager
@@ -40,10 +40,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.12.0",
+    version="0.13.0",
     description=(
-        "ExplodeX early LONG/SHORT scanner with multi-exchange confirmation, "
-        "pre-move prediction and paper-only risk management"
+        "ExplodeX unified market heart for pre-explosion detection, "
+        "fixed trade theses and paper-only risk management"
     ),
     lifespan=lifespan,
 )
@@ -78,48 +78,11 @@ def _float(value, default: float = 0.0) -> float:
         return default
 
 
-def _gate_ready_with_prediction(scored: dict, prediction: dict) -> dict:
-    if scored.get("state") != "READY":
-        return scored
-    direction_match = prediction.get("direction") == scored.get("direction")
-    phase = str(prediction.get("phase", "SIN_SETUP"))
-    sequence = prediction.get("sequence") if isinstance(prediction.get("sequence"), dict) else {}
-    decision_guard = prediction.get("decision_guard") if isinstance(prediction.get("decision_guard"), dict) else {}
-    chase_risk = bool(sequence.get("chase_risk"))
-    risk_guard_pass = bool(sequence.get("risk_guard_pass", decision_guard.get("risk_guard_pass", True)))
-    risk_guard_blocks = list(sequence.get("risk_guard_blocks") or decision_guard.get("risk_guard_blocks") or [])
-    if direction_match and phase == "ACTIVADO" and not chase_risk and risk_guard_pass:
-        return scored
-    gated = dict(scored)
-    gated["state"] = "PREPARING"
-    metrics = dict(gated.get("metrics") or {})
-    rejects = list(metrics.get("reject_reasons") or [])
-    reason = (
-        "pre_move_direction_conflict"
-        if not direction_match
-        else "pre_move_chase_risk"
-        if chase_risk
-        else "risk_guard_blocked"
-        if not risk_guard_pass
-        else "pre_move_not_activated"
-    )
-    if reason not in rejects:
-        rejects.append(reason)
-    metrics["reject_reasons"] = rejects
-    metrics["pre_move_direction_match"] = direction_match
-    metrics["pre_move_phase"] = phase
-    metrics["pre_move_chase_risk"] = chase_risk
-    metrics["risk_guard_pass"] = risk_guard_pass
-    metrics["risk_guard_blocks"] = risk_guard_blocks
-    gated["metrics"] = metrics
-    return gated
-
-
 @app.get("/")
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.12.0",
+        "version": "0.13.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
@@ -128,9 +91,9 @@ async def root():
             "configured": coinglass_client.configured,
             "require_for_ready": settings.coinglass_require_for_ready,
         },
-        "prediction_engine": "pre-move-v1 + risk-guard-v2",
+        "prediction_engine": "explodex-heart-v1",
         "ready_policy": READY_POLICY,
-        "message": "ExplodeX backend online",
+        "message": "ExplodeX unified heart online",
     }
 
 
@@ -144,7 +107,7 @@ async def health():
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
         "provider_warning": binance_client.last_primary_error,
-        "prediction_engine": "pre-move-v1 + risk-guard-v2",
+        "prediction_engine": "explodex-heart-v1",
         "ready_policy": READY_POLICY,
         "coinglass": coinglass_client.status(),
     }
@@ -156,7 +119,7 @@ async def runtime_status():
     payload["market_data_source"] = binance_client.active_source
     payload["provider_warning"] = binance_client.last_primary_error
     payload["coinglass"] = coinglass_client.status()
-    payload["prediction_engine"] = "pre-move-v1 + risk-guard-v2"
+    payload["prediction_engine"] = "explodex-heart-v1"
     payload["ready_policy"] = READY_POLICY
     return payload
 
@@ -259,7 +222,10 @@ async def market_candles(
 
 
 @app.get("/api/v1/analysis/{symbol}")
-async def live_symbol_analysis(symbol: str):
+async def live_symbol_analysis(
+    symbol: str,
+    db: AsyncSession = Depends(get_db),
+):
     safe_symbol = _safe_symbol(symbol)
     try:
         snapshot, btc_klines = await asyncio.gather(
@@ -269,9 +235,18 @@ async def live_symbol_analysis(symbol: str):
         btc_context = build_btc_context(btc_klines)
         local_scored = score_snapshot(snapshot, btc_context=btc_context)
         cg = await coinglass_client.enrich_symbol(safe_symbol)
-        scored = apply_coinglass_confirmation(local_scored, cg)
-        prediction = build_pre_move_prediction(scored, snapshot, cg)
-        scored = _gate_ready_with_prediction(scored, prediction)
+        confirmed = apply_coinglass_confirmation(local_scored, cg)
+        heart_result = await run_explodex_heart(
+            db,
+            symbol=safe_symbol,
+            scored=confirmed,
+            snapshot=snapshot,
+            coinglass=cg,
+            persist_thesis=True,
+        )
+        scored = heart_result["score"]
+        prediction = heart_result["prediction"]
+        heart = heart_result["heart"]
 
         availability = {
             "price_structure": bool(snapshot.get("klines")),
@@ -314,6 +289,7 @@ async def live_symbol_analysis(symbol: str):
             "data_quality": data_quality,
             "availability": availability,
             "coinglass": cg,
+            "explodex_heart": heart,
             "prediction": prediction,
             "current_open_interest": _float(snapshot.get("open_interest", {}).get("openInterest")),
             "direction": scored["direction"],
@@ -325,17 +301,17 @@ async def live_symbol_analysis(symbol: str):
             "risk_score": scored["risk_score"],
             "local_risk_score_before_coinglass": local_scored["risk_score"],
             "current_price": scored["current_price"],
-            "entry_low": prediction.get("entry_low", scored["entry_low"]),
-            "entry_high": prediction.get("entry_high", scored["entry_high"]),
-            "invalidation_price": prediction.get("invalidation_price", scored["stop_loss"]),
-            "stop_loss": prediction.get("stop_loss", scored["stop_loss"]),
-            "tp1": prediction.get("tp1", scored["tp1"]),
-            "tp2": prediction.get("tp2", scored["tp2"]),
-            "tp3": prediction.get("tp3", scored["tp3"]),
+            "entry_low": scored.get("entry_low", prediction.get("entry_low")),
+            "entry_high": scored.get("entry_high", prediction.get("entry_high")),
+            "invalidation_price": scored.get("invalidation_price", prediction.get("invalidation_price", scored["stop_loss"])),
+            "stop_loss": scored.get("stop_loss", prediction.get("stop_loss")),
+            "tp1": scored.get("tp1", prediction.get("tp1")),
+            "tp2": scored.get("tp2", prediction.get("tp2")),
+            "tp3": scored.get("tp3", prediction.get("tp3")),
             "expected_move_min_pct": scored["expected_move_min_pct"],
             "expected_move_max_pct": scored["expected_move_max_pct"],
-            "expected_duration_min_minutes": prediction.get("expected_duration_min_minutes", scored["expected_duration_min_minutes"]),
-            "expected_duration_max_minutes": prediction.get("expected_duration_max_minutes", scored["expected_duration_max_minutes"]),
+            "expected_duration_min_minutes": scored.get("expected_duration_min_minutes", prediction.get("expected_duration_min_minutes")),
+            "expected_duration_max_minutes": scored.get("expected_duration_max_minutes", prediction.get("expected_duration_max_minutes")),
             "components": scored["components"],
             "metrics": scored["metrics"],
             "btc_context": btc_context,
@@ -345,6 +321,8 @@ async def live_symbol_analysis(symbol: str):
                 "chase_risk": chase_risk,
                 "risk_guard_pass": risk_guard_pass,
                 "risk_guard_blocks": risk_guard_blocks,
+                "heart_execution_allowed": heart.get("execution_allowed"),
+                "thesis_status": (heart.get("thesis") or {}).get("status"),
                 "ready": scored.get("state") == "READY",
             },
             "risk_policy": {
@@ -354,9 +332,11 @@ async def live_symbol_analysis(symbol: str):
                 "direction_match_required_for_ready": True,
                 "no_chase_required_for_ready": True,
                 "risk_guard_required_for_ready": True,
+                "fixed_thesis_required_after_plan_creation": True,
+                "heart_execution_permission_required": True,
                 "score_is_probability": False,
             },
-            "note": "READY ahora también exige Risk Guard V2; score y predicción no garantizan beneficio.",
+            "note": "ExplodeX Heart es la decisión canónica. Índices técnicos no garantizan beneficio.",
         }
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Live analysis unavailable: {exc}") from exc
