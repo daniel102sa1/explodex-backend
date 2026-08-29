@@ -65,20 +65,14 @@ async def open_new_positions_live_fill(
     regime: dict[str, Any] | None = None,
     defensive: bool = False,
 ) -> dict[str, Any]:
-    """Open PAPER positions only from the canonical ExplodeX Heart plan."""
+    """Open PAPER positions only from the canonical ExplodeX Heart ENTER decision."""
     regime = regime or {}
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one())
     slots = max(0, base.MAX_OPEN_POSITIONS - open_count)
     if slots <= 0:
-        return {
-            "opened": 0,
-            "stale_skipped": 0,
-            "heart_blocked": 0,
-            "no_chase": 0,
-            "risk_multiplier": risk_multiplier,
-        }
+        return {"opened": 0, "stale_skipped": 0, "heart_blocked": 0, "no_chase": 0, "risk_multiplier": risk_multiplier}
 
     candidates = (await db.execute(text("""
         SELECT vo.signal_id::text, vo.symbol, vo.observed_at,
@@ -112,13 +106,14 @@ async def open_new_positions_live_fill(
         heart = _as_dict(reason.get("explodex_heart"))
         thesis = _as_dict(heart.get("thesis"))
         plan = _as_dict(heart.get("plan"))
+        decision = _as_dict(heart.get("action_decision"))
 
         side = str(heart.get("direction") or row.get("direction") or "").upper()
         if (
             not bool(heart.get("execution_allowed"))
+            or not bool(decision.get("should_enter", heart.get("execution_allowed")))
             or str(row.get("signal_state") or "") != "READY"
             or not bool(thesis.get("frozen_plan"))
-            or str(thesis.get("status") or "") != "ENTER_NOW"
         ):
             heart_blocked += 1
             continue
@@ -142,12 +137,8 @@ async def open_new_positions_live_fill(
             stale_skipped += 1
             continue
 
-        # Leverage is a sizing tool only. Direction and geometry are never
-        # recalculated here; they come exclusively from the frozen Heart thesis.
         regime_name = str(regime.get("regime") or regime.get("name") or "")
-        regime_aligned = (side == "LONG" and regime_name == "TREND_UP") or (
-            side == "SHORT" and regime_name == "TREND_DOWN"
-        )
+        regime_aligned = (side == "LONG" and regime_name == "TREND_UP") or (side == "SHORT" and regime_name == "TREND_DOWN")
         leverage = adaptive_leverage(
             grade=row.get("grade"),
             fingerprint_score=fingerprint_score,
@@ -156,8 +147,6 @@ async def open_new_positions_live_fill(
             defensive=defensive,
         )
         sizing = base.size_position(balance, fill, stop, leverage)
-        # Portfolio/régimen risk may reduce size but can never increase the
-        # frozen plan's original risk budget.
         combined_risk_multiplier = min(1.0, max(0.0, risk_multiplier))
         sizing = _scale_sizing(sizing, combined_risk_multiplier)
         if sizing["quantity"] <= 0 or sizing["margin"] <= 0:
@@ -166,14 +155,16 @@ async def open_new_positions_live_fill(
 
         opened_at = datetime.now(timezone.utc)
         metadata = json.dumps({
-            "execution_version": "paper_execution_v2_multi_strategy_v9_heart_only",
+            "execution_version": "paper_execution_v2_multi_strategy_v10_actionable_heart",
             "strategy_mode": "TREND_PREMOVE",
             "signal_observed_at": row["observed_at"].isoformat() if row.get("observed_at") else None,
             "simulated_fill_price": fill,
             "uses_current_observable_price": True,
             "explodex_heart": heart,
             "heart_approved": True,
+            "action_decision": decision,
             "plan_is_frozen": True,
+            "legacy_phase_required": False,
             "post_signal_direction_recalculation": False,
             "post_signal_stop_widening": False,
             "adaptive_leverage": leverage,
@@ -212,7 +203,6 @@ async def open_new_positions_live_fill(
 
 async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     await base.ensure_paper_schema(db)
-
     closed = await base._close_due_positions(db)
     thesis_reconciliation = await reconcile_canonical_theses(db)
     range_expired = await close_expired_range_positions(db)
@@ -233,37 +223,22 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     range_enabled = range_enabled_by_regime and secondary_entries_enabled
     micro_enabled = micro_enabled_by_regime and secondary_entries_enabled
 
-    trend_opened = await open_new_positions_live_fill(
-        db,
-        risk_multiplier=trend_risk_multiplier,
-        regime=regime,
-        defensive=defensive,
-    )
+    trend_opened = await open_new_positions_live_fill(db, risk_multiplier=trend_risk_multiplier, regime=regime, defensive=defensive)
 
     range_scan = await scan_all_eligible_ranges(db)
-    range_opened = (
-        await open_range_positions(db)
-        if range_enabled
-        else {
-            "opened": 0,
-            "skipped": 0,
-            "regime_blocked": not range_enabled_by_regime,
-            "loss_brake_blocked": defensive and not secondary_entries_enabled,
-        }
-    )
+    range_opened = await open_range_positions(db) if range_enabled else {
+        "opened": 0, "skipped": 0,
+        "regime_blocked": not range_enabled_by_regime,
+        "loss_brake_blocked": defensive and not secondary_entries_enabled,
+    }
 
     micro_scan = await scan_micro_scalps(db)
     advanced_prefilter = await prefilter_new_micro_signals(db)
-    micro_opened = (
-        await open_micro_positions(db)
-        if micro_enabled
-        else {
-            "opened": 0,
-            "skipped": 0,
-            "regime_blocked": not micro_enabled_by_regime,
-            "loss_brake_blocked": defensive and not secondary_entries_enabled,
-        }
-    )
+    micro_opened = await open_micro_positions(db) if micro_enabled else {
+        "opened": 0, "skipped": 0,
+        "regime_blocked": not micro_enabled_by_regime,
+        "loss_brake_blocked": defensive and not secondary_entries_enabled,
+    }
 
     order_sync = await sync_paper_orders(db)
     summary = await base.paper_summary(db)
@@ -276,14 +251,11 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     })
     await db.commit()
     return {
-        "execution_version": "paper_execution_v2_multi_strategy_v9_heart_only",
+        "execution_version": "paper_execution_v2_multi_strategy_v10_actionable_heart",
         "regime_router": regime,
         "loss_brake": loss_brake,
         "thesis_reconciliation": thesis_reconciliation,
-        "trend": {
-            **closed,
-            **trend_opened,
-        },
+        "trend": {**closed, **trend_opened},
         "range_micro": {
             "expired": range_expired.get("closed", 0),
             "enabled_by_regime": range_enabled_by_regime,
