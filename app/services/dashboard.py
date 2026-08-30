@@ -22,6 +22,14 @@ PHASE_PRIORITY = {
     "SIN_DATOS": 0,
 }
 
+ACTION_PRIORITY = {
+    "ENTRAR_LONG": 100,
+    "ENTRAR_SHORT": 100,
+    "ESPERAR_RETEST": 60,
+    "ESPERAR": 50,
+    "NO_ENTRAR": 0,
+}
+
 
 def _json_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
@@ -48,13 +56,26 @@ def _iso(value: Any) -> str | None:
     return str(value) if value else None
 
 
-def _condition_summary(prediction: dict[str, Any]) -> tuple[int, int]:
-    conditions = prediction.get("conditions")
-    if isinstance(conditions, list) and conditions:
-        ready = sum(1 for item in conditions if isinstance(item, dict) and bool(item.get("ready")))
-        return ready, len(conditions)
-    confirmations = prediction.get("confirmations") or []
-    return min(len(confirmations), 9), 9
+def _heart_summary(reason: dict[str, Any], prediction: dict[str, Any]) -> tuple[dict[str, Any], int, int, str, bool]:
+    heart = _json_dict(reason.get("explodex_heart"))
+    if not heart:
+        heart = _json_dict(prediction.get("explodex_heart"))
+    action_decision = _json_dict(heart.get("action_decision"))
+    action = str(action_decision.get("action") or "ESPERAR")
+    should_enter = bool(action_decision.get("should_enter"))
+
+    # These are the actual Heart entry checks. Do not fabricate a green 9/9
+    # from a list of descriptive confirmations.
+    missing = list(action_decision.get("advanced_stack_missing") or [])
+    stack_ready = bool(action_decision.get("advanced_stack_ready"))
+    stack_total = 7
+    stack_ready_count = stack_total if stack_ready else max(0, stack_total - len(missing))
+
+    # Add the live price-in-zone check as a separate, meaningful condition.
+    total_conditions = stack_total + 1
+    ready_conditions = stack_ready_count + (1 if bool(action_decision.get("price_in_entry_zone")) else 0)
+    operable = should_enter and action in {"ENTRAR_LONG", "ENTRAR_SHORT"}
+    return heart, ready_conditions, total_conditions, action, operable
 
 
 async def live_predictions(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
@@ -109,16 +130,13 @@ async def live_predictions(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
         prediction = _json_dict(reason.get("prediction"))
         metrics = _json_dict(reason.get("metrics"))
         coinglass = _json_dict(reason.get("coinglass"))
-        ready_conditions, total_conditions = _condition_summary(prediction)
+        heart, ready_conditions, total_conditions, action, operable = _heart_summary(reason, prediction)
         history = trajectories.get(str(row["symbol"]), [])[-6:]
         scores = [x["preactivation_score"] for x in history if x["preactivation_score"] > 0]
         velocity = (scores[-1] - scores[0]) if len(scores) >= 2 else 0.0
         accelerating = len(scores) >= 3 and scores[-1] > scores[-2] > scores[-3]
         phase = str(prediction.get("phase") or "SIN_SETUP")
         state = str(row.get("state") or "NO_TRADE")
-        operable = state == "READY" and phase == "ACTIVADO" and not bool(
-            prediction.get("sequence", {}).get("chase_risk") if isinstance(prediction.get("sequence"), dict) else False
-        )
         items.append(
             {
                 "id": row["id"],
@@ -143,6 +161,8 @@ async def live_predictions(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
                 "expected_duration_min_minutes": row.get("expected_duration_min_minutes"),
                 "expected_duration_max_minutes": row.get("expected_duration_max_minutes"),
                 "prediction": prediction,
+                "explodex_heart": heart,
+                "heart_action": action,
                 "metrics": metrics,
                 "coinglass": coinglass,
                 "conditions_ready": ready_conditions,
@@ -156,6 +176,7 @@ async def live_predictions(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
 
     items.sort(
         key=lambda item: (
+            ACTION_PRIORITY.get(str(item.get("heart_action")), 0),
             1 if item["operable"] else 0,
             PHASE_PRIORITY.get(str(item["prediction"].get("phase")), 0),
             _f(item["prediction"].get("preactivation_score")),
@@ -167,7 +188,7 @@ async def live_predictions(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
     items = items[:limit]
     operable_count = sum(1 for item in items if item["operable"])
     preactivation_count = sum(1 for item in items if str(item["prediction"].get("phase")) == "PREACTIVACION")
-    activated_count = sum(1 for item in items if str(item["prediction"].get("phase")) == "ACTIVADO")
+    activated_count = sum(1 for item in items if str(item["heart_action"]) in {"ENTRAR_LONG", "ENTRAR_SHORT"})
     accelerating_count = sum(1 for item in items if item["preparation_accelerating"])
 
     return {
@@ -179,7 +200,7 @@ async def live_predictions(db: AsyncSession, limit: int = 50) -> dict[str, Any]:
             "activated": activated_count,
             "accelerating": accelerating_count,
         },
-        "note": "READY exige activación previa; el score no representa probabilidad garantizada.",
+        "note": "La decisión y los checks vienen del ExplodeX Heart. El score es técnico y no una probabilidad garantizada.",
     }
 
 
@@ -202,6 +223,8 @@ async def prediction_history(db: AsyncSession, symbol: str, limit: int = 12) -> 
     for row in reversed(result.mappings().all()):
         reason = _json_dict(row["reason"])
         prediction = _json_dict(reason.get("prediction"))
+        heart = _json_dict(reason.get("explodex_heart")) or _json_dict(prediction.get("explodex_heart"))
+        action = _json_dict(heart.get("action_decision")).get("action")
         rows.append(
             {
                 "at": _iso(row["created_at"]),
@@ -213,6 +236,7 @@ async def prediction_history(db: AsyncSession, symbol: str, limit: int = 12) -> 
                 "preactivation_score": _f(prediction.get("preactivation_score")),
                 "phase": prediction.get("phase") or "SIN_SETUP",
                 "type": prediction.get("type") or "SIN_SETUP",
+                "heart_action": action or "ESPERAR",
             }
         )
     learned = await edge_summary(db, symbol=symbol)
@@ -238,11 +262,14 @@ async def live_event_feed(db: AsyncSession, limit: int = 80) -> list[dict[str, A
     for row in signal_result.mappings().all():
         reason = _json_dict(row["reason"])
         prediction = _json_dict(reason.get("prediction"))
+        heart = _json_dict(reason.get("explodex_heart")) or _json_dict(prediction.get("explodex_heart"))
+        action = str(_json_dict(heart.get("action_decision")).get("action") or "ESPERAR")
         phase = str(prediction.get("phase") or row["state"])
         kind = str(prediction.get("type") or "SETUP")
         pre = _f(prediction.get("preactivation_score"))
-        severity = "READY" if row["state"] == "READY" else "EARLY" if phase in {"ACTIVADO", "PREACTIVACION"} else "INFO"
-        title = f"{row['symbol']} READY {row['direction']}" if row["state"] == "READY" else f"{row['symbol']} {phase.replace('_', ' ')}"
+        entering = action in {"ENTRAR_LONG", "ENTRAR_SHORT"}
+        severity = "READY" if entering else "EARLY" if phase in {"ACTIVADO", "PREACTIVACION"} else "INFO"
+        title = f"{row['symbol']} {action.replace('_', ' ')}" if entering else f"{row['symbol']} {phase.replace('_', ' ')}"
         events.append(
             {
                 "at": _iso(row["created_at"]),
@@ -252,6 +279,7 @@ async def live_event_feed(db: AsyncSession, limit: int = 80) -> list[dict[str, A
                 "direction": row["direction"],
                 "state": row["state"],
                 "phase": phase,
+                "heart_action": action,
                 "title": title,
                 "message": f"{kind.replace('_', ' ')} · preparación {pre:.1f}/100 · setup {_f(row['setup_score']):.1f}/100",
             }
