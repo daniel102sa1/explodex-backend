@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import scanner as scanner_module
+from app.services.entry_latch_persistence import apply_entry_latches_for_run
 from app.services.heart_persistence import canonicalize_scanner_run
 from app.services.microstructure_persistence_resilient import install_microstructure_persistence_hardening
 from app.services.plan_lifecycle_persistence import expire_exhausted_plans_for_run
@@ -18,10 +19,7 @@ install_verdict_memory_overrides()
 install_microstructure_persistence_hardening()
 install_server_snapshot_extensions()
 
-# Preserve the raw scanner callable exactly once.
 _raw_run_scanner = scanner_module.run_scanner
-
-# The guarded prediction stack is the mathematical input to the unified heart.
 scanner_module.build_pre_move_prediction = build_pre_move_prediction
 
 
@@ -30,8 +28,6 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
     result = await _raw_run_scanner(db, deep_limit=deep_limit)
     run_id = str(result.get("run_id") or "")
     if run_id:
-        # Statistical calibration remains an evidence layer, but it is no longer
-        # allowed to become a separate source of truth from the persisted signal.
         try:
             result["edge_gate"] = await apply_edge_gate_to_scanner_run(db, run_id)
         except Exception as exc:
@@ -40,9 +36,6 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
             }
 
-        # Final canonicalization happens after every other scanner layer. This
-        # freezes/maintains the thesis and writes the one decision that Validation
-        # Lab and PAPER are allowed to consume.
         try:
             result["explodex_heart"] = await canonicalize_scanner_run(db, run_id)
         except Exception as exc:
@@ -52,9 +45,21 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
             }
 
-        # A plan that already passed TP3 without an entry is finished. Persist
-        # that lifecycle after canonicalization so UI and PAPER stop suggesting
-        # an eternal retest. This never manufactures the opposite trade.
+        # Entry latch runs immediately after canonicalization. The first ENTER
+        # becomes a persistent activated plan. Later weaker scans may update the
+        # radar, but cannot revert the user-facing action to "wait for confirmation".
+        try:
+            result["entry_latch"] = await apply_entry_latches_for_run(db, run_id)
+        except Exception as exc:
+            result["entry_latch"] = {
+                "version": "entry_latch_persistence_v1",
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            }
+
+        # Missed TP3 lifecycle runs after the latch. A triggered entry must not
+        # be classified as a missed opportunity just because PAPER/manual fill
+        # state is not yet known.
         try:
             result["plan_lifecycle"] = await expire_exhausted_plans_for_run(db, run_id)
         except Exception as exc:
@@ -66,5 +71,4 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
     return result
 
 
-# Runtime/manual scanner callers receive the same guarded + canonical lifecycle.
 scanner_module.run_scanner = run_scanner
