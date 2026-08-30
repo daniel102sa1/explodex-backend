@@ -6,9 +6,10 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.entry_trigger_latch import active_entry_latch
 from app.services.plan_lifecycle_guard import expire_exhausted_plan
 
-VERSION = "plan_lifecycle_persistence_v1"
+VERSION = "plan_lifecycle_persistence_v2_entry_aware"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -33,7 +34,7 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 
 async def expire_exhausted_plans_for_run(db: AsyncSession, run_id: str) -> dict[str, Any]:
-    """Close missed plans that already passed TP3 and persist NO_ENTRAR clearly."""
+    """Close only truly missed plans that passed TP3 without any entry trigger."""
     rows = (await db.execute(text("""
         SELECT s.id::text AS signal_id, sy.symbol, s.current_price, s.reason
         FROM signals s
@@ -43,6 +44,7 @@ async def expire_exhausted_plans_for_run(db: AsyncSession, run_id: str) -> dict[
     """), {"run_id": run_id})).mappings().all()
 
     exhausted = 0
+    skipped_latched = 0
     symbols: list[str] = []
     for raw in rows:
         row = dict(raw)
@@ -51,6 +53,13 @@ async def expire_exhausted_plans_for_run(db: AsyncSession, run_id: str) -> dict[
         heart = _d(reason.get("explodex_heart")) or _d(prediction.get("explodex_heart"))
         thesis = _d(heart.get("thesis"))
         if not thesis or str(thesis.get("status") or "") == "IN_POSITION":
+            continue
+
+        # Once an ENTER was fired, this is no longer a missed opportunity.
+        # Manual fills are unknown to the backend, so the latch is authoritative.
+        latch = await active_entry_latch(db, str(row.get("symbol")))
+        if latch and str(latch.get("status") or "") in {"TRIGGERED", "IN_POSITION"}:
+            skipped_latched += 1
             continue
 
         current = _f(row.get("current_price"))
@@ -107,6 +116,7 @@ async def expire_exhausted_plans_for_run(db: AsyncSession, run_id: str) -> dict[
         "version": VERSION,
         "seen": len(rows),
         "exhausted": exhausted,
+        "skipped_entry_latched": skipped_latched,
         "symbols": symbols[:20],
-        "rule": "TP3 pasado sin entrada termina el plan; nunca crea automáticamente la operación contraria.",
+        "rule": "TP3 pasado solo expira planes que nunca dispararon ENTRAR; una entrada latched mantiene su plan.",
     }
