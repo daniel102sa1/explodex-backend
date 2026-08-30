@@ -12,7 +12,7 @@ from app.services.paper_fast_cycle import run_fast_paper_cycle
 from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
-from app.services.paper_portfolio import paper_history, paper_summary
+from app.services.paper_portfolio import ensure_paper_schema, paper_history, paper_summary
 from app.services.paper_range_micro import range_summary, scan_all_eligible_ranges
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.validation_mode import ensure_validation_schema
@@ -21,7 +21,10 @@ router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
 
 
 async def _ensure_paper_dependencies(db: AsyncSession) -> None:
+    """Prepare the canonical PAPER schema before any route reads it."""
     await ensure_validation_schema(db)
+    await ensure_paper_schema(db)
+    await ensure_signal_fk(db)
 
 
 async def _safe_component(
@@ -43,10 +46,12 @@ async def _safe_component(
 
 @router.get("/summary")
 async def summary(db: AsyncSession = Depends(get_db)):
+    # Repair/migrate first. Previously paper_summary() ran before the signal FK
+    # bridge and could fail with 500 on databases carrying legacy PAPER rows.
     await _ensure_paper_dependencies(db)
     result = await paper_summary(db)
-    await ensure_signal_fk(db)
     result["execution_version"] = EXECUTION_VERSION
+    result["schema_bridge"] = "signals_fk_ready"
     result["heart_diagnostics"] = await _safe_component(db, "heart_diagnostics", lambda session: heart_diagnostics(session, minutes=30))
     result["orders"] = await _safe_component(db, "orders", paper_order_stats)
     result["range_micro"] = await _safe_component(db, "range_micro", range_summary)
