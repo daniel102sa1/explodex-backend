@@ -6,9 +6,10 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.ignition_engine import build_ignition_signal
 from app.services.trade_thesis import apply_trade_thesis, apply_thesis_to_score
 
-HEART_PERSISTENCE_VERSION = "heart_persistence_v1"
+HEART_PERSISTENCE_VERSION = "heart_persistence_v2_ignition"
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -32,21 +33,121 @@ def _f(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _execution_allowed(score: dict[str, Any], prediction: dict[str, Any], thesis: dict[str, Any]) -> bool:
-    seq = prediction.get("sequence") if isinstance(prediction.get("sequence"), dict) else {}
-    return (
-        str(score.get("state") or "") == "READY"
-        and str(prediction.get("phase") or "") == "ACTIVADO"
-        and not bool(seq.get("chase_risk"))
-        and (
-            not thesis.get("frozen_plan")
-            or str(thesis.get("status") or "") == "ENTER_NOW"
-        )
+def _stack_checks(prediction: dict[str, Any]) -> tuple[bool, list[str]]:
+    fingerprint = _json(prediction.get("premove_fingerprint"))
+    stack = _json(prediction.get("prediction_stack_v5"))
+    master = _json(stack.get("master_decision"))
+    risk_veto = _json(stack.get("risk_veto"))
+    timing = _json(stack.get("entry_timing"))
+    sequence = _json(prediction.get("sequence"))
+    decision_guard = _json(prediction.get("decision_guard"))
+
+    trade_now = bool(fingerprint.get("trade_now_ready")) or str(fingerprint.get("trade_class") or "").upper() == "TRADE_NOW"
+    master_yes = str(master.get("state") or "").upper() == "YES"
+    timing_enter = str(timing.get("state") or "").upper() in {"ENTER_NOW", "TRADE_NOW"} or trade_now
+    veto_clear = not bool(risk_veto.get("blocked"))
+    not_chasing = not bool(sequence.get("chase_risk")) and not bool(risk_veto.get("chase"))
+    not_invalidated = not bool(risk_veto.get("invalidated")) and not bool(risk_veto.get("hard_block"))
+    risk_guard_pass = bool(sequence.get("risk_guard_pass", decision_guard.get("risk_guard_pass", True)))
+
+    checks = {
+        "fingerprint_trade_now": trade_now,
+        "master_yes": master_yes,
+        "timing_enter": timing_enter,
+        "veto_clear": veto_clear,
+        "not_chasing": not_chasing,
+        "not_invalidated": not_invalidated,
+        "risk_guard_pass": risk_guard_pass,
+    }
+    return all(checks.values()), [key for key, ok in checks.items() if not ok]
+
+
+def _inside_zone(price: float, low: float, high: float) -> bool:
+    return price > 0 and low > 0 and high > 0 and min(low, high) <= price <= max(low, high)
+
+
+def _canonical_action(
+    score: dict[str, Any],
+    prediction: dict[str, Any],
+    thesis: dict[str, Any],
+    ignition: dict[str, Any],
+) -> dict[str, Any]:
+    direction = str(score.get("direction") or prediction.get("direction") or "").upper()
+    stack_ready, stack_missing = _stack_checks(prediction)
+    sequence = _json(prediction.get("sequence"))
+    stack = _json(prediction.get("prediction_stack_v5"))
+    risk_veto = _json(stack.get("risk_veto"))
+
+    low = _f(score.get("entry_low"))
+    high = _f(score.get("entry_high"))
+    current = _f(score.get("current_price"))
+    in_zone = _inside_zone(current, low, high)
+
+    terminal = str(thesis.get("status") or "") in {"INVALIDATED", "EXPIRED", "CLOSED"}
+    cooldown = str(thesis.get("action") or "") == "COOLDOWN_NO_CAMBIAR_DE_LADO"
+    chase = bool(sequence.get("chase_risk")) or bool(risk_veto.get("chase")) or str(thesis.get("status") or "") == "NO_CHASE"
+    hard_block = bool(risk_veto.get("blocked")) or bool(risk_veto.get("invalidated")) or bool(risk_veto.get("hard_block"))
+    risk_guard_pass = bool(sequence.get("risk_guard_pass", _json(prediction.get("decision_guard")).get("risk_guard_pass", True)))
+    risk_ok = _f(score.get("risk_score"), 100.0) <= 48.0
+    ignition_ready = bool(ignition.get("fast_path_ready"))
+    entry_signal_ready = stack_ready or ignition_ready
+
+    allowed = (
+        entry_signal_ready
+        and in_zone
+        and risk_guard_pass
+        and risk_ok
+        and not chase
+        and not hard_block
+        and not terminal
+        and not cooldown
+        and str(score.get("state") or "") != "NO_TRADE"
     )
+
+    if allowed:
+        action = "ENTRAR_LONG" if direction == "LONG" else "ENTRAR_SHORT"
+        via = "IGNITION_FAST_PATH" if ignition_ready and not stack_ready else "ADVANCED_STACK"
+        reason = (
+            "Ignición fuerte confirmada; flujo/volumen/OI comienzan a expandirse y los bloqueos duros están limpios."
+            if via == "IGNITION_FAST_PATH"
+            else "Stack avanzado en TRADE_NOW/YES, sin veto ni chase y precio dentro de la zona."
+        )
+    elif terminal or cooldown or hard_block or not risk_guard_pass:
+        action = "NO_ENTRAR"
+        via = "BLOCKED"
+        reason = "Hay invalidación, veto duro, cooldown o Risk Guard bloqueando la operación."
+    elif chase:
+        action = "ESPERAR_RETEST"
+        via = "NO_CHASE"
+        reason = "La dirección puede seguir siendo válida, pero el precio ya salió de la zona; no perseguir."
+    else:
+        action = "ESPERAR"
+        via = "WAITING"
+        reason = "La preparación existe, pero todavía falta ignición/confirmación o que el precio esté en la zona."
+
+    missing = list(stack_missing)
+    if not ignition_ready and "ignition_fast_path" not in missing:
+        missing.append("ignition_fast_path")
+    if not in_zone and "price_in_entry_zone" not in missing:
+        missing.append("price_in_entry_zone")
+
+    return {
+        "action": action,
+        "should_enter": allowed,
+        "direction": direction,
+        "via": via,
+        "price_in_entry_zone": in_zone,
+        "advanced_stack_ready": stack_ready,
+        "advanced_stack_missing": missing,
+        "ignition_fast_path_ready": ignition_ready,
+        "ignition_score": ignition.get("score"),
+        "ignition_stage": ignition.get("stage"),
+        "reason": reason,
+    }
 
 
 async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, Any]:
-    """Freeze/propagate one thesis into every persisted signal of a scanner run."""
+    """Freeze one thesis and persist the single actionable Heart decision."""
     rows = (await db.execute(text("""
         SELECT s.id::text AS signal_id, sy.symbol, s.direction, s.state,
                s.setup_score, s.risk_score, s.confidence_pct, s.current_price,
@@ -64,6 +165,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
     frozen = 0
     blocked = 0
     execution_ready = 0
+    ignition_ready_count = 0
     actions: dict[str, int] = {}
 
     for raw in rows:
@@ -97,30 +199,33 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             "coinglass": _json(reason.get("coinglass")),
         }
 
-        thesis = await apply_trade_thesis(
-            db,
-            symbol=row["symbol"],
-            score=score,
-            prediction=prediction,
-        )
+        ignition = build_ignition_signal(score, prediction)
+        thesis = await apply_trade_thesis(db, symbol=row["symbol"], score=score, prediction=prediction)
         score, prediction = apply_thesis_to_score(score, prediction, thesis)
-        allowed = _execution_allowed(score, prediction, thesis)
-        action = str(thesis.get("action") or "OBSERVAR")
+        decision = _canonical_action(score, prediction, thesis, ignition)
+        allowed = bool(decision.get("should_enter"))
+
+        if allowed:
+            score["state"] = "READY"
+            execution_ready += 1
+        if ignition.get("fast_path_ready"):
+            ignition_ready_count += 1
+        action = str(decision.get("action") or "ESPERAR")
         actions[action] = actions.get(action, 0) + 1
         if thesis.get("frozen_plan"):
             frozen += 1
         if str(score.get("state")) == "NO_TRADE":
             blocked += 1
-        if allowed:
-            execution_ready += 1
 
         heart = {
-            "version": "explodex_heart_v1",
+            "version": "explodex_heart_v3_ignition",
             "persistence_version": HEART_PERSISTENCE_VERSION,
             "symbol": row["symbol"],
             "direction": score.get("direction"),
             "state": score.get("state"),
             "execution_allowed": allowed,
+            "action_decision": decision,
+            "ignition": ignition,
             "prediction_phase": prediction.get("phase"),
             "prediction_type": prediction.get("type"),
             "thesis": thesis,
@@ -173,5 +278,6 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         "frozen_theses": frozen,
         "blocked": blocked,
         "execution_ready": execution_ready,
+        "ignition_ready": ignition_ready_count,
         "actions": actions,
     }
