@@ -7,19 +7,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.services.paper_edge_lab import edge_lab_report
-from app.services.paper_execution_v2 import run_paper_cycle_v2
+from app.services.paper_execution_v2 import EXECUTION_VERSION, run_paper_cycle_v2
+from app.services.paper_fast_cycle import run_fast_paper_cycle
 from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
 from app.services.paper_portfolio import paper_history, paper_summary
 from app.services.paper_range_micro import range_summary, scan_all_eligible_ranges
+from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.validation_mode import ensure_validation_schema
 
 router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
 
 
 async def _ensure_paper_dependencies(db: AsyncSession) -> None:
-    """Create validation tables before PAPER tables that reference them."""
     await ensure_validation_schema(db)
 
 
@@ -28,7 +29,6 @@ async def _safe_component(
     name: str,
     loader: Callable[[AsyncSession], Awaitable[Any]],
 ) -> Any:
-    """Keep one optional PAPER diagnostic from taking down the whole summary."""
     try:
         return await loader(db)
     except Exception as exc:
@@ -45,6 +45,9 @@ async def _safe_component(
 async def summary(db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
     result = await paper_summary(db)
+    await ensure_signal_fk(db)
+    result["execution_version"] = EXECUTION_VERSION
+    result["heart_diagnostics"] = await _safe_component(db, "heart_diagnostics", lambda session: heart_diagnostics(session, minutes=30))
     result["orders"] = await _safe_component(db, "orders", paper_order_stats)
     result["range_micro"] = await _safe_component(db, "range_micro", range_summary)
     result["micro_scalp"] = await _safe_component(db, "micro_scalp", micro_summary)
@@ -78,7 +81,7 @@ async def history(
     await _ensure_paper_dependencies(db)
     return {
         "version": "paper_portfolio_v1",
-        "execution_version": "paper_execution_v2_multi_strategy_v5_anti_loss",
+        "execution_version": EXECUTION_VERSION,
         "paper_only": True,
         "rows": await paper_history(db, limit=limit),
     }
@@ -114,7 +117,7 @@ async def range_micro_scan(db: AsyncSession = Depends(get_db)):
     return {
         "paper_only": True,
         "result": await scan_all_eligible_ranges(db, force=True),
-        "note": "Escanea todas las Futures USDT elegibles por liquidez para detectar rangos laterales PAPER. No envía órdenes reales.",
+        "note": "Escanea Futures USDT elegibles para investigación PAPER; no envía órdenes reales.",
     }
 
 
@@ -130,7 +133,17 @@ async def micro_scalp_scan(db: AsyncSession = Depends(get_db)):
     return {
         "paper_only": True,
         "result": await scan_micro_scalps(db, force=True),
-        "note": "MICRO SCALP busca operaciones PAPER cortas en mercados líquidos. También muestra por qué se rechazan monedas. No cambia el clasificador de entradas reales ni envía órdenes reales.",
+        "note": "MICRO SCALP es investigación PAPER y no cambia la decisión canónica del Heart.",
+    }
+
+
+@router.post("/run-fast")
+async def run_fast_cycle(db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return {
+        "paper_only": True,
+        "result": await run_fast_paper_cycle(db),
+        "note": "Ciclo rápido del PAPER visible: Heart + precio actual + zona + riesgo. No envía órdenes reales.",
     }
 
 
@@ -139,8 +152,8 @@ async def run_cycle(db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
     return {
         "version": "paper_portfolio_v1",
-        "execution_version": "paper_execution_v2_multi_strategy_v5_anti_loss",
+        "execution_version": EXECUTION_VERSION,
         "paper_only": True,
         "result": await run_paper_cycle_v2(db),
-        "note": "Simulación únicamente. El Anti-Loss Gate puede vetar patrones PAPER repetidamente perdedores y activar modo defensivo; no envía órdenes reales.",
+        "note": "Ciclo completo PAPER y laboratorios secundarios. La entrada TREND/PRE-MOVE viene del ExplodeX Heart.",
     }
