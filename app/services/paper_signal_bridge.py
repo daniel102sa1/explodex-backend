@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-VERSION = "paper_signal_bridge_v1"
+VERSION = "paper_signal_bridge_v2_legacy_safe_fk"
 
 
 def as_dict(value: Any) -> dict[str, Any]:
@@ -23,10 +23,12 @@ def as_dict(value: Any) -> dict[str, Any]:
 
 
 async def ensure_signal_fk(db: AsyncSession) -> None:
-    """Make paper_positions.signal_id reference signals, not validation observations.
+    """Make new PAPER rows reference canonical signals without breaking history.
 
-    Validation is research/shadow evidence. It must not be a database-level
-    prerequisite for the canonical Heart PAPER simulator.
+    Historical paper_positions were created when signal_id referenced
+    validation_observations. Those UUIDs are preserved as trades, but orphan
+    links are nulled before the new FK is installed. This prevents the migration
+    itself from aborting every automatic PAPER cycle.
     """
     await db.execute(text("""
         DO $$
@@ -42,7 +44,24 @@ async def ensure_signal_fk(db: AsyncSession) -> None:
                     EXECUTE format('ALTER TABLE paper_positions DROP CONSTRAINT %I', c.conname);
                 END IF;
             END LOOP;
+        END $$;
+    """))
 
+    # Keep all historical position/PnL rows; only detach obsolete signal UUIDs.
+    await db.execute(text("""
+        UPDATE paper_positions pp
+        SET signal_id=NULL,
+            metadata=COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                'legacy_signal_link_detached', TRUE,
+                'legacy_signal_bridge_version', :version
+            )
+        WHERE pp.signal_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM signals s WHERE s.id=pp.signal_id)
+    """), {"version": VERSION})
+
+    await db.execute(text("""
+        DO $$
+        BEGIN
             IF NOT EXISTS (
                 SELECT 1
                 FROM pg_constraint
