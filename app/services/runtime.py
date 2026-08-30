@@ -9,7 +9,8 @@ from app.config import settings
 from app.database import SessionLocal
 from app.services.edge_engine import capture_recent_signals, label_due_observations
 from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
-from app.services.paper_trading import manage_open_paper_trades, sync_ready_signals
+from app.services.paper_heart_sync import sync_heart_paper_signals
+from app.services.paper_trading import manage_open_paper_trades
 from app.services.scanner_guarded import run_scanner
 from app.services.sequential_microstructure import flush_pending_snapshots, hydrate_recent_histories, prune_persistent_history
 from app.services.trade_time_manager import manage_trade_time_stops
@@ -85,6 +86,7 @@ class RuntimeState:
             },
             "paper_sync": {
                 "running": self.paper_sync_running,
+                "engine": "paper_heart_sync_v1",
                 "interval_seconds": settings.paper_sync_interval_seconds,
                 "last_run_at": iso(self.last_paper_sync_at),
                 "last_ok": self.last_paper_sync_ok,
@@ -176,17 +178,23 @@ async def _run_paper_sync_once() -> None:
     runtime_state.paper_sync_running = True
     try:
         async with SessionLocal() as db:
-            result = await sync_ready_signals(db)
+            result = await sync_heart_paper_signals(db)
         runtime_state.last_paper_sync_result = {
+            "version": result.get("version"),
             "opened": result.get("opened", 0),
             "reason": result.get("reason"),
+            "heart_enter_signals": result.get("heart_enter_signals"),
+            "heart_actions": result.get("heart_actions"),
+            "blockers": result.get("blockers"),
+            "latest_signals_checked": result.get("latest_signals_checked"),
+            "available_slots": result.get("available_slots"),
             "equity_usdt": result.get("equity_usdt"),
             "daily_pnl_usdt": result.get("daily_pnl_usdt"),
         }
         runtime_state.last_paper_sync_ok = True
         runtime_state.last_paper_sync_error = None
     except Exception as exc:
-        logger.exception("Automatic paper sync cycle failed")
+        logger.exception("Automatic Heart PAPER sync cycle failed")
         runtime_state.last_paper_sync_ok = False
         runtime_state.last_paper_sync_error = str(exc)[:1000]
     finally:
@@ -322,7 +330,7 @@ async def start_runtime() -> list[asyncio.Task[Any]]:
     return [
         asyncio.create_task(_scanner_loop(), name="explodex-scanner-loop"),
         asyncio.create_task(_paper_manage_loop(), name="explodex-paper-manage-loop"),
-        asyncio.create_task(_paper_sync_loop(), name="explodex-paper-sync-loop"),
+        asyncio.create_task(_paper_sync_loop(), name="explodex-paper-heart-sync-loop"),
         asyncio.create_task(_edge_loop(), name="explodex-edge-loop"),
         asyncio.create_task(_verdict_memory_loop(), name="explodex-verdict-memory-loop"),
         asyncio.create_task(_microstructure_memory_loop(), name="explodex-microstructure-memory-loop"),
