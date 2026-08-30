@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import scanner as scanner_module
 from app.services.heart_persistence import canonicalize_scanner_run
 from app.services.microstructure_persistence_resilient import install_microstructure_persistence_hardening
+from app.services.plan_lifecycle_persistence import expire_exhausted_plans_for_run
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.scanner_edge_gate import apply_edge_gate_to_scanner_run
 from app.services.server_snapshot_extensions import install_server_snapshot_extensions
@@ -50,8 +51,18 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 "status": "ERROR",
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
             }
-            # Heart persistence is safety-critical. Surface the failure in the
-            # result instead of silently pretending decisions are unified.
+
+        # A plan that already passed TP3 without an entry is finished. Persist
+        # that lifecycle after canonicalization so UI and PAPER stop suggesting
+        # an eternal retest. This never manufactures the opposite trade.
+        try:
+            result["plan_lifecycle"] = await expire_exhausted_plans_for_run(db, run_id)
+        except Exception as exc:
+            result["plan_lifecycle"] = {
+                "version": "plan_lifecycle_persistence_v1",
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            }
     return result
 
 
