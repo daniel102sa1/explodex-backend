@@ -9,7 +9,7 @@ from app.config import settings
 from app.database import SessionLocal
 from app.services.edge_engine import capture_recent_signals, label_due_observations
 from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
-from app.services.paper_heart_sync import sync_heart_paper_signals
+from app.services.paper_fast_cycle import run_fast_paper_cycle
 from app.services.paper_trading import manage_open_paper_trades
 from app.services.scanner_guarded import run_scanner
 from app.services.sequential_microstructure import flush_pending_snapshots, hydrate_recent_histories, prune_persistent_history
@@ -18,6 +18,12 @@ from app.services.verdict_memory import capture_enter_verdicts, resolve_verdict_
 from app.services.walk_forward import build_walk_forward_report
 
 logger = logging.getLogger("explodex.runtime")
+
+# The old defaults were five minutes. That is too slow for an entry window that
+# can exist for less than a minute. Keep explicit upper bounds even when an old
+# deployment environment still has 300s configured.
+SCANNER_LOOP_SECONDS = min(max(30, int(settings.scanner_interval_seconds)), 60)
+PAPER_HEART_LOOP_SECONDS = min(max(15, int(settings.paper_sync_interval_seconds)), 30)
 
 
 class RuntimeState:
@@ -69,7 +75,8 @@ class RuntimeState:
             "started_at": iso(self.started_at),
             "scanner": {
                 "running": self.scanner_running,
-                "interval_seconds": settings.scanner_interval_seconds,
+                "interval_seconds": SCANNER_LOOP_SECONDS,
+                "configured_interval_seconds": settings.scanner_interval_seconds,
                 "deep_limit": settings.scanner_deep_limit,
                 "last_run_at": iso(self.last_scanner_at),
                 "last_ok": self.last_scanner_ok,
@@ -86,8 +93,10 @@ class RuntimeState:
             },
             "paper_sync": {
                 "running": self.paper_sync_running,
-                "engine": "paper_heart_sync_v1",
-                "interval_seconds": settings.paper_sync_interval_seconds,
+                "engine": "paper_fast_cycle_v1",
+                "portfolio": "paper_positions_visible_in_/paper",
+                "interval_seconds": PAPER_HEART_LOOP_SECONDS,
+                "configured_interval_seconds": settings.paper_sync_interval_seconds,
                 "last_run_at": iso(self.last_paper_sync_at),
                 "last_ok": self.last_paper_sync_ok,
                 "last_error": self.last_paper_sync_error,
@@ -149,6 +158,8 @@ async def _run_scanner_once() -> None:
 
 
 async def _run_paper_manage_once() -> None:
+    # Legacy `trades` manager remains temporarily for historical compatibility.
+    # The portfolio shown at /paper is managed by the fast Heart cycle below.
     if runtime_state.paper_manage_running:
         return
     runtime_state.paper_manage_running = True
@@ -164,7 +175,7 @@ async def _run_paper_manage_once() -> None:
         runtime_state.last_paper_manage_ok = True
         runtime_state.last_paper_manage_error = None
     except Exception as exc:
-        logger.exception("Automatic paper manager cycle failed")
+        logger.exception("Automatic legacy paper manager cycle failed")
         runtime_state.last_paper_manage_ok = False
         runtime_state.last_paper_manage_error = str(exc)[:1000]
     finally:
@@ -178,23 +189,27 @@ async def _run_paper_sync_once() -> None:
     runtime_state.paper_sync_running = True
     try:
         async with SessionLocal() as db:
-            result = await sync_heart_paper_signals(db)
+            result = await run_fast_paper_cycle(db)
+        trend = result.get("trend") or {}
+        diagnostics = result.get("heart_diagnostics") or {}
         runtime_state.last_paper_sync_result = {
             "version": result.get("version"),
             "opened": result.get("opened", 0),
+            "closed": result.get("closed", 0),
             "reason": result.get("reason"),
-            "heart_enter_signals": result.get("heart_enter_signals"),
-            "heart_actions": result.get("heart_actions"),
-            "blockers": result.get("blockers"),
-            "latest_signals_checked": result.get("latest_signals_checked"),
-            "available_slots": result.get("available_slots"),
-            "equity_usdt": result.get("equity_usdt"),
-            "daily_pnl_usdt": result.get("daily_pnl_usdt"),
+            "equity": result.get("equity"),
+            "open_positions": result.get("open_positions"),
+            "signals_checked": trend.get("signals_checked"),
+            "heart_enter_signals": trend.get("heart_enter_signals"),
+            "blockers": trend.get("blockers"),
+            "heart_actions": diagnostics.get("actions"),
+            "missing_checks": diagnostics.get("missing_checks"),
+            "enter_symbols": diagnostics.get("enter_symbols"),
         }
         runtime_state.last_paper_sync_ok = True
         runtime_state.last_paper_sync_error = None
     except Exception as exc:
-        logger.exception("Automatic Heart PAPER sync cycle failed")
+        logger.exception("Automatic visible Heart PAPER cycle failed")
         runtime_state.last_paper_sync_ok = False
         runtime_state.last_paper_sync_error = str(exc)[:1000]
     finally:
@@ -281,7 +296,7 @@ async def _scanner_loop() -> None:
     await asyncio.sleep(8)
     while True:
         await _run_scanner_once()
-        await asyncio.sleep(settings.scanner_interval_seconds)
+        await asyncio.sleep(SCANNER_LOOP_SECONDS)
 
 
 async def _paper_manage_loop() -> None:
@@ -292,10 +307,10 @@ async def _paper_manage_loop() -> None:
 
 
 async def _paper_sync_loop() -> None:
-    await asyncio.sleep(25)
+    await asyncio.sleep(15)
     while True:
         await _run_paper_sync_once()
-        await asyncio.sleep(settings.paper_sync_interval_seconds)
+        await asyncio.sleep(PAPER_HEART_LOOP_SECONDS)
 
 
 async def _edge_loop() -> None:
@@ -330,7 +345,7 @@ async def start_runtime() -> list[asyncio.Task[Any]]:
     return [
         asyncio.create_task(_scanner_loop(), name="explodex-scanner-loop"),
         asyncio.create_task(_paper_manage_loop(), name="explodex-paper-manage-loop"),
-        asyncio.create_task(_paper_sync_loop(), name="explodex-paper-heart-sync-loop"),
+        asyncio.create_task(_paper_sync_loop(), name="explodex-visible-paper-heart-loop"),
         asyncio.create_task(_edge_loop(), name="explodex-edge-loop"),
         asyncio.create_task(_verdict_memory_loop(), name="explodex-verdict-memory-loop"),
         asyncio.create_task(_microstructure_memory_loop(), name="explodex-microstructure-memory-loop"),
