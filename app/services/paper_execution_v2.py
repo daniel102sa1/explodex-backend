@@ -24,7 +24,10 @@ from app.services.paper_range_micro import (
     scan_all_eligible_ranges,
 )
 from app.services.paper_regime_router import current_paper_regime
+from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.trade_thesis import mark_thesis_entered
+
+EXECUTION_VERSION = "paper_execution_v2_multi_strategy_v11_canonical_visible_heart"
 
 
 def _valid_geometry(side: str, entry: float, stop: float, tp: float) -> bool:
@@ -58,6 +61,17 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _prediction_meta(reason: dict[str, Any]) -> tuple[float, str | None, str | None]:
+    prediction = _as_dict(reason.get("prediction"))
+    fingerprint = _as_dict(prediction.get("premove_fingerprint"))
+    stack = _as_dict(prediction.get("prediction_stack_v5"))
+    catalyst = _as_dict(stack.get("catalyst"))
+    fp_score = base._f(fingerprint.get("fingerprint_score"), base._f(prediction.get("preactivation_score")))
+    grade = fingerprint.get("grade") or stack.get("grade")
+    catalyst_state = catalyst.get("state") or stack.get("catalyst_state")
+    return fp_score, str(grade) if grade else None, str(catalyst_state) if catalyst_state else None
+
+
 async def open_new_positions_live_fill(
     db: AsyncSession,
     *,
@@ -65,84 +79,121 @@ async def open_new_positions_live_fill(
     regime: dict[str, Any] | None = None,
     defensive: bool = False,
 ) -> dict[str, Any]:
-    """Open PAPER positions only from the canonical ExplodeX Heart ENTER decision."""
+    """Open the PAPER positions visible in the app directly from Heart ENTER.
+
+    Validation is intentionally not an execution prerequisite. The canonical
+    Heart already fuses the guarded prediction, fixed thesis, risk vetoes and
+    no-chase logic. We only re-check live price/geometry and portfolio risk here.
+    """
     regime = regime or {}
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one())
     slots = max(0, base.MAX_OPEN_POSITIONS - open_count)
     if slots <= 0:
-        return {"opened": 0, "stale_skipped": 0, "heart_blocked": 0, "no_chase": 0, "risk_multiplier": risk_multiplier}
+        return {
+            "opened": 0,
+            "reason": "max_open_positions",
+            "signals_checked": 0,
+            "heart_enter_signals": 0,
+            "stale_skipped": 0,
+            "heart_blocked": 0,
+            "no_chase": 0,
+            "risk_multiplier": risk_multiplier,
+        }
 
     candidates = (await db.execute(text("""
-        SELECT vo.signal_id::text, vo.symbol, vo.observed_at,
-               s.direction, s.state AS signal_state, s.reason AS signal_reason,
-               vo.trade_class, vo.grade, vo.fingerprint_score,
-               vo.catalyst_state, vo.master_state
-        FROM validation_observations vo
-        JOIN signals s ON s.id=vo.signal_id
-        LEFT JOIN paper_positions pp ON pp.signal_id=vo.signal_id
+        SELECT DISTINCT ON (s.symbol_id)
+               s.id::text AS signal_id,
+               sy.symbol,
+               s.created_at AS observed_at,
+               s.direction,
+               s.state AS signal_state,
+               s.setup_score,
+               s.risk_score,
+               s.reason AS signal_reason
+        FROM signals s
+        JOIN symbols sy ON sy.id=s.symbol_id
+        LEFT JOIN paper_positions pp ON pp.signal_id=s.id
         WHERE pp.signal_id IS NULL
-          AND s.state='READY'
-          AND COALESCE((s.reason->'explodex_heart'->>'execution_allowed')::boolean, FALSE)=TRUE
-          AND vo.trade_class='TRADE_NOW'
-          AND COALESCE(vo.master_state,'YES')='YES'
-          AND vo.observed_at >= NOW() - INTERVAL '20 minutes'
-        ORDER BY vo.observed_at ASC
-        LIMIT :slots
-    """), {"slots": max(slots * 4, slots)})).mappings().all()
+          AND s.is_active=TRUE
+          AND s.created_at >= NOW() - INTERVAL '30 minutes'
+        ORDER BY s.symbol_id, s.created_at DESC
+    """))).mappings().all()
 
     opened = 0
     stale_skipped = 0
     anti_loss_skipped = 0
     heart_blocked = 0
     no_chase = 0
+    heart_enter_signals = 0
+    blockers: dict[str, int] = {}
+
+    def block(reason: str) -> None:
+        blockers[reason] = blockers.get(reason, 0) + 1
 
     for raw in candidates:
         if opened >= slots:
             break
         row = dict(raw)
         reason = _as_dict(row.get("signal_reason"))
-        heart = _as_dict(reason.get("explodex_heart"))
+        prediction = _as_dict(reason.get("prediction"))
+        heart = _as_dict(reason.get("explodex_heart")) or _as_dict(prediction.get("explodex_heart"))
         thesis = _as_dict(heart.get("thesis"))
         plan = _as_dict(heart.get("plan"))
         decision = _as_dict(heart.get("action_decision"))
 
+        should_enter = bool(heart.get("execution_allowed")) and bool(
+            decision.get("should_enter", heart.get("execution_allowed"))
+        )
+        if should_enter:
+            heart_enter_signals += 1
+
         side = str(heart.get("direction") or row.get("direction") or "").upper()
-        if (
-            not bool(heart.get("execution_allowed"))
-            or not bool(decision.get("should_enter", heart.get("execution_allowed")))
-            or str(row.get("signal_state") or "") != "READY"
-            or not bool(thesis.get("frozen_plan"))
-        ):
+        if not should_enter:
             heart_blocked += 1
+            block(f"heart_{str(decision.get('action') or 'esperar').lower()}")
+            continue
+        if str(row.get("signal_state") or "") != "READY":
+            heart_blocked += 1
+            block("signal_not_ready")
+            continue
+        if not bool(thesis.get("frozen_plan")):
+            heart_blocked += 1
+            block("no_frozen_thesis")
             continue
 
         entry_low = base._f(plan.get("entry_low"), base._f(thesis.get("entry_low")))
         entry_high = base._f(plan.get("entry_high"), base._f(thesis.get("entry_high")))
         stop = base._f(plan.get("stop_loss"), base._f(thesis.get("stop_loss")))
         tp = base._f(plan.get("tp1"), base._f(thesis.get("tp1")))
-        fingerprint_score = base._f(row.get("fingerprint_score"))
+        fingerprint_score, grade, catalyst_state = _prediction_meta(reason)
         fill = await base._latest_price(row["symbol"])
 
         if fill <= 0 or entry_low <= 0 or entry_high <= 0 or stop <= 0 or tp <= 0:
             stale_skipped += 1
+            block("missing_or_invalid_plan")
             continue
-        if not (entry_low <= fill <= entry_high):
-            if (side == "LONG" and fill > entry_high) or (side == "SHORT" and fill < entry_low):
+        lo, hi = min(entry_low, entry_high), max(entry_low, entry_high)
+        if not (lo <= fill <= hi):
+            if (side == "LONG" and fill > hi) or (side == "SHORT" and fill < lo):
                 no_chase += 1
+                block("no_chase_price_left_zone")
+            else:
+                block("waiting_for_entry_zone")
             heart_blocked += 1
             continue
         if not _valid_geometry(side, fill, stop, tp):
             stale_skipped += 1
+            block("invalid_geometry")
             continue
 
         regime_name = str(regime.get("regime") or regime.get("name") or "")
         regime_aligned = (side == "LONG" and regime_name == "TREND_UP") or (side == "SHORT" and regime_name == "TREND_DOWN")
         leverage = adaptive_leverage(
-            grade=row.get("grade"),
+            grade=grade,
             fingerprint_score=fingerprint_score,
-            catalyst_state=row.get("catalyst_state"),
+            catalyst_state=catalyst_state,
             regime_aligned=regime_aligned,
             defensive=defensive,
         )
@@ -151,11 +202,12 @@ async def open_new_positions_live_fill(
         sizing = _scale_sizing(sizing, combined_risk_multiplier)
         if sizing["quantity"] <= 0 or sizing["margin"] <= 0:
             anti_loss_skipped += 1
+            block("position_size_zero")
             continue
 
         opened_at = datetime.now(timezone.utc)
         metadata = json.dumps({
-            "execution_version": "paper_execution_v2_multi_strategy_v10_actionable_heart",
+            "execution_version": EXECUTION_VERSION,
             "strategy_mode": "TREND_PREMOVE",
             "signal_observed_at": row["observed_at"].isoformat() if row.get("observed_at") else None,
             "simulated_fill_price": fill,
@@ -164,6 +216,7 @@ async def open_new_positions_live_fill(
             "heart_approved": True,
             "action_decision": decision,
             "plan_is_frozen": True,
+            "validation_is_shadow_only": True,
             "legacy_phase_required": False,
             "post_signal_direction_recalculation": False,
             "post_signal_stop_widening": False,
@@ -180,29 +233,48 @@ async def open_new_positions_live_fill(
                 :risk_usdt, :opened_at, CAST(:metadata AS JSONB)
             ) ON CONFLICT (signal_id) DO NOTHING
         """), {
-            "signal_id": row["signal_id"], "symbol": row["symbol"], "side": side,
-            "grade": row.get("grade"), "fingerprint_score": fingerprint_score,
-            "leverage": leverage, "entry_price": fill, "stop_loss": stop, "take_profit": tp,
-            "quantity": sizing["quantity"], "notional": sizing["notional"], "margin_used": sizing["margin"],
-            "risk_usdt": sizing["risk_usdt"], "opened_at": opened_at, "metadata": metadata,
+            "signal_id": row["signal_id"],
+            "symbol": row["symbol"],
+            "side": side,
+            "grade": grade,
+            "fingerprint_score": fingerprint_score,
+            "leverage": leverage,
+            "entry_price": fill,
+            "stop_loss": stop,
+            "take_profit": tp,
+            "quantity": sizing["quantity"],
+            "notional": sizing["notional"],
+            "margin_used": sizing["margin"],
+            "risk_usdt": sizing["risk_usdt"],
+            "opened_at": opened_at,
+            "metadata": metadata,
         })
         if result.rowcount:
             await mark_thesis_entered(db, row["symbol"])
             opened += 1
+            block("opened")
 
     await db.commit()
+    primary_reason = "opened" if opened else (
+        max(blockers, key=blockers.get) if blockers else "no_recent_signals"
+    )
     return {
         "opened": opened,
+        "reason": primary_reason,
+        "signals_checked": len(candidates),
+        "heart_enter_signals": heart_enter_signals,
         "stale_skipped": stale_skipped,
         "anti_loss_skipped": anti_loss_skipped,
         "heart_blocked": heart_blocked,
         "no_chase": no_chase,
+        "blockers": blockers,
         "risk_multiplier": risk_multiplier,
     }
 
 
 async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     await base.ensure_paper_schema(db)
+    await ensure_signal_fk(db)
     closed = await base._close_due_positions(db)
     thesis_reconciliation = await reconcile_canonical_theses(db)
     range_expired = await close_expired_range_positions(db)
@@ -223,11 +295,19 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     range_enabled = range_enabled_by_regime and secondary_entries_enabled
     micro_enabled = micro_enabled_by_regime and secondary_entries_enabled
 
-    trend_opened = await open_new_positions_live_fill(db, risk_multiplier=trend_risk_multiplier, regime=regime, defensive=defensive)
+    trend_opened = await open_new_positions_live_fill(
+        db,
+        risk_multiplier=trend_risk_multiplier,
+        regime=regime,
+        defensive=defensive,
+    )
 
+    # Secondary PAPER strategies remain research-only and cannot override the
+    # canonical Heart trend decision. They are kept for comparison/learning.
     range_scan = await scan_all_eligible_ranges(db)
     range_opened = await open_range_positions(db) if range_enabled else {
-        "opened": 0, "skipped": 0,
+        "opened": 0,
+        "skipped": 0,
         "regime_blocked": not range_enabled_by_regime,
         "loss_brake_blocked": defensive and not secondary_entries_enabled,
     }
@@ -235,26 +315,31 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
     micro_scan = await scan_micro_scalps(db)
     advanced_prefilter = await prefilter_new_micro_signals(db)
     micro_opened = await open_micro_positions(db) if micro_enabled else {
-        "opened": 0, "skipped": 0,
+        "opened": 0,
+        "skipped": 0,
         "regime_blocked": not micro_enabled_by_regime,
         "loss_brake_blocked": defensive and not secondary_entries_enabled,
     }
 
     order_sync = await sync_paper_orders(db)
+    diagnostics = await heart_diagnostics(db, minutes=30)
     summary = await base.paper_summary(db)
     await db.execute(text("""
         INSERT INTO paper_equity_curve (cash_balance, unrealized_pnl, equity, open_positions)
         VALUES (:cash, :unrealized, :equity, :open_positions)
     """), {
-        "cash": summary["cash_balance"], "unrealized": summary["unrealized_pnl"],
-        "equity": summary["equity"], "open_positions": len(summary["open_positions"]),
+        "cash": summary["cash_balance"],
+        "unrealized": summary["unrealized_pnl"],
+        "equity": summary["equity"],
+        "open_positions": len(summary["open_positions"]),
     })
     await db.commit()
     return {
-        "execution_version": "paper_execution_v2_multi_strategy_v10_actionable_heart",
+        "execution_version": EXECUTION_VERSION,
         "regime_router": regime,
         "loss_brake": loss_brake,
         "thesis_reconciliation": thesis_reconciliation,
+        "heart_diagnostics": diagnostics,
         "trend": {**closed, **trend_opened},
         "range_micro": {
             "expired": range_expired.get("closed", 0),
