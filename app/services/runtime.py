@@ -8,6 +8,7 @@ from typing import Any
 from app.config import settings
 from app.database import SessionLocal
 from app.services.edge_engine import capture_recent_signals, label_due_observations
+from app.services.multi_horizon_outcomes import update_multi_horizon_outcomes
 from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
 from app.services.paper_fast_cycle import run_fast_paper_cycle
 from app.services.paper_trading import manage_open_paper_trades
@@ -19,9 +20,6 @@ from app.services.walk_forward import build_walk_forward_report
 
 logger = logging.getLogger("explodex.runtime")
 
-# The old defaults were five minutes. That is too slow for an entry window that
-# can exist for less than a minute. Keep explicit upper bounds even when an old
-# deployment environment still has 300s configured.
 SCANNER_LOOP_SECONDS = min(max(30, int(settings.scanner_interval_seconds)), 60)
 PAPER_HEART_LOOP_SECONDS = min(max(15, int(settings.paper_sync_interval_seconds)), 30)
 
@@ -113,6 +111,7 @@ class RuntimeState:
             "verdict_memory": {
                 "running": self.verdict_memory_running,
                 "interval_seconds": 120,
+                "horizons": ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "4h", "6h", "24h"],
                 "last_run_at": iso(self.last_verdict_memory_at),
                 "last_ok": self.last_verdict_memory_ok,
                 "last_error": self.last_verdict_memory_error,
@@ -158,8 +157,6 @@ async def _run_scanner_once() -> None:
 
 
 async def _run_paper_manage_once() -> None:
-    # Legacy `trades` manager remains temporarily for historical compatibility.
-    # The portfolio shown at /paper is managed by the fast Heart cycle below.
     if runtime_state.paper_manage_running:
         return
     runtime_state.paper_manage_running = True
@@ -244,12 +241,14 @@ async def _run_verdict_memory_once() -> None:
     try:
         async with SessionLocal() as db:
             captured = await capture_enter_verdicts(db, limit=200)
+            horizons = await update_multi_horizon_outcomes(db, limit=120)
             resolved = await resolve_verdict_outcomes(db, limit=60)
             stats = await verdict_memory_stats(db)
             shadow_model = await build_tp1_stop_shadow_report(db)
             walk_forward = await build_walk_forward_report(db)
         runtime_state.last_verdict_memory_result = {
             "capture": captured,
+            "multi_horizon": horizons,
             "resolve": resolved,
             "stats": stats,
             "tp1_stop_shadow_model": shadow_model,
