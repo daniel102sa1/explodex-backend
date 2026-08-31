@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import scanner as scanner_module
 from app.services.entry_latch_persistence import apply_entry_latches_for_run
 from app.services.heart_persistence import canonicalize_scanner_run
+from app.services.horizon_matrix_persistence import persist_horizon_matrix_for_run
 from app.services.microstructure_persistence_resilient import install_microstructure_persistence_hardening
 from app.services.plan_lifecycle_persistence import expire_exhausted_plans_for_run
 from app.services.prediction_guarded import build_pre_move_prediction
@@ -82,6 +83,18 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
         except Exception as exc:
             result["unified_heart_contract"] = {
                 "version": "unified_heart_contract_v1",
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            }
+
+        # The matrix is not another authority. It is persisted into that same
+        # contract so the Heart can express 15m/1h/4h/6h/24h disagreement without
+        # creating a second LONG/SHORT decision path.
+        try:
+            result["horizon_forecast_matrix"] = await persist_horizon_matrix_for_run(db, run_id)
+        except Exception as exc:
+            result["horizon_forecast_matrix"] = {
+                "version": "horizon_matrix_persistence_v1",
                 "status": "ERROR",
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
             }
