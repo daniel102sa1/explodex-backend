@@ -8,11 +8,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.execution_math import choose_target_for_min_net_rr
 
-VERSION = "paper_swing_trajectory_v1"
+VERSION = "paper_swing_trajectory_v2_expectancy"
 RISK_MULTIPLIER = 0.50
 MAX_LEVERAGE = 2
 MAX_OPEN_SWING = 1
+MIN_NET_RR = 2.6
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -54,12 +56,6 @@ async def open_swing_trajectory_position(
     aggressive_opened: int,
     defensive: bool,
 ) -> dict[str, Any]:
-    """Open one reduced-risk 4h-48h PAPER position from the trajectory Heart.
-
-    Tactical Heart has priority. This lane exists for moves that are structurally
-    clear on 4h/6h/1d but do not offer a narrow 5m entry. A wider structural stop
-    is paired with smaller size so widening distance does not increase risk.
-    """
     if defensive:
         return {"version": VERSION, "opened": 0, "reason": "disabled_in_defensive_mode"}
     if normal_opened > 0 or aggressive_opened > 0:
@@ -118,42 +114,47 @@ async def open_swing_trajectory_position(
             for item in why:
                 reject(item)
             continue
-        ranked.append((
-            _f(trajectory.get("trajectory_score")),
-            _f(trajectory.get("direction_edge")),
-            row,
-            {"reason": reason, "heart": heart, "trajectory": trajectory},
-        ))
+        ranked.append((_f(trajectory.get("trajectory_score")), _f(trajectory.get("direction_edge")), row, {"trajectory": trajectory}))
 
     ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
     if not ranked:
-        return {
-            "version": VERSION,
-            "opened": 0,
-            "reason": "no_swing_trajectory_candidate",
-            "signals_checked": len(rows),
-            "rejected": rejected,
-        }
+        return {"version": VERSION, "opened": 0, "reason": "no_swing_trajectory_candidate", "signals_checked": len(rows), "rejected": rejected}
 
     _, _, row, ctx = ranked[0]
     trajectory = ctx["trajectory"]
     plan = _d(trajectory.get("swing_plan"))
     side = str(trajectory.get("direction") or "").upper()
-    entry_low = _f(plan.get("entry_low"))
-    entry_high = _f(plan.get("entry_high"))
+    entry_low, entry_high = _f(plan.get("entry_low")), _f(plan.get("entry_high"))
     stop = _f(plan.get("structural_stop"))
-    tp1 = _f(plan.get("target1"))
     fill = await base._latest_price(str(row["symbol"]))
     lo, hi = min(entry_low, entry_high), max(entry_low, entry_high)
 
-    if min(fill, lo, hi, stop, tp1) <= 0:
+    if min(fill, lo, hi, stop) <= 0:
         return {"version": VERSION, "opened": 0, "reason": "invalid_swing_geometry"}
-    # Wider entry band is allowed, but we still refuse to chase beyond it.
     if not (lo <= fill <= hi):
         return {"version": VERSION, "opened": 0, "reason": "swing_price_outside_entry_band"}
-    if side == "LONG" and not (stop < fill < tp1):
+
+    max_hold_minutes = int(trajectory.get("max_hold_minutes") or plan.get("max_hold_minutes") or 720)
+    expected_hold_hours = max(4.0, min(48.0, max_hold_minutes / 60.0))
+    target_choice = choose_target_for_min_net_rr(
+        side=side,
+        entry=fill,
+        stop=stop,
+        targets=[
+            ("TARGET1", _f(plan.get("target1"))),
+            ("TARGET2", _f(plan.get("target2"))),
+            ("TARGET3", _f(plan.get("target3"))),
+        ],
+        expected_hold_hours=expected_hold_hours,
+        min_net_rr=MIN_NET_RR,
+    )
+    if not target_choice.get("accepted"):
+        return {"version": VERSION, "opened": 0, "reason": "swing_expectancy_rejected", "execution_math": target_choice}
+    chosen = _d(target_choice.get("chosen_target"))
+    target = _f(chosen.get("price"))
+    if side == "LONG" and not (stop < fill < target):
         return {"version": VERSION, "opened": 0, "reason": "invalid_swing_long_geometry"}
-    if side == "SHORT" and not (tp1 < fill < stop):
+    if side == "SHORT" and not (target < fill < stop):
         return {"version": VERSION, "opened": 0, "reason": "invalid_swing_short_geometry"}
 
     sizing = base.size_position(balance, fill, stop, MAX_LEVERAGE)
@@ -170,15 +171,19 @@ async def open_swing_trajectory_position(
         "trajectory_score": trajectory.get("trajectory_score"),
         "direction_edge": trajectory.get("direction_edge"),
         "horizon": trajectory.get("horizon"),
-        "max_hold_minutes": trajectory.get("max_hold_minutes"),
+        "max_hold_minutes": max_hold_minutes,
         "structural_stop": stop,
         "stop_distance_pct": plan.get("stop_distance_pct"),
-        "target2": plan.get("target2"),
-        "target3": plan.get("target3"),
+        "execution_target_name": chosen.get("name"),
+        "execution_target_price": target,
+        "execution_math": target_choice,
+        "expected_ranges": trajectory.get("expected_ranges"),
         "risk_multiplier": RISK_MULTIPLIER,
         "max_leverage": MAX_LEVERAGE,
+        "actual_stop_risk_usdt": sizing.get("risk_usdt"),
+        "risk_budget_usdt": sizing.get("risk_budget_usdt"),
         "stop_widening_after_entry": False,
-        "purpose": "Test 4h-48h directional trajectory when tactical Heart has no narrow entry.",
+        "purpose": "Test 4h-48h trajectory with structural stop, horizon-matched target and positive net R/R.",
     }
 
     result = await db.execute(text("""
@@ -187,45 +192,25 @@ async def open_swing_trajectory_position(
             take_profit, quantity, notional, margin_used, risk_usdt, opened_at, metadata
         ) VALUES (
             CAST(:signal_id AS UUID), :symbol, :side, 'SWING', :score, :leverage,
-            :entry, :stop, :tp1, :quantity, :notional, :margin, :risk_usdt, :opened_at,
+            :entry, :stop, :target, :quantity, :notional, :margin, :risk_usdt, :opened_at,
             CAST(:metadata AS JSONB)
         ) ON CONFLICT (signal_id) DO NOTHING
     """), {
-        "signal_id": row["signal_id"],
-        "symbol": row["symbol"],
-        "side": side,
-        "score": _f(trajectory.get("trajectory_score")),
-        "leverage": MAX_LEVERAGE,
-        "entry": fill,
-        "stop": stop,
-        "tp1": tp1,
-        "quantity": sizing["quantity"],
-        "notional": sizing["notional"],
-        "margin": sizing["margin"],
-        "risk_usdt": sizing["risk_usdt"],
-        "opened_at": datetime.now(timezone.utc),
-        "metadata": json.dumps(metadata),
+        "signal_id": row["signal_id"], "symbol": row["symbol"], "side": side,
+        "score": _f(trajectory.get("trajectory_score")), "leverage": MAX_LEVERAGE,
+        "entry": fill, "stop": stop, "target": target,
+        "quantity": sizing["quantity"], "notional": sizing["notional"], "margin": sizing["margin"],
+        "risk_usdt": sizing["risk_usdt"], "opened_at": datetime.now(timezone.utc), "metadata": json.dumps(metadata),
     })
     await db.commit()
     if not result.rowcount:
         return {"version": VERSION, "opened": 0, "reason": "duplicate_swing_signal"}
 
     return {
-        "version": VERSION,
-        "opened": 1,
-        "reason": "swing_trajectory_entry",
-        "symbol": row["symbol"],
-        "side": side,
-        "entry": fill,
-        "stop": stop,
-        "tp1": tp1,
-        "target2": plan.get("target2"),
-        "target3": plan.get("target3"),
-        "horizon": trajectory.get("horizon"),
-        "max_hold_minutes": trajectory.get("max_hold_minutes"),
-        "trajectory_score": trajectory.get("trajectory_score"),
-        "direction_edge": trajectory.get("direction_edge"),
-        "risk_usdt": sizing["risk_usdt"],
-        "leverage": MAX_LEVERAGE,
-        "experimental": True,
+        "version": VERSION, "opened": 1, "reason": "swing_trajectory_entry",
+        "symbol": row["symbol"], "side": side, "entry": fill, "stop": stop,
+        "target": target, "target_name": chosen.get("name"), "net_rr": chosen.get("net_rr"),
+        "horizon": trajectory.get("horizon"), "max_hold_minutes": max_hold_minutes,
+        "trajectory_score": trajectory.get("trajectory_score"), "direction_edge": trajectory.get("direction_edge"),
+        "risk_usdt": sizing["risk_usdt"], "leverage": MAX_LEVERAGE, "experimental": True,
     }
