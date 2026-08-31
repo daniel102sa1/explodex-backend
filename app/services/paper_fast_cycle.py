@@ -5,36 +5,21 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
-from app.services.paper_aggressive_learning import open_aggressive_learning_position
-from app.services.paper_execution_v2 import open_new_positions_live_fill
 from app.services.paper_horizon_manager import close_due_positions
 from app.services.paper_loss_autopsy import portfolio_loss_brake
 from app.services.paper_regime_router import current_paper_regime
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.paper_sizing_patch import install_corrected_paper_sizing
-from app.services.paper_swing_trajectory import open_swing_trajectory_position
+from app.services.paper_unified_heart_executor import execute_unified_heart_contracts
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v4_actual_risk_trajectory"
+VERSION = "paper_fast_cycle_v5_unified_heart_only"
 
-# Every active PAPER lane calls base.size_position dynamically. Installing the
-# corrected implementation here makes canonical/aggressive/swing use actual
-# stop risk without duplicating sizing formulas across strategies.
 install_corrected_paper_sizing()
 
 
 async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
-    """Frequent PAPER execution loop for the portfolio visible at /paper.
-
-    Priority:
-    1) Canonical tactical Heart ENTER.
-    2) Reduced-risk aggressive early-entry experiment.
-    3) Reduced-risk 4h-48h trajectory swing when the tactical lane opened nothing.
-
-    The trajectory lane never upgrades the tactical user-facing recommendation.
-    It exists so PAPER can learn from slower directional moves that need wider
-    structural stops and longer holding periods.
-    """
+    """Visible PAPER portfolio driven by one canonical Heart contract only."""
     await ensure_validation_schema(db)
     await base.ensure_paper_schema(db)
     await ensure_signal_fk(db)
@@ -44,56 +29,35 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
     policy = regime.get("policy") or {}
     loss_brake = await portfolio_loss_brake(db)
     defensive = str(loss_brake.get("mode") or "NORMAL").upper() == "DEFENSIVE"
-    trend_risk_multiplier = float(loss_brake.get("trend_risk_multiplier") or 1.0)
-    trend_risk_multiplier *= float(((policy.get("trend_premove") or {}).get("risk_multiplier")) or 1.0)
+    risk_multiplier = float(loss_brake.get("trend_risk_multiplier") or 1.0)
+    risk_multiplier *= float(((policy.get("trend_premove") or {}).get("risk_multiplier")) or 1.0)
 
-    canonical = await open_new_positions_live_fill(
+    execution = await execute_unified_heart_contracts(
         db,
-        risk_multiplier=trend_risk_multiplier,
-        regime=regime,
         defensive=defensive,
-    )
-
-    aggressive = await open_aggressive_learning_position(
-        db,
-        normal_opened=int(canonical.get("opened") or 0),
-        defensive=defensive,
-    )
-
-    swing = await open_swing_trajectory_position(
-        db,
-        normal_opened=int(canonical.get("opened") or 0),
-        aggressive_opened=int(aggressive.get("opened") or 0),
-        defensive=defensive,
+        risk_multiplier=risk_multiplier,
     )
 
     diagnostics = await heart_diagnostics(db, minutes=30)
     summary = await base.paper_summary(db)
-    total_opened = (
-        int(canonical.get("opened") or 0)
-        + int(aggressive.get("opened") or 0)
-        + int(swing.get("opened") or 0)
-    )
-    reason = (
-        "canonical_opened"
-        if int(canonical.get("opened") or 0) > 0
-        else "aggressive_learning_opened"
-        if int(aggressive.get("opened") or 0) > 0
-        else "swing_trajectory_opened"
-        if int(swing.get("opened") or 0) > 0
-        else canonical.get("reason") or aggressive.get("reason") or swing.get("reason")
-    )
-
     return {
         "version": VERSION,
         "closed": closed.get("closed", 0),
         "close_actions": closed.get("actions", [])[:10],
-        "opened": total_opened,
-        "reason": reason,
-        "trend": canonical,
-        "aggressive_learning": aggressive,
-        "swing_trajectory": swing,
+        "opened": int(execution.get("opened") or 0),
+        "reason": execution.get("reason"),
+        "unified_execution": execution,
+        # Compatibility aliases for existing runtime/UI diagnostics.
+        "trend": execution,
+        "aggressive_learning": {
+            "opened": sum(1 for item in execution.get("trades", []) if item.get("lane") == "AGGRESSIVE_PAPER")
+        },
+        "swing_trajectory": {
+            "opened": sum(1 for item in execution.get("trades", []) if item.get("lane") == "SWING_PAPER")
+        },
         "heart_diagnostics": diagnostics,
+        "regime": regime,
+        "loss_brake": loss_brake,
         "equity": summary.get("equity"),
         "open_positions": len(summary.get("open_positions") or []),
     }
