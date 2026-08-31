@@ -6,13 +6,14 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.execution_math import choose_target_for_min_net_rr
 from app.services.explosion_intelligence import load_timing_model, timing_memory_adjustment
 from app.services.higher_timeframe_context import alignment, batch_higher_timeframe_context
 from app.services.ignition_engine import build_ignition_signal
 from app.services.liquidity_target_engine import build_liquidity_targets
 from app.services.trade_thesis import apply_trade_thesis, apply_thesis_to_score
 
-HEART_PERSISTENCE_VERSION = "heart_persistence_v4_learned_timing_liquidity_htf"
+HEART_PERSISTENCE_VERSION = "heart_persistence_v5_adaptive_expectancy"
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -100,11 +101,63 @@ def _apply_timing_memory(ignition: dict[str, Any], timing_model: dict[str, Any])
     return out
 
 
+async def _adaptive_expectancy_threshold(db: AsyncSession) -> dict[str, Any]:
+    """Convert recent PAPER hit-rate into the minimum net R/R required.
+
+    We use Bayesian shrinkage toward 40% while the sample is small so a short
+    lucky/unlucky streak cannot swing the threshold wildly. With enough trades,
+    the threshold approaches the break-even R/R implied by the observed win rate.
+    """
+    try:
+        row = (await db.execute(text("""
+            SELECT COUNT(*) AS sample,
+                   COUNT(*) FILTER (WHERE net_pnl > 0) AS winners
+            FROM (
+                SELECT net_pnl
+                FROM paper_positions
+                WHERE status='CLOSED' AND net_pnl IS NOT NULL
+                ORDER BY closed_at DESC
+                LIMIT 120
+            ) recent
+        """))).mappings().one()
+        sample = int(row.get("sample") or 0)
+        winners = int(row.get("winners") or 0)
+    except Exception:
+        return {
+            "sample": 0,
+            "winners": 0,
+            "raw_win_rate_pct": None,
+            "shrunk_win_rate_pct": 40.0,
+            "min_net_rr": 1.6,
+            "status": "DEFAULT_NO_HISTORY",
+        }
+
+    prior_n = 20.0
+    prior_p = 0.40
+    shrunk_p = (winners + prior_n * prior_p) / (sample + prior_n) if sample >= 0 else prior_p
+    shrunk_p = max(0.22, min(0.65, shrunk_p))
+    break_even_rr = (1.0 - shrunk_p) / shrunk_p
+    # Add a small safety margin because realized exits include time exits and
+    # because our cost model is an estimate rather than exact Binance billing.
+    min_net_rr = max(1.60, min(3.20, break_even_rr * 1.07))
+    return {
+        "sample": sample,
+        "winners": winners,
+        "raw_win_rate_pct": round(winners / sample * 100.0, 2) if sample else None,
+        "shrunk_win_rate_pct": round(shrunk_p * 100.0, 2),
+        "break_even_net_rr": round(break_even_rr, 3),
+        "min_net_rr": round(min_net_rr, 3),
+        "status": "ADAPTIVE" if sample >= 30 else "CALIBRATING",
+    }
+
+
 def _canonical_action(
     score: dict[str, Any],
     prediction: dict[str, Any],
     thesis: dict[str, Any],
     ignition: dict[str, Any],
+    *,
+    min_net_rr: float,
 ) -> dict[str, Any]:
     direction = str(score.get("direction") or prediction.get("direction") or "").upper()
     stack_ready, stack_missing = _stack_checks(prediction)
@@ -116,6 +169,22 @@ def _canonical_action(
     high = _f(score.get("entry_high"))
     current = _f(score.get("current_price"))
     in_zone = _inside_zone(current, low, high)
+
+    max_duration_min = _f(score.get("expected_duration_max_minutes"), _f(prediction.get("expected_duration_max_minutes"), 120.0))
+    expected_hold_hours = max(0.25, min(12.0, max_duration_min / 60.0))
+    target_choice = choose_target_for_min_net_rr(
+        side=direction,
+        entry=current,
+        stop=_f(score.get("stop_loss")),
+        targets=[
+            ("TP1", _f(score.get("tp1"))),
+            ("TP2", _f(score.get("tp2"))),
+            ("TP3", _f(score.get("tp3"))),
+        ],
+        expected_hold_hours=expected_hold_hours,
+        min_net_rr=min_net_rr,
+    )
+    math_ok = bool(target_choice.get("accepted"))
 
     terminal = str(thesis.get("status") or "") in {"INVALIDATED", "EXPIRED", "CLOSED"}
     cooldown = str(thesis.get("action") or "") == "COOLDOWN_NO_CAMBIAR_DE_LADO"
@@ -129,6 +198,7 @@ def _canonical_action(
     allowed = (
         entry_signal_ready
         and in_zone
+        and math_ok
         and risk_guard_pass
         and risk_ok
         and not chase
@@ -143,13 +213,14 @@ def _canonical_action(
         via = "IGNITION_FAST_PATH" if ignition_ready and not stack_ready else "ADVANCED_STACK"
         if ignition_ready and bool(_json(ignition.get("timing_memory")).get("can_influence_entry")):
             via = "LEARNED_IGNITION_FAST_PATH" if not stack_ready else "ADVANCED_STACK_PLUS_MEMORY"
+        chosen = _json(target_choice.get("chosen_target"))
         reason = (
-            "Ignición fuerte confirmada por flujo/volumen/OI y memoria histórica suficiente; bloqueos duros limpios."
-            if via == "LEARNED_IGNITION_FAST_PATH"
-            else "Ignición fuerte confirmada; flujo/volumen/OI comienzan a expandirse y los bloqueos duros están limpios."
-            if "IGNITION" in via
-            else "Stack avanzado en TRADE_NOW/YES, sin veto ni chase y precio dentro de la zona."
+            f"Entrada autorizada con R/R neto {chosen.get('net_rr')} hacia {chosen.get('name')}; supera mínimo adaptativo {min_net_rr:.2f}."
         )
+    elif entry_signal_ready and in_zone and not math_ok:
+        action = "NO_ENTRAR"
+        via = "EXPECTANCY_BLOCK"
+        reason = f"Setup técnico listo, pero ningún TP compensa el riesgo/costos: se exige R/R neto mínimo {min_net_rr:.2f}."
     elif terminal or cooldown or hard_block or not risk_guard_pass:
         action = "NO_ENTRAR"
         via = "BLOCKED"
@@ -168,7 +239,10 @@ def _canonical_action(
         missing.append("ignition_fast_path")
     if not in_zone and "price_in_entry_zone" not in missing:
         missing.append("price_in_entry_zone")
+    if not math_ok and "positive_net_expectancy_geometry" not in missing:
+        missing.append("positive_net_expectancy_geometry")
 
+    chosen = _json(target_choice.get("chosen_target"))
     return {
         "action": action,
         "should_enter": allowed,
@@ -182,6 +256,10 @@ def _canonical_action(
         "ignition_raw_score": ignition.get("raw_score", ignition.get("score")),
         "ignition_stage": ignition.get("stage"),
         "timing_memory": ignition.get("timing_memory"),
+        "execution_math": target_choice,
+        "execution_target_name": chosen.get("name"),
+        "execution_target_price": chosen.get("price"),
+        "min_net_rr": round(min_net_rr, 3),
         "reason": reason,
     }
 
@@ -209,12 +287,15 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
     liquidity_aligned = 0
     htf_aligned = 0
     htf_conflicted = 0
+    expectancy_blocked = 0
     actions: dict[str, int] = {}
 
     try:
         timing_model = await load_timing_model(db)
     except Exception:
         timing_model = {"sample": 0, "buckets": {}}
+    expectancy_policy = await _adaptive_expectancy_threshold(db)
+    min_net_rr = _f(expectancy_policy.get("min_net_rr"), 1.6)
 
     ranked_for_htf = sorted(
         (dict(item) for item in rows),
@@ -282,13 +363,16 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         if htf_alignment.get("strong_conflict"):
             htf_conflicted += 1
 
-        decision = _canonical_action(score, prediction, thesis, ignition)
+        decision = _canonical_action(score, prediction, thesis, ignition, min_net_rr=min_net_rr)
         decision["higher_timeframe_alignment"] = htf_alignment
+        decision["expectancy_policy"] = expectancy_policy
         allowed = bool(decision.get("should_enter"))
 
         if allowed:
             score["state"] = "READY"
             execution_ready += 1
+        if str(decision.get("via")) == "EXPECTANCY_BLOCK":
+            expectancy_blocked += 1
         if ignition.get("fast_path_ready"):
             ignition_ready_count += 1
         action = str(decision.get("action") or "ESPERAR")
@@ -299,7 +383,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             blocked += 1
 
         heart = {
-            "version": "explodex_heart_v5_explosion_intelligence_htf",
+            "version": "explodex_heart_v6_adaptive_expectancy",
             "persistence_version": HEART_PERSISTENCE_VERSION,
             "symbol": row["symbol"],
             "direction": score.get("direction"),
@@ -323,6 +407,8 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
                 "tp1": score.get("tp1"),
                 "tp2": score.get("tp2"),
                 "tp3": score.get("tp3"),
+                "execution_target_name": decision.get("execution_target_name"),
+                "execution_target_price": decision.get("execution_target_price"),
                 "do_not_recalculate": bool(thesis.get("frozen_plan")),
             },
             "learning": {
@@ -330,6 +416,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
                 "timing_memory": ignition.get("timing_memory"),
                 "memory_can_influence_entry": bool(_json(ignition.get("timing_memory")).get("can_influence_entry")),
                 "higher_timeframe_is_context_only": True,
+                "expectancy_policy": expectancy_policy,
             },
             "score_is_probability": False,
         }
@@ -368,6 +455,8 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         "frozen_theses": frozen,
         "blocked": blocked,
         "execution_ready": execution_ready,
+        "expectancy_blocked": expectancy_blocked,
+        "expectancy_policy": expectancy_policy,
         "ignition_ready": ignition_ready_count,
         "memory_influenced": memory_influenced,
         "liquidity_aligned": liquidity_aligned,
