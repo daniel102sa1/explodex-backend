@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+from statistics import mean
 from typing import Any
 
 from app.services.binance import binance_client
 
-VERSION = "higher_timeframe_context_v1"
+VERSION = "higher_timeframe_context_v2_structure"
 CACHE_SECONDS = 300.0
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -28,10 +29,33 @@ def _ema(values: list[float], period: int) -> float:
     return result
 
 
+def _atr_pct(rows: list[list[Any]], period: int = 14) -> float:
+    if len(rows) < 2:
+        return 0.0
+    trs: list[float] = []
+    start = max(1, len(rows) - period)
+    for idx in range(start, len(rows)):
+        high = _f(rows[idx][2])
+        low = _f(rows[idx][3])
+        prev_close = _f(rows[idx - 1][4])
+        if high <= 0 or low <= 0 or prev_close <= 0:
+            continue
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    current = _f(rows[-1][4]) if rows else 0.0
+    return mean(trs) / current * 100.0 if trs and current > 0 else 0.0
+
+
 def _frame(rows: list[list[Any]], candles_back: int) -> dict[str, Any]:
-    closes = [_f(row[4]) for row in rows if len(row) > 4 and _f(row[4]) > 0]
+    valid = [row for row in rows if len(row) > 4 and _f(row[4]) > 0]
+    closes = [_f(row[4]) for row in valid]
     if len(closes) < 22:
-        return {"trend": "UNKNOWN", "change_pct": 0.0, "ema_gap_pct": 0.0, "available": False}
+        return {
+            "trend": "UNKNOWN",
+            "change_pct": 0.0,
+            "ema_gap_pct": 0.0,
+            "atr_pct": 0.0,
+            "available": False,
+        }
     current = closes[-1]
     lookback_index = max(0, len(closes) - max(2, candles_back) - 1)
     reference = closes[lookback_index]
@@ -39,6 +63,10 @@ def _frame(rows: list[list[Any]], candles_back: int) -> dict[str, Any]:
     ema9 = _ema(closes[-40:], 9)
     ema21 = _ema(closes[-60:], 21)
     gap = ((ema9 - ema21) / current * 100.0) if current else 0.0
+    recent = valid[-12:]
+    swing_high = max((_f(row[2]) for row in recent), default=current)
+    swing_low = min((_f(row[3]) for row in recent), default=current)
+    atr = _atr_pct(valid, 14)
     if ema9 > ema21 and change > -0.5:
         trend = "BULLISH"
     elif ema9 < ema21 and change < 0.5:
@@ -50,6 +78,9 @@ def _frame(rows: list[list[Any]], candles_back: int) -> dict[str, Any]:
         "trend": trend,
         "change_pct": round(change, 4),
         "ema_gap_pct": round(gap, 4),
+        "atr_pct": round(atr, 4),
+        "swing_high": round(swing_high, 12),
+        "swing_low": round(swing_low, 12),
         "last": round(current, 12),
     }
 
@@ -97,7 +128,7 @@ async def higher_timeframe_context(symbol: str) -> dict[str, Any]:
         "bullish_frames": bull,
         "bearish_frames": bear,
         "errors": errors,
-        "role": "directional context and continuation evidence; never an automatic entry by itself",
+        "role": "directional context, structural volatility and continuation evidence; never an automatic entry by itself",
     }
     _cache[symbol] = (now, payload)
     return payload
