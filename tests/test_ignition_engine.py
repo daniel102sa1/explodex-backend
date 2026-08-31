@@ -12,6 +12,9 @@ def _score(direction="LONG"):
         "entry_high": 100.2,
         "stop_loss": 98.7 if direction == "LONG" else 101.3,
         "tp1": 102.0 if direction == "LONG" else 98.0,
+        "tp2": 103.5 if direction == "LONG" else 96.5,
+        "tp3": 105.0 if direction == "LONG" else 95.0,
+        "expected_duration_max_minutes": 120,
         "metrics": {
             "futures_delta_ratio": 0.16 if direction == "LONG" else -0.16,
             "spot_delta_ratio": 0.12 if direction == "LONG" else -0.12,
@@ -44,15 +47,17 @@ def _thesis():
     return {"frozen_plan": True, "status": "WAITING_ENTRY", "action": "ESPERAR_ENTRADA"}
 
 
-def test_ignition_can_authorize_before_legacy_trade_now():
+def test_ignition_can_authorize_before_legacy_trade_now_when_math_is_positive():
     score = _score()
     prediction = _prediction()
     ignition = build_ignition_signal(score, prediction)
     assert ignition["fast_path_ready"] is True
-    decision = _canonical_action(score, prediction, _thesis(), ignition)
+    decision = _canonical_action(score, prediction, _thesis(), ignition, min_net_rr=1.6)
     assert decision["should_enter"] is True
     assert decision["action"] == "ENTRAR_LONG"
     assert decision["via"] == "IGNITION_FAST_PATH"
+    assert decision["execution_target_price"] > score["current_price"]
+    assert decision["execution_math"]["accepted"] is True
 
 
 def test_ignition_never_bypasses_hard_veto():
@@ -62,7 +67,7 @@ def test_ignition_never_bypasses_hard_veto():
     prediction["prediction_stack_v5"]["risk_veto"]["hard_block"] = True
     ignition = build_ignition_signal(score, prediction)
     assert ignition["fast_path_ready"] is False
-    decision = _canonical_action(score, prediction, _thesis(), ignition)
+    decision = _canonical_action(score, prediction, _thesis(), ignition, min_net_rr=1.6)
     assert decision["should_enter"] is False
     assert decision["action"] == "NO_ENTRAR"
 
@@ -73,6 +78,6 @@ def test_ignition_never_bypasses_risk_guard():
     prediction["sequence"]["risk_guard_pass"] = False
     ignition = build_ignition_signal(score, prediction)
     assert ignition["fast_path_ready"] is False
-    decision = _canonical_action(score, prediction, _thesis(), ignition)
+    decision = _canonical_action(score, prediction, _thesis(), ignition, min_net_rr=1.6)
     assert decision["should_enter"] is False
     assert decision["action"] == "NO_ENTRAR"
