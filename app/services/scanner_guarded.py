@@ -12,6 +12,7 @@ from app.services.plan_lifecycle_persistence import expire_exhausted_plans_for_r
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.scanner_edge_gate import apply_edge_gate_to_scanner_run
 from app.services.server_snapshot_extensions import install_server_snapshot_extensions
+from app.services.trajectory_persistence import persist_trajectory_for_run
 from app.services.verdict_memory_override import install_verdict_memory_overrides
 
 # Install runtime extensions before runtime.py imports direct service callables.
@@ -45,9 +46,21 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 "error": f"{type(exc).__name__}: {str(exc)[:500]}",
             }
 
-        # Entry latch runs immediately after canonicalization. The first ENTER
-        # becomes a persistent activated plan. Later weaker scans may update the
-        # radar, but cannot revert the user-facing action to "wait for confirmation".
+        # Trajectory is a second, slower lane. It reads the already-canonical
+        # Heart and HTF context, then adds a 4h-48h forecast without changing
+        # the tactical ENTER/WAIT/NO_ENTER decision.
+        try:
+            result["trajectory_forecast"] = await persist_trajectory_for_run(db, run_id)
+        except Exception as exc:
+            result["trajectory_forecast"] = {
+                "version": "trajectory_persistence_v1",
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            }
+
+        # Entry latch runs immediately after canonicalization/trajectory. The first
+        # tactical ENTER becomes a persistent activated plan. Trajectory never
+        # overrides this latch or flips its direction.
         try:
             result["entry_latch"] = await apply_entry_latches_for_run(db, run_id)
         except Exception as exc:
