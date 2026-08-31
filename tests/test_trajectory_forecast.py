@@ -57,10 +57,16 @@ def test_bearish_market_can_create_swing_short_without_tactical_enter():
     assert result["direction_edge"] >= 12.0
     assert result["directional_htf_strength"] >= 0.08
     assert result["expected_ranges"]["24h_pct"] > 0
+    assert result["expected_ranges"]["48h_pct"] >= result["expected_ranges"]["24h_pct"]
     assert result["should_enter_paper_swing"] is True
     assert result["swing_plan"]["structural_stop"] > 100.0
     assert result["swing_plan"]["target1"] < 100.0
-    assert result["swing_plan"]["target_fits_expected_24h_range"] is True
+    assert result["swing_plan"]["target_fits_expected_48h_range"] is True
+    # If the target does not statistically fit 24h but fits 48h, the engine
+    # must extend the horizon rather than pretending the move should happen fast.
+    if not result["swing_plan"]["target_fits_expected_24h_range"]:
+        assert result["horizon"] == "24-48h"
+        assert result["max_hold_minutes"] == 2880
     ok, blockers = swing_candidate_ok(signal_state="NO_TRADE", trajectory=result)
     assert ok is True
     assert blockers == []
