@@ -6,10 +6,12 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.explosion_intelligence import load_timing_model, timing_memory_adjustment
 from app.services.ignition_engine import build_ignition_signal
+from app.services.liquidity_target_engine import build_liquidity_targets
 from app.services.trade_thesis import apply_trade_thesis, apply_thesis_to_score
 
-HEART_PERSISTENCE_VERSION = "heart_persistence_v2_ignition"
+HEART_PERSISTENCE_VERSION = "heart_persistence_v3_learned_timing_liquidity"
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -66,6 +68,37 @@ def _inside_zone(price: float, low: float, high: float) -> bool:
     return price > 0 and low > 0 and high > 0 and min(low, high) <= price <= max(low, high)
 
 
+def _apply_timing_memory(ignition: dict[str, Any], timing_model: dict[str, Any]) -> dict[str, Any]:
+    out = dict(ignition)
+    raw_score = _f(out.get("score"))
+    memory = timing_memory_adjustment(out, timing_model)
+    out["raw_score"] = round(raw_score, 1)
+    out["timing_memory"] = memory
+    adjusted = _f(memory.get("adjusted_score"), raw_score)
+    out["score"] = round(adjusted, 1)
+
+    if bool(memory.get("can_influence_entry")):
+        blockers = list(out.get("blockers") or [])
+        support = int(out.get("supporting_components") or 0)
+        strong = int(out.get("strong_components") or 0)
+        ready = adjusted >= 82.0 and support >= 4 and strong >= 2 and not blockers
+        out["fast_path_ready"] = ready
+        if ready:
+            out["stage"] = "IGNITING"
+        elif blockers:
+            out["stage"] = "BLOCKED"
+        elif adjusted >= 72.0 and support >= 3:
+            out["stage"] = "ARMED"
+        elif adjusted >= 58.0:
+            out["stage"] = "LOADING"
+        else:
+            out["stage"] = "QUIET"
+        out["memory_adjusted_entry"] = True
+    else:
+        out["memory_adjusted_entry"] = False
+    return out
+
+
 def _canonical_action(
     score: dict[str, Any],
     prediction: dict[str, Any],
@@ -107,9 +140,13 @@ def _canonical_action(
     if allowed:
         action = "ENTRAR_LONG" if direction == "LONG" else "ENTRAR_SHORT"
         via = "IGNITION_FAST_PATH" if ignition_ready and not stack_ready else "ADVANCED_STACK"
+        if ignition_ready and bool(_json(ignition.get("timing_memory")).get("can_influence_entry")):
+            via = "LEARNED_IGNITION_FAST_PATH" if not stack_ready else "ADVANCED_STACK_PLUS_MEMORY"
         reason = (
-            "Ignición fuerte confirmada; flujo/volumen/OI comienzan a expandirse y los bloqueos duros están limpios."
-            if via == "IGNITION_FAST_PATH"
+            "Ignición fuerte confirmada por flujo/volumen/OI y memoria histórica suficiente; bloqueos duros limpios."
+            if via == "LEARNED_IGNITION_FAST_PATH"
+            else "Ignición fuerte confirmada; flujo/volumen/OI comienzan a expandirse y los bloqueos duros están limpios."
+            if "IGNITION" in via
             else "Stack avanzado en TRADE_NOW/YES, sin veto ni chase y precio dentro de la zona."
         )
     elif terminal or cooldown or hard_block or not risk_guard_pass:
@@ -141,7 +178,9 @@ def _canonical_action(
         "advanced_stack_missing": missing,
         "ignition_fast_path_ready": ignition_ready,
         "ignition_score": ignition.get("score"),
+        "ignition_raw_score": ignition.get("raw_score", ignition.get("score")),
         "ignition_stage": ignition.get("stage"),
+        "timing_memory": ignition.get("timing_memory"),
         "reason": reason,
     }
 
@@ -166,7 +205,14 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
     blocked = 0
     execution_ready = 0
     ignition_ready_count = 0
+    memory_influenced = 0
+    liquidity_aligned = 0
     actions: dict[str, int] = {}
+
+    try:
+        timing_model = await load_timing_model(db)
+    except Exception:
+        timing_model = {"sample": 0, "buckets": {}}
 
     for raw in rows:
         row = dict(raw)
@@ -199,9 +245,17 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             "coinglass": _json(reason.get("coinglass")),
         }
 
-        ignition = build_ignition_signal(score, prediction)
+        raw_ignition = build_ignition_signal(score, prediction)
+        ignition = _apply_timing_memory(raw_ignition, timing_model)
+        if ignition.get("memory_adjusted_entry"):
+            memory_influenced += 1
+
         thesis = await apply_trade_thesis(db, symbol=row["symbol"], score=score, prediction=prediction)
         score, prediction = apply_thesis_to_score(score, prediction, thesis)
+        liquidity = build_liquidity_targets(score, prediction, thesis)
+        if liquidity.get("aligned_with_thesis"):
+            liquidity_aligned += 1
+
         decision = _canonical_action(score, prediction, thesis, ignition)
         allowed = bool(decision.get("should_enter"))
 
@@ -218,7 +272,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             blocked += 1
 
         heart = {
-            "version": "explodex_heart_v3_ignition",
+            "version": "explodex_heart_v4_explosion_intelligence",
             "persistence_version": HEART_PERSISTENCE_VERSION,
             "symbol": row["symbol"],
             "direction": score.get("direction"),
@@ -226,6 +280,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             "execution_allowed": allowed,
             "action_decision": decision,
             "ignition": ignition,
+            "liquidity_intelligence": liquidity,
             "prediction_phase": prediction.get("phase"),
             "prediction_type": prediction.get("type"),
             "thesis": thesis,
@@ -240,6 +295,11 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
                 "tp2": score.get("tp2"),
                 "tp3": score.get("tp3"),
                 "do_not_recalculate": bool(thesis.get("frozen_plan")),
+            },
+            "learning": {
+                "timing_model_sample": int(_json(timing_model).get("sample") or 0),
+                "timing_memory": ignition.get("timing_memory"),
+                "memory_can_influence_entry": bool(_json(ignition.get("timing_memory")).get("can_influence_entry")),
             },
             "score_is_probability": False,
         }
@@ -279,5 +339,8 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         "blocked": blocked,
         "execution_ready": execution_ready,
         "ignition_ready": ignition_ready_count,
+        "memory_influenced": memory_influenced,
+        "liquidity_aligned": liquidity_aligned,
+        "timing_model_sample": int(_json(timing_model).get("sample") or 0),
         "actions": actions,
     }
