@@ -8,6 +8,8 @@ from typing import Any
 from app.config import settings
 from app.database import SessionLocal
 from app.services.edge_engine import capture_recent_signals, label_due_observations
+from app.services.explosion_intelligence import enrich_verdict_features, load_timing_model
+from app.services.final_explosion_labels import finalize_explosion_outcomes
 from app.services.multi_horizon_outcomes import update_multi_horizon_outcomes
 from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
 from app.services.paper_fast_cycle import run_fast_paper_cycle
@@ -31,32 +33,26 @@ class RuntimeState:
         self.last_scanner_ok: bool | None = None
         self.last_scanner_error: str | None = None
         self.last_scanner_result: dict[str, Any] | None = None
-
         self.last_paper_manage_at: datetime | None = None
         self.last_paper_manage_ok: bool | None = None
         self.last_paper_manage_error: str | None = None
         self.last_paper_manage_result: dict[str, Any] | None = None
-
         self.last_paper_sync_at: datetime | None = None
         self.last_paper_sync_ok: bool | None = None
         self.last_paper_sync_error: str | None = None
         self.last_paper_sync_result: dict[str, Any] | None = None
-
         self.last_edge_at: datetime | None = None
         self.last_edge_ok: bool | None = None
         self.last_edge_error: str | None = None
         self.last_edge_result: dict[str, Any] | None = None
-
         self.last_verdict_memory_at: datetime | None = None
         self.last_verdict_memory_ok: bool | None = None
         self.last_verdict_memory_error: str | None = None
         self.last_verdict_memory_result: dict[str, Any] | None = None
-
         self.last_microstructure_memory_at: datetime | None = None
         self.last_microstructure_memory_ok: bool | None = None
         self.last_microstructure_memory_error: str | None = None
         self.last_microstructure_memory_result: dict[str, Any] | None = None
-
         self.scanner_running = False
         self.paper_manage_running = False
         self.paper_sync_running = False
@@ -67,7 +63,6 @@ class RuntimeState:
     def as_dict(self) -> dict[str, Any]:
         def iso(value: datetime | None) -> str | None:
             return value.isoformat() if value else None
-
         return {
             "scheduler_enabled": settings.scheduler_enabled,
             "started_at": iso(self.started_at),
@@ -112,6 +107,8 @@ class RuntimeState:
                 "running": self.verdict_memory_running,
                 "interval_seconds": 120,
                 "horizons": ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "4h", "6h", "24h"],
+                "final_label_requires": "24h",
+                "explosion_labels": ["EXPLOSION_LONG", "EXPLOSION_SHORT", "DELAYED_EXPLOSION", "FAKE_BREAKOUT", "SWEEP_AND_REVERSE_TO_THESIS", "DIRECTION_WRONG", "NO_MOVE"],
                 "last_run_at": iso(self.last_verdict_memory_at),
                 "last_ok": self.last_verdict_memory_ok,
                 "last_error": self.last_verdict_memory_error,
@@ -202,6 +199,7 @@ async def _run_paper_sync_once() -> None:
             "heart_actions": diagnostics.get("actions"),
             "missing_checks": diagnostics.get("missing_checks"),
             "enter_symbols": diagnostics.get("enter_symbols"),
+            "aggressive_learning": result.get("aggressive_learning"),
         }
         runtime_state.last_paper_sync_ok = True
         runtime_state.last_paper_sync_error = None
@@ -241,14 +239,20 @@ async def _run_verdict_memory_once() -> None:
     try:
         async with SessionLocal() as db:
             captured = await capture_enter_verdicts(db, limit=200)
+            features = await enrich_verdict_features(db, limit=250)
             horizons = await update_multi_horizon_outcomes(db, limit=120)
+            explosion_labels = await finalize_explosion_outcomes(db, limit=250)
+            timing_model = await load_timing_model(db, force=True)
             resolved = await resolve_verdict_outcomes(db, limit=60)
             stats = await verdict_memory_stats(db)
             shadow_model = await build_tp1_stop_shadow_report(db)
             walk_forward = await build_walk_forward_report(db)
         runtime_state.last_verdict_memory_result = {
             "capture": captured,
+            "feature_enrichment": features,
             "multi_horizon": horizons,
+            "explosion_labels": explosion_labels,
+            "timing_model": timing_model,
             "resolve": resolved,
             "stats": stats,
             "tp1_stop_shadow_model": shadow_model,
@@ -340,7 +344,6 @@ async def start_runtime() -> list[asyncio.Task[Any]]:
     runtime_state.started_at = datetime.now(timezone.utc)
     if not settings.scheduler_enabled:
         return []
-
     return [
         asyncio.create_task(_scanner_loop(), name="explodex-scanner-loop"),
         asyncio.create_task(_paper_manage_loop(), name="explodex-paper-manage-loop"),
