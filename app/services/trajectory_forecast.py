@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
+from statistics import median
 from typing import Any
 
-VERSION = "trajectory_forecast_v1"
+VERSION = "trajectory_forecast_v2_robust_range"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -24,36 +26,80 @@ def _clip(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 def _frame_vote(frame: dict[str, Any], weight: float, long_score: float, short_score: float) -> tuple[float, float]:
     trend = str(frame.get("trend") or "UNKNOWN").upper()
+    strength = abs(_f(frame.get("trend_strength_signed"), 0.35))
+    strength_factor = max(0.45, min(1.0, strength + 0.35))
     if trend == "BULLISH":
-        long_score += weight
+        long_score += weight * strength_factor
     elif trend == "BEARISH":
-        short_score += weight
+        short_score += weight * strength_factor
     return long_score, short_score
+
+
+def _expected_ranges(frames: dict[str, Any]) -> dict[str, float]:
+    f4 = _d(frames.get("4h"))
+    f6 = _d(frames.get("6h"))
+    f1d = _d(frames.get("1d"))
+
+    v4 = max(_f(f4.get("robust_bar_range_pct")), _f(f4.get("atr_pct")))
+    v6 = max(_f(f6.get("robust_bar_range_pct")), _f(f6.get("atr_pct")))
+    v1d = max(_f(f1d.get("robust_bar_range_pct")), _f(f1d.get("atr_pct")))
+
+    estimates8 = [x for x in (v4 * math.sqrt(2.0), v6 * math.sqrt(8.0 / 6.0)) if x > 0]
+    estimates24 = [x for x in (v4 * math.sqrt(6.0), v6 * 2.0, v1d) if x > 0]
+    estimates48 = [x for x in (v4 * math.sqrt(12.0), v6 * math.sqrt(8.0), v1d * math.sqrt(2.0)) if x > 0]
+
+    def robust(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        # Median keeps one unusually volatile timeframe from dominating.
+        return max(0.25, min(25.0, median(values)))
+
+    return {
+        "8h_pct": round(robust(estimates8), 4),
+        "24h_pct": round(robust(estimates24), 4),
+        "48h_pct": round(robust(estimates48), 4),
+    }
 
 
 def _structural_geometry(direction: str, current: float, htf: dict[str, Any], score: dict[str, Any]) -> dict[str, Any]:
     frames = _d(htf.get("frames"))
     frame4 = _d(frames.get("4h"))
-    atr_pct = _f(frame4.get("atr_pct"), _f(_d(score.get("metrics")).get("atr_pct"), 1.0))
-    atr_pct = max(0.35, min(4.0, atr_pct))
+    robust4 = max(
+        _f(frame4.get("robust_bar_range_pct")),
+        _f(frame4.get("atr_pct")),
+        _f(_d(score.get("metrics")).get("atr_pct"), 0.8),
+        0.35,
+    )
+    robust4 = min(5.0, robust4)
     swing_low = _f(frame4.get("swing_low"))
     swing_high = _f(frame4.get("swing_high"))
+    swing_low_outer = _f(frame4.get("swing_low_outer"), swing_low)
+    swing_high_outer = _f(frame4.get("swing_high_outer"), swing_high)
 
     if direction == "LONG":
-        structure_distance = ((current - swing_low) / current * 100.0) if current > 0 and 0 < swing_low < current else 0.0
+        inner_distance = ((current - swing_low) / current * 100.0) if 0 < swing_low < current else 0.0
+        outer_distance = ((current - swing_low_outer) / current * 100.0) if 0 < swing_low_outer < current else 0.0
     else:
-        structure_distance = ((swing_high - current) / current * 100.0) if current > 0 and swing_high > current else 0.0
+        inner_distance = ((swing_high - current) / current * 100.0) if swing_high > current else 0.0
+        outer_distance = ((swing_high_outer - current) / current * 100.0) if swing_high_outer > current else 0.0
 
-    stop_pct = max(1.0, atr_pct * 1.45, structure_distance + atr_pct * 0.20)
-    stop_pct = min(6.0, stop_pct)
+    # The stop sits behind current 4h structure plus a volatility buffer. If the
+    # outer swing is extremely far away we do not blindly use it; position should
+    # not require an absurd stop just to survive ordinary noise.
+    structural = inner_distance + robust4 * 0.30 if inner_distance > 0 else robust4 * 1.20
+    if outer_distance > 0 and outer_distance <= structural * 1.6:
+        structural = max(structural, outer_distance + robust4 * 0.15)
+    stop_pct = max(0.9, robust4 * 1.15, structural)
+    stop_pct = min(6.5, stop_pct)
     risk_unit = current * stop_pct / 100.0
     stop = current - risk_unit if direction == "LONG" else current + risk_unit
 
-    # Swing targets are intentionally zones, not exact guaranteed prices.
-    target1 = current + risk_unit * 1.8 if direction == "LONG" else current - risk_unit * 1.8
-    target2 = current + risk_unit * 2.6 if direction == "LONG" else current - risk_unit * 2.6
-    target3 = current + risk_unit * 3.4 if direction == "LONG" else current - risk_unit * 3.4
-    entry_half_width_pct = min(1.0, max(0.25, atr_pct * 0.30))
+    # Given the observed portfolio hit rate, swing needs materially asymmetric
+    # payoff. These are candidate objectives; execution still checks net R/R.
+    target1 = current + risk_unit * 2.6 if direction == "LONG" else current - risk_unit * 2.6
+    target2 = current + risk_unit * 3.4 if direction == "LONG" else current - risk_unit * 3.4
+    target3 = current + risk_unit * 4.2 if direction == "LONG" else current - risk_unit * 4.2
+    entry_half_width_pct = min(1.2, max(0.25, robust4 * 0.30))
     entry_low = current * (1.0 - entry_half_width_pct / 100.0)
     entry_high = current * (1.0 + entry_half_width_pct / 100.0)
 
@@ -67,7 +113,7 @@ def _structural_geometry(direction: str, current: float, htf: dict[str, Any], sc
         "target3": round(target3, 12),
         "target_zone_low": round(min(target2, target3), 12),
         "target_zone_high": round(max(target2, target3), 12),
-        "atr_4h_pct": round(atr_pct, 4),
+        "robust_4h_range_pct": round(robust4, 4),
         "stop_is_fixed_at_entry": True,
         "widen_stop_after_entry": False,
     }
@@ -79,13 +125,6 @@ def build_trajectory_forecast(
     htf: dict[str, Any],
     liquidity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Estimate directional trajectory from 4h to 48h.
-
-    This does not replace the tactical Heart. It answers a different question:
-    whether the market has enough multi-timeframe evidence to justify holding a
-    reduced-size PAPER swing through normal pullbacks. Scores are technical
-    indices, not calibrated probabilities.
-    """
     metrics = _d(score.get("metrics"))
     frames = _d(htf.get("frames"))
     liquidity = _d(liquidity)
@@ -127,8 +166,6 @@ def build_trajectory_forecast(
     elif book <= -0.08:
         short_score += 5
 
-    # Price + OI is useful for distinguishing fresh trend participation from
-    # pure liquidation. New OI aligned with price gets continuation credit.
     if oi >= 0.25 and change_1h >= 0.20:
         long_score += 8
     elif oi >= 0.25 and change_1h <= -0.20:
@@ -143,7 +180,6 @@ def build_trajectory_forecast(
     elif attraction == "DOWN":
         short_score += 8
 
-    # Mild contrarian crowding signal only; funding never decides direction.
     if funding >= 0.0005:
         short_score += 3
     elif funding <= -0.0005:
@@ -169,25 +205,36 @@ def build_trajectory_forecast(
     aligned_frames = sum(1 for item in frames.values() if isinstance(item, dict) and item.get("trend") == wanted)
     conflicting_frames = sum(1 for item in frames.values() if isinstance(item, dict) and item.get("trend") == opposite_trend)
 
+    strengths = [_f(item.get("trend_strength_signed")) for item in frames.values() if isinstance(item, dict) and item.get("available")]
+    mean_strength = sum(strengths) / len(strengths) if strengths else 0.0
+    directional_strength = mean_strength if direction == "LONG" else -mean_strength
+
     current = _f(score.get("current_price"))
     geometry = _structural_geometry(direction, current, htf, score) if current > 0 else {}
+    expected_ranges = _expected_ranges(frames)
     risk_score = _f(score.get("risk_score"), 100.0)
-    extended = abs(change_1h) >= 5.5
+    extended = abs(change_1h) >= max(5.5, expected_ranges.get("8h_pct", 0.0) * 0.9)
 
-    # A swing lane is deliberately easier to trigger than tactical ENTER, but
-    # still requires actual directional separation and HTF support.
+    target1_distance_pct = (
+        abs(_f(geometry.get("target1")) - current) / current * 100.0 if current > 0 and geometry else 0.0
+    )
+    expected24 = _f(expected_ranges.get("24h_pct"))
+    target_plausible = expected24 <= 0 or target1_distance_pct <= expected24 * 1.20
+
     should_enter_paper = (
         current > 0
         and dominant >= 62.0
         and edge >= 12.0
         and aligned_frames >= 2
         and conflicting_frames <= 1
+        and directional_strength >= 0.08
         and risk_score <= 70.0
         and not extended
+        and target_plausible
         and bool(geometry)
     )
 
-    if aligned_frames == 3 and dominant >= 75:
+    if aligned_frames == 3 and dominant >= 75 and expected_ranges.get("48h_pct", 0) > 0:
         horizon = "24-48h"
         max_hold_minutes = 2880
     elif aligned_frames >= 2 and dominant >= 66:
@@ -208,10 +255,14 @@ def build_trajectory_forecast(
         blockers.append("insufficient_htf_alignment")
     if conflicting_frames > 1:
         blockers.append("too_many_htf_conflicts")
+    if directional_strength < 0.08:
+        blockers.append("htf_trend_strength_too_weak")
     if risk_score > 70:
         blockers.append("risk_score_above_70")
     if extended:
         blockers.append("already_extended_1h")
+    if not target_plausible:
+        blockers.append("target_exceeds_24h_expected_range")
 
     return {
         "version": VERSION,
@@ -223,6 +274,8 @@ def build_trajectory_forecast(
         "score_is_probability": False,
         "aligned_htf_frames": aligned_frames,
         "conflicting_htf_frames": conflicting_frames,
+        "directional_htf_strength": round(directional_strength, 5),
+        "expected_ranges": expected_ranges,
         "horizon": horizon,
         "max_hold_minutes": max_hold_minutes,
         "should_enter_paper_swing": should_enter_paper,
@@ -234,7 +287,9 @@ def build_trajectory_forecast(
             "max_hold_minutes": max_hold_minutes,
             "risk_budget_pct": 0.50,
             "max_leverage": 2,
+            "target1_distance_pct": round(target1_distance_pct, 4),
+            "target_fits_expected_24h_range": target_plausible,
             "management": "Aguantar retrocesos normales mientras no toque el stop estructural; no ensanchar el stop después de entrar.",
         },
-        "interpretation": "Trayectoria 4h-48h para PAPER; estima dirección y zona objetivo, no una ruta recta ni un precio garantizado.",
+        "interpretation": "Trayectoria 4h-48h para PAPER; rango esperado se deriva de volatilidad HTF robusta y no implica una ruta recta ni un precio garantizado.",
     }
