@@ -7,7 +7,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.explosion_intelligence import VERSION, classify_horizons
+from app.services.explosion_classifier_v2 import classify_horizons
+from app.services.explosion_intelligence import VERSION
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -23,12 +24,7 @@ def _d(value: Any) -> dict[str, Any]:
 
 
 async def finalize_explosion_outcomes(db: AsyncSession, limit: int = 250) -> dict[str, Any]:
-    """Create training labels only after the 24h horizon is available.
-
-    Short-horizon observations remain useful for monitoring, but they are not
-    promoted to permanent training truth before 4h/6h/24h have had time to
-    reveal delayed explosions, reversals and fake breakouts.
-    """
+    """Create training labels only after the 24h horizon is available."""
     rows = (await db.execute(text("""
         SELECT id::text, direction, metadata
         FROM verdict_memory
@@ -51,6 +47,7 @@ async def finalize_explosion_outcomes(db: AsyncSession, limit: int = 250) -> dic
         if not result:
             continue
         metadata["explosion_label_version"] = VERSION
+        metadata["explosion_classifier_version"] = result.get("version")
         metadata["explosion_label_maturity"] = "FINAL_24H"
         metadata["explosion_label"] = result["label"]
         metadata["timing_quality"] = result["timing_quality"]
