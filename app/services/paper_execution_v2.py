@@ -27,7 +27,7 @@ from app.services.paper_regime_router import current_paper_regime
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.trade_thesis import mark_thesis_entered
 
-EXECUTION_VERSION = "paper_execution_v2_multi_strategy_v11_canonical_visible_heart"
+EXECUTION_VERSION = "paper_execution_v2_multi_strategy_v12_expectancy_target"
 
 
 def _valid_geometry(side: str, entry: float, stop: float, tp: float) -> bool:
@@ -79,11 +79,12 @@ async def open_new_positions_live_fill(
     regime: dict[str, Any] | None = None,
     defensive: bool = False,
 ) -> dict[str, Any]:
-    """Open the PAPER positions visible in the app directly from Heart ENTER.
+    """Open visible PAPER positions directly from canonical Heart ENTER.
 
-    Validation is intentionally not an execution prerequisite. The canonical
-    Heart already fuses the guarded prediction, fixed thesis, risk vetoes and
-    no-chase logic. We only re-check live price/geometry and portfolio risk here.
+    The Heart now chooses the nearest TP that satisfies its adaptive *net* R/R
+    requirement after fees/slippage/funding. Execution uses that target instead
+    of blindly taking TP1, which previously produced small winners versus larger
+    stop losses.
     """
     regime = regime or {}
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
@@ -166,7 +167,11 @@ async def open_new_positions_live_fill(
         entry_low = base._f(plan.get("entry_low"), base._f(thesis.get("entry_low")))
         entry_high = base._f(plan.get("entry_high"), base._f(thesis.get("entry_high")))
         stop = base._f(plan.get("stop_loss"), base._f(thesis.get("stop_loss")))
-        tp = base._f(plan.get("tp1"), base._f(thesis.get("tp1")))
+        tp = base._f(
+            decision.get("execution_target_price"),
+            base._f(plan.get("execution_target_price"), base._f(plan.get("tp1"), base._f(thesis.get("tp1")))),
+        )
+        target_name = str(decision.get("execution_target_name") or plan.get("execution_target_name") or "TP1")
         fingerprint_score, grade, catalyst_state = _prediction_meta(reason)
         fill = await base._latest_price(row["symbol"])
 
@@ -222,6 +227,11 @@ async def open_new_positions_live_fill(
             "post_signal_stop_widening": False,
             "adaptive_leverage": leverage,
             "combined_risk_multiplier": combined_risk_multiplier,
+            "execution_target_name": target_name,
+            "execution_target_price": tp,
+            "execution_math": decision.get("execution_math"),
+            "actual_stop_risk_usdt": sizing.get("risk_usdt"),
+            "risk_budget_usdt": sizing.get("risk_budget_usdt"),
         })
         result = await db.execute(text("""
             INSERT INTO paper_positions (
@@ -302,8 +312,6 @@ async def run_paper_cycle_v2(db: AsyncSession) -> dict[str, Any]:
         defensive=defensive,
     )
 
-    # Secondary PAPER strategies remain research-only and cannot override the
-    # canonical Heart trend decision. They are kept for comparison/learning.
     range_scan = await scan_all_eligible_ranges(db)
     range_opened = await open_range_positions(db) if range_enabled else {
         "opened": 0,
