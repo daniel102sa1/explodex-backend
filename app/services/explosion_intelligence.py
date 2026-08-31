@@ -52,6 +52,10 @@ def extract_signal_features(reason: Any) -> dict[str, Any]:
     heart = _d(bundle.get("explodex_heart")) or _d(prediction.get("explodex_heart"))
     ignition = _d(heart.get("ignition"))
     decision = _d(heart.get("action_decision"))
+    liquidity = _d(heart.get("liquidity_intelligence"))
+    htf = _d(heart.get("higher_timeframe"))
+    htf_alignment = _d(heart.get("higher_timeframe_alignment"))
+    htf_frames = _d(htf.get("frames"))
     metrics = _d(bundle.get("metrics"))
     coinglass = _d(bundle.get("coinglass"))
     if not coinglass:
@@ -101,6 +105,19 @@ def extract_signal_features(reason: Any) -> dict[str, Any]:
         "cg_long_liq_4h": cg_liq.get("long_4h"),
         "cg_short_liq_4h": cg_liq.get("short_4h"),
         "cg_liq_imbalance_1h": cg_liq.get("short_minus_long_imbalance_1h"),
+        "liquidity_attraction_direction": liquidity.get("attraction_direction"),
+        "liquidity_up_score": liquidity.get("upward_attraction_score"),
+        "liquidity_down_score": liquidity.get("downward_attraction_score"),
+        "liquidity_aligned": liquidity.get("aligned_with_thesis"),
+        "htf_bias": htf.get("bias"),
+        "htf_aligned_frames": htf_alignment.get("aligned_frames"),
+        "htf_conflicting_frames": htf_alignment.get("conflicting_frames"),
+        "htf_4h_trend": _d(htf_frames.get("4h")).get("trend"),
+        "htf_6h_trend": _d(htf_frames.get("6h")).get("trend"),
+        "htf_1d_trend": _d(htf_frames.get("1d")).get("trend"),
+        "htf_4h_change_pct": _d(htf_frames.get("4h")).get("change_pct"),
+        "htf_6h_change_pct": _d(htf_frames.get("6h")).get("change_pct"),
+        "htf_1d_change_pct": _d(htf_frames.get("1d")).get("change_pct"),
         "sweep_low": bool(sequence.get("sweep_low")),
         "sweep_high": bool(sequence.get("sweep_high")),
         "sell_absorption_rebound": bool(sequence.get("sell_absorption_rebound")),
@@ -262,7 +279,7 @@ async def load_timing_model(db: AsyncSession, *, force: bool = False) -> dict[st
         WHERE metadata ? 'explosion_label'
           AND metadata ? 'ignition_score'
         GROUP BY bucket
-    """)).mappings().all()
+    """))).mappings().all()
 
     buckets: dict[str, Any] = {}
     total = 0
