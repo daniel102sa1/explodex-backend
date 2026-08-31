@@ -8,13 +8,15 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.execution_math import choose_target_for_min_net_rr
 
-VERSION = "paper_aggressive_learning_v1"
+VERSION = "paper_aggressive_learning_v2_expectancy"
 MIN_IGNITION_SCORE = 76.0
 MAX_RISK_SCORE = 40.0
 RISK_MULTIPLIER = 0.50
 MAX_LEVERAGE = 2
 MAX_OPEN_AGGRESSIVE = 1
+MIN_NET_RR = 2.8
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -47,12 +49,6 @@ def aggressive_candidate_ok(
     decision: dict[str, Any],
     ignition: dict[str, Any],
 ) -> tuple[bool, list[str]]:
-    """Reduced-risk PAPER-only early-entry gate.
-
-    It cannot bypass hard safety checks. It only relaxes the timing threshold:
-    a well-prepared ARMED/IGNITING setup may be sampled before the canonical
-    Heart emits ENTER, so its outcome can be measured against the normal path.
-    """
     blockers: list[str] = []
     action = str(decision.get("action") or "").upper()
     ignition_stage = str(ignition.get("stage") or "").upper()
@@ -76,7 +72,6 @@ def aggressive_candidate_ok(
     if int(ignition.get("supporting_components") or 0) < 3:
         blockers.append("insufficient_supporting_components")
 
-    # These are the hard checks from ignition_engine. They must all remain clear.
     for required in (
         "master_yes",
         "veto_clear",
@@ -99,12 +94,6 @@ async def open_aggressive_learning_position(
     normal_opened: int,
     defensive: bool,
 ) -> dict[str, Any]:
-    """Open at most one reduced-risk experimental PAPER position.
-
-    This runs only when the canonical path opened nothing in the cycle. It does
-    not mark the canonical thesis IN_POSITION because the experiment must remain
-    distinct from the user's primary Heart recommendation.
-    """
     if defensive:
         return {"version": VERSION, "opened": 0, "reason": "disabled_in_defensive_mode"}
     if normal_opened > 0:
@@ -202,17 +191,38 @@ async def open_aggressive_learning_position(
     entry_low = _f(plan.get("entry_low"), _f(thesis.get("entry_low")))
     entry_high = _f(plan.get("entry_high"), _f(thesis.get("entry_high")))
     stop = _f(plan.get("stop_loss"), _f(thesis.get("stop_loss")))
-    tp1 = _f(plan.get("tp1"), _f(thesis.get("tp1")))
     fill = await base._latest_price(str(row["symbol"]))
     lo, hi = min(entry_low, entry_high), max(entry_low, entry_high)
 
-    if min(fill, lo, hi, stop, tp1) <= 0:
+    if min(fill, lo, hi, stop) <= 0:
         return {"version": VERSION, "opened": 0, "reason": "invalid_plan_geometry"}
     if not (lo <= fill <= hi):
         return {"version": VERSION, "opened": 0, "reason": "price_not_in_entry_zone"}
-    if side == "LONG" and not (stop < fill < tp1):
+
+    target_choice = choose_target_for_min_net_rr(
+        side=side,
+        entry=fill,
+        stop=stop,
+        targets=[
+            ("TP1", _f(plan.get("tp1"), _f(thesis.get("tp1")))),
+            ("TP2", _f(plan.get("tp2"), _f(thesis.get("tp2")))),
+            ("TP3", _f(plan.get("tp3"), _f(thesis.get("tp3")))),
+        ],
+        expected_hold_hours=2.0,
+        min_net_rr=MIN_NET_RR,
+    )
+    if not target_choice.get("accepted"):
+        return {
+            "version": VERSION,
+            "opened": 0,
+            "reason": "aggressive_expectancy_rejected",
+            "execution_math": target_choice,
+        }
+    chosen = _d(target_choice.get("chosen_target"))
+    target = _f(chosen.get("price"))
+    if side == "LONG" and not (stop < fill < target):
         return {"version": VERSION, "opened": 0, "reason": "invalid_long_geometry"}
-    if side == "SHORT" and not (tp1 < fill < stop):
+    if side == "SHORT" and not (target < fill < stop):
         return {"version": VERSION, "opened": 0, "reason": "invalid_short_geometry"}
 
     sizing = base.size_position(balance, fill, stop, MAX_LEVERAGE)
@@ -231,6 +241,10 @@ async def open_aggressive_learning_position(
         "ignition_stage": ignition.get("stage"),
         "risk_multiplier": RISK_MULTIPLIER,
         "max_leverage": MAX_LEVERAGE,
+        "execution_target_name": chosen.get("name"),
+        "execution_target_price": target,
+        "execution_math": target_choice,
+        "actual_stop_risk_usdt": sizing.get("risk_usdt"),
         "validation_goal": "Compare early ARMED/IGNITING entries against canonical ENTER outcomes.",
         "does_not_promote_heart": True,
     }
@@ -241,7 +255,7 @@ async def open_aggressive_learning_position(
             take_profit, quantity, notional, margin_used, risk_usdt, opened_at, metadata
         ) VALUES (
             CAST(:signal_id AS UUID), :symbol, :side, 'EARLY', :score, :leverage,
-            :entry, :stop, :tp1, :quantity, :notional, :margin, :risk_usdt, :opened_at,
+            :entry, :stop, :target, :quantity, :notional, :margin, :risk_usdt, :opened_at,
             CAST(:metadata AS JSONB)
         ) ON CONFLICT (signal_id) DO NOTHING
     """), {
@@ -252,7 +266,7 @@ async def open_aggressive_learning_position(
         "leverage": MAX_LEVERAGE,
         "entry": fill,
         "stop": stop,
-        "tp1": tp1,
+        "target": target,
         "quantity": sizing["quantity"],
         "notional": sizing["notional"],
         "margin": sizing["margin"],
@@ -272,7 +286,9 @@ async def open_aggressive_learning_position(
         "side": side,
         "entry": fill,
         "stop": stop,
-        "tp1": tp1,
+        "target": target,
+        "target_name": chosen.get("name"),
+        "net_rr": chosen.get("net_rr"),
         "ignition_score": ignition.get("score"),
         "risk_usdt": sizing["risk_usdt"],
         "leverage": MAX_LEVERAGE,
