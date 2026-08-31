@@ -4,7 +4,7 @@ from app.services.paper_swing_trajectory import swing_candidate_ok
 from app.services.trajectory_forecast import build_trajectory_forecast
 
 
-def _frame(trend: str, *, atr: float = 1.5, high: float = 104.0, low: float = 96.0):
+def _frame(trend: str, *, atr: float = 2.5, high: float = 101.5, low: float = 98.5):
     signed = 0.60 if trend == "BULLISH" else -0.60 if trend == "BEARISH" else 0.0
     return {
         "available": True,
@@ -14,17 +14,17 @@ def _frame(trend: str, *, atr: float = 1.5, high: float = 104.0, low: float = 96
         "robust_bar_range_pct": atr,
         "swing_high": high,
         "swing_low": low,
-        "swing_high_outer": high + 1.0,
-        "swing_low_outer": low - 1.0,
+        "swing_high_outer": high + 0.5,
+        "swing_low_outer": low - 0.5,
     }
 
 
 def _htf(trends):
     return {
         "frames": {
-            "4h": _frame(trends[0], atr=1.5),
-            "6h": _frame(trends[1], atr=1.8),
-            "1d": _frame(trends[2], atr=3.0),
+            "4h": _frame(trends[0], atr=2.5),
+            "6h": _frame(trends[1], atr=3.0),
+            "1d": _frame(trends[2], atr=5.0),
         },
         "bias": "BEARISH" if trends.count("BEARISH") >= 2 else "BULLISH" if trends.count("BULLISH") >= 2 else "NEUTRAL",
     }
@@ -102,13 +102,9 @@ def test_wider_structural_stop_reduces_quantity_and_reports_actual_risk():
     assert wide["quantity"] < narrow["quantity"]
     assert wide["risk_usdt"] <= 10.0
     assert wide["risk_usdt"] == round(wide["quantity"] * 5.0, 6)
-    # Swing lane halves both quantity and actual stop risk, so its loss budget
-    # remains <=0.5% of a 1000 USDT account even with a wider stop.
     swing_risk = wide["risk_usdt"] * 0.5
     assert swing_risk <= 5.0
 
 
 def test_legacy_base_sizing_is_replaced_at_runtime_by_patch():
-    # Document the intended invariant: fast PAPER installs the corrected sizing
-    # before canonical/aggressive/swing open any position.
     assert callable(base.size_position)
