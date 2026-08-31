@@ -11,10 +11,16 @@ from app.services.paper_horizon_manager import close_due_positions
 from app.services.paper_loss_autopsy import portfolio_loss_brake
 from app.services.paper_regime_router import current_paper_regime
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
+from app.services.paper_sizing_patch import install_corrected_paper_sizing
 from app.services.paper_swing_trajectory import open_swing_trajectory_position
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v3_trajectory_swing"
+VERSION = "paper_fast_cycle_v4_actual_risk_trajectory"
+
+# Every active PAPER lane calls base.size_position dynamically. Installing the
+# corrected implementation here makes canonical/aggressive/swing use actual
+# stop risk without duplicating sizing formulas across strategies.
+install_corrected_paper_sizing()
 
 
 async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
