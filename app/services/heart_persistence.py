@@ -7,11 +7,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.explosion_intelligence import load_timing_model, timing_memory_adjustment
+from app.services.higher_timeframe_context import alignment, batch_higher_timeframe_context
 from app.services.ignition_engine import build_ignition_signal
 from app.services.liquidity_target_engine import build_liquidity_targets
 from app.services.trade_thesis import apply_trade_thesis, apply_thesis_to_score
 
-HEART_PERSISTENCE_VERSION = "heart_persistence_v3_learned_timing_liquidity"
+HEART_PERSISTENCE_VERSION = "heart_persistence_v4_learned_timing_liquidity_htf"
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -186,7 +187,6 @@ def _canonical_action(
 
 
 async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, Any]:
-    """Freeze one thesis and persist the single actionable Heart decision."""
     rows = (await db.execute(text("""
         SELECT s.id::text AS signal_id, sy.symbol, s.direction, s.state,
                s.setup_score, s.risk_score, s.confidence_pct, s.current_price,
@@ -207,12 +207,25 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
     ignition_ready_count = 0
     memory_influenced = 0
     liquidity_aligned = 0
+    htf_aligned = 0
+    htf_conflicted = 0
     actions: dict[str, int] = {}
 
     try:
         timing_model = await load_timing_model(db)
     except Exception:
         timing_model = {"sample": 0, "buckets": {}}
+
+    ranked_for_htf = sorted(
+        (dict(item) for item in rows),
+        key=lambda item: _f(item.get("setup_score")),
+        reverse=True,
+    )
+    htf_symbols = [str(item.get("symbol")) for item in ranked_for_htf[:8] if _f(item.get("setup_score")) >= 64.0]
+    try:
+        htf_map = await batch_higher_timeframe_context(htf_symbols, concurrency=4)
+    except Exception:
+        htf_map = {}
 
     for raw in rows:
         row = dict(raw)
@@ -256,7 +269,21 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         if liquidity.get("aligned_with_thesis"):
             liquidity_aligned += 1
 
+        htf = htf_map.get(str(row["symbol"])) or {
+            "version": "higher_timeframe_context_v1",
+            "symbol": row["symbol"],
+            "bias": "NOT_FETCHED",
+            "frames": {},
+            "role": "Only strongest candidates fetch 4h/6h/1d context to control API load.",
+        }
+        htf_alignment = alignment(str(score.get("direction") or ""), htf)
+        if htf_alignment.get("strong_alignment"):
+            htf_aligned += 1
+        if htf_alignment.get("strong_conflict"):
+            htf_conflicted += 1
+
         decision = _canonical_action(score, prediction, thesis, ignition)
+        decision["higher_timeframe_alignment"] = htf_alignment
         allowed = bool(decision.get("should_enter"))
 
         if allowed:
@@ -272,7 +299,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             blocked += 1
 
         heart = {
-            "version": "explodex_heart_v4_explosion_intelligence",
+            "version": "explodex_heart_v5_explosion_intelligence_htf",
             "persistence_version": HEART_PERSISTENCE_VERSION,
             "symbol": row["symbol"],
             "direction": score.get("direction"),
@@ -281,6 +308,8 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             "action_decision": decision,
             "ignition": ignition,
             "liquidity_intelligence": liquidity,
+            "higher_timeframe": htf,
+            "higher_timeframe_alignment": htf_alignment,
             "prediction_phase": prediction.get("phase"),
             "prediction_type": prediction.get("type"),
             "thesis": thesis,
@@ -300,6 +329,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
                 "timing_model_sample": int(_json(timing_model).get("sample") or 0),
                 "timing_memory": ignition.get("timing_memory"),
                 "memory_can_influence_entry": bool(_json(ignition.get("timing_memory")).get("can_influence_entry")),
+                "higher_timeframe_is_context_only": True,
             },
             "score_is_probability": False,
         }
@@ -341,6 +371,9 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         "ignition_ready": ignition_ready_count,
         "memory_influenced": memory_influenced,
         "liquidity_aligned": liquidity_aligned,
+        "htf_aligned": htf_aligned,
+        "htf_conflicted": htf_conflicted,
+        "htf_symbols_checked": len(htf_symbols),
         "timing_model_sample": int(_json(timing_model).get("sample") or 0),
         "actions": actions,
     }
