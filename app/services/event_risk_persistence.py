@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.event_risk_engine import build_event_risk
 
-VERSION = "event_risk_persistence_v1"
+VERSION = "event_risk_persistence_v2_lane_risk"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -73,6 +73,19 @@ async def persist_event_risk_for_run(db: AsyncSession, run_id: str) -> dict[str,
             abnormal += 1
 
         contract = _d(heart.get("execution_contract"))
+        lanes = _d(contract.get("lanes"))
+        risk_mult = max(0.0, min(1.0, _f(event.get("risk_multiplier"), 1.0)))
+        for key in ("tactical", "aggressive_paper", "swing_paper"):
+            lane = _d(lanes.get(key))
+            if lane:
+                lane["event_risk_multiplier"] = risk_mult
+                lane["event_type"] = event_type
+                lane["event_severity"] = event.get("severity")
+                lane["event_directional_bias"] = event.get("directional_bias")
+                lane["event_requires_extra_confirmation"] = event.get("require_extra_confirmation")
+                lanes[key] = lane
+        contract["lanes"] = lanes
+
         original_lane = contract.get("permitted_paper_lane")
         if bool(event.get("block_new_entries")):
             contract["event_original_permitted_paper_lane"] = original_lane
@@ -83,7 +96,7 @@ async def persist_event_risk_for_run(db: AsyncSession, run_id: str) -> dict[str,
             contract["event_blocked_entry"] = False
 
         contract["event_risk"] = event
-        contract["event_risk_multiplier"] = event.get("risk_multiplier")
+        contract["event_risk_multiplier"] = risk_mult
         contract["event_requires_extra_confirmation"] = event.get("require_extra_confirmation")
         heart["event_risk"] = event
         heart["execution_contract"] = contract
