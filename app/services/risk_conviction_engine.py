@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-VERSION = "risk_conviction_engine_v2_elliott"
+VERSION = "risk_conviction_engine_v3_event_risk"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -55,39 +55,29 @@ def build_risk_conviction(
     reasons: list[str] = [f"quality={quality:.1f}"]
 
     if net_rr >= 3.5:
-        conviction += 12.0
-        reasons.append("net_rr>=3.5")
+        conviction += 12.0; reasons.append("net_rr>=3.5")
     elif net_rr >= 3.0:
-        conviction += 9.0
-        reasons.append("net_rr>=3.0")
+        conviction += 9.0; reasons.append("net_rr>=3.0")
     elif net_rr >= 2.6:
-        conviction += 6.0
-        reasons.append("net_rr>=2.6")
+        conviction += 6.0; reasons.append("net_rr>=2.6")
     elif net_rr > 0:
-        conviction += 2.0
-        reasons.append("net_rr_positive")
+        conviction += 2.0; reasons.append("net_rr_positive")
 
     risk_score = _f(risk_score, 100.0)
     conviction -= max(0.0, risk_score - 25.0) * 0.32
     if risk_score <= 30:
-        conviction += 5.0
-        reasons.append("low_risk_score")
+        conviction += 5.0; reasons.append("low_risk_score")
     elif risk_score >= 55:
         reasons.append("elevated_risk_score")
 
     horizons = _d(matrix.get("horizons"))
-    aligned = 0
-    opposing = 0
-    edge_sum = 0.0
-    edge_count = 0
+    aligned = 0; opposing = 0; edge_sum = 0.0; edge_count = 0
     for horizon in ("15m", "1h", "4h", "6h", "24h"):
         item = _d(horizons.get(horizon))
         hdir = str(item.get("direction") or "").upper()
         edge = _f(item.get("edge"))
         if hdir == direction:
-            aligned += 1
-            edge_sum += edge
-            edge_count += 1
+            aligned += 1; edge_sum += edge; edge_count += 1
         elif hdir in {"LONG", "SHORT"} and hdir != direction:
             opposing += 1
     avg_aligned_edge = edge_sum / edge_count if edge_count else 0.0
@@ -95,36 +85,25 @@ def build_risk_conviction(
     consensus = str(matrix.get("consensus") or "MIXED").upper()
     horizon_conflict = bool(matrix.get("horizon_conflict"))
     if aligned >= 5:
-        conviction += 14.0
-        reasons.append("5of5_horizon_alignment")
+        conviction += 14.0; reasons.append("5of5_horizon_alignment")
     elif aligned >= 4:
-        conviction += 10.0
-        reasons.append("4of5_horizon_alignment")
+        conviction += 10.0; reasons.append("4of5_horizon_alignment")
     elif aligned >= 3:
-        conviction += 5.0
-        reasons.append("3of5_horizon_alignment")
+        conviction += 5.0; reasons.append("3of5_horizon_alignment")
     if avg_aligned_edge >= 24:
-        conviction += 8.0
-        reasons.append("strong_horizon_edge")
+        conviction += 8.0; reasons.append("strong_horizon_edge")
     elif avg_aligned_edge >= 16:
-        conviction += 4.0
-        reasons.append("good_horizon_edge")
+        conviction += 4.0; reasons.append("good_horizon_edge")
 
     if consensus == direction:
-        conviction += 7.0
-        reasons.append("matrix_consensus_aligned")
+        conviction += 7.0; reasons.append("matrix_consensus_aligned")
     elif consensus in {"LONG", "SHORT"} and consensus != direction:
-        conviction -= 18.0
-        reasons.append("matrix_consensus_opposes")
+        conviction -= 18.0; reasons.append("matrix_consensus_opposes")
     if horizon_conflict:
-        conviction -= 14.0
-        reasons.append("short_long_horizon_conflict")
+        conviction -= 14.0; reasons.append("short_long_horizon_conflict")
     if opposing >= 2:
-        conviction -= min(15.0, opposing * 5.0)
-        reasons.append(f"opposing_horizons={opposing}")
+        conviction -= min(15.0, opposing * 5.0); reasons.append(f"opposing_horizons={opposing}")
 
-    # Elliott is deliberately bounded. A subjective wave count can support or
-    # reduce size, but can never create an entry or override the canonical side.
     ebest = _d(elliott.get("best"))
     elliott_score = _f(ebest.get("score"))
     elliott_direction = str(ebest.get("direction") or "").upper()
@@ -143,24 +122,12 @@ def build_risk_conviction(
 
     conviction = _clip(conviction)
 
-    if conviction >= 90:
-        multiplier = 1.50
-        tier = "MAX_CONVICTION"
-    elif conviction >= 82:
-        multiplier = 1.25
-        tier = "HIGH"
-    elif conviction >= 72:
-        multiplier = 1.00
-        tier = "NORMAL_PLUS"
-    elif conviction >= 62:
-        multiplier = 0.75
-        tier = "NORMAL"
-    elif conviction >= 52:
-        multiplier = 0.50
-        tier = "LOW"
-    else:
-        multiplier = 0.25
-        tier = "MINIMAL"
+    if conviction >= 90: multiplier, tier = 1.50, "MAX_CONVICTION"
+    elif conviction >= 82: multiplier, tier = 1.25, "HIGH"
+    elif conviction >= 72: multiplier, tier = 1.00, "NORMAL_PLUS"
+    elif conviction >= 62: multiplier, tier = 0.75, "NORMAL"
+    elif conviction >= 52: multiplier, tier = 0.50, "LOW"
+    else: multiplier, tier = 0.25, "MINIMAL"
 
     if lane_name == "AGGRESSIVE_PAPER":
         multiplier = min(multiplier, 0.50)
@@ -177,6 +144,18 @@ def build_risk_conviction(
     if elliott_status == "CLEAR_COUNT" and elliott_direction in {"LONG", "SHORT"} and elliott_direction != direction and elliott_score >= 82.0:
         multiplier = min(multiplier, 0.50)
 
+    event_multiplier = max(0.0, min(1.0, _f(lane.get("event_risk_multiplier"), 1.0)))
+    event_type = str(lane.get("event_type") or "NORMAL")
+    event_severity = str(lane.get("event_severity") or "NORMAL")
+    event_bias = str(lane.get("event_directional_bias") or "NEUTRAL").upper()
+    if event_multiplier < 1.0:
+        multiplier *= event_multiplier
+        reasons.append(f"event_risk_multiplier={event_multiplier:.2f}")
+    if event_bias in {"LONG", "SHORT"} and event_bias != direction and event_severity in {"HIGH", "CRITICAL"}:
+        multiplier = min(multiplier, 0.25)
+        reasons.append("event_direction_conflict")
+    multiplier = max(0.05, min(1.50, multiplier))
+
     return {
         "version": VERSION,
         "paper_only": True,
@@ -184,8 +163,8 @@ def build_risk_conviction(
         "changes_direction": False,
         "conviction_score": round(conviction, 1),
         "tier": tier,
-        "risk_budget_multiplier": round(multiplier, 2),
-        "target_account_risk_pct_before_portfolio_brakes": round(multiplier, 2),
+        "risk_budget_multiplier": round(multiplier, 3),
+        "target_account_risk_pct_before_portfolio_brakes": round(multiplier, 3),
         "lane": lane_name,
         "direction": direction,
         "quality": round(quality, 1),
@@ -203,6 +182,13 @@ def build_risk_conviction(
             "timeframe_agreement": bool(elliott.get("timeframe_agreement")),
             "pattern": ebest.get("pattern"),
         },
+        "event_risk": {
+            "event_type": event_type,
+            "severity": event_severity,
+            "directional_bias": event_bias,
+            "risk_multiplier": event_multiplier,
+            "requires_extra_confirmation": bool(lane.get("event_requires_extra_confirmation")),
+        },
         "reasons": reasons,
-        "rule": "Higher Heart conviction may increase PAPER size; uncertainty, conflict, Elliott disagreement and portfolio brakes reduce it.",
+        "rule": "Higher Heart conviction may increase PAPER size; uncertainty, event stress, conflict, Elliott disagreement and portfolio brakes reduce it.",
     }
