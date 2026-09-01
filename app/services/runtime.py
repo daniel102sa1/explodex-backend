@@ -13,10 +13,8 @@ from app.services.final_explosion_labels import finalize_explosion_outcomes
 from app.services.multi_horizon_outcomes import update_multi_horizon_outcomes
 from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
 from app.services.paper_fast_cycle import run_fast_paper_cycle
-from app.services.paper_trading import manage_open_paper_trades
 from app.services.scanner_guarded import run_scanner
 from app.services.sequential_microstructure import flush_pending_snapshots, hydrate_recent_histories, prune_persistent_history
-from app.services.trade_time_manager import manage_trade_time_stops
 from app.services.verdict_memory import capture_enter_verdicts, resolve_verdict_outcomes, verdict_memory_stats
 from app.services.walk_forward import build_walk_forward_report
 
@@ -33,6 +31,8 @@ class RuntimeState:
         self.last_scanner_ok: bool | None = None
         self.last_scanner_error: str | None = None
         self.last_scanner_result: dict[str, Any] | None = None
+        # Kept only for API compatibility. The legacy PAPER manager is disabled;
+        # visible PAPER is managed exclusively by paper_fast_cycle.
         self.last_paper_manage_at: datetime | None = None
         self.last_paper_manage_ok: bool | None = None
         self.last_paper_manage_error: str | None = None
@@ -77,8 +77,10 @@ class RuntimeState:
                 "last_result": self.last_scanner_result,
             },
             "paper_manager": {
-                "running": self.paper_manage_running,
-                "interval_seconds": settings.paper_manage_interval_seconds,
+                "running": False,
+                "enabled": False,
+                "legacy_disabled": True,
+                "authority": "DISABLED_USE_UNIFIED_PAPER_SYNC_ONLY",
                 "last_run_at": iso(self.last_paper_manage_at),
                 "last_ok": self.last_paper_manage_ok,
                 "last_error": self.last_paper_manage_error,
@@ -86,8 +88,9 @@ class RuntimeState:
             },
             "paper_sync": {
                 "running": self.paper_sync_running,
-                "engine": "paper_fast_cycle_v1",
+                "engine": "paper_fast_cycle_v5_unified_heart_only",
                 "portfolio": "paper_positions_visible_in_/paper",
+                "single_authority": True,
                 "interval_seconds": PAPER_HEART_LOOP_SECONDS,
                 "configured_interval_seconds": settings.paper_sync_interval_seconds,
                 "last_run_at": iso(self.last_paper_sync_at),
@@ -153,30 +156,6 @@ async def _run_scanner_once() -> None:
         runtime_state.scanner_running = False
 
 
-async def _run_paper_manage_once() -> None:
-    if runtime_state.paper_manage_running:
-        return
-    runtime_state.paper_manage_running = True
-    try:
-        async with SessionLocal() as db:
-            price_result = await manage_open_paper_trades(db)
-            time_result = await manage_trade_time_stops(db)
-        runtime_state.last_paper_manage_result = {
-            "managed": price_result.get("managed", 0),
-            "actions": (price_result.get("actions", []) + time_result.get("actions", []))[:15],
-            "time_stop_actions": time_result.get("actions", [])[:10],
-        }
-        runtime_state.last_paper_manage_ok = True
-        runtime_state.last_paper_manage_error = None
-    except Exception as exc:
-        logger.exception("Automatic legacy paper manager cycle failed")
-        runtime_state.last_paper_manage_ok = False
-        runtime_state.last_paper_manage_error = str(exc)[:1000]
-    finally:
-        runtime_state.last_paper_manage_at = datetime.now(timezone.utc)
-        runtime_state.paper_manage_running = False
-
-
 async def _run_paper_sync_once() -> None:
     if runtime_state.paper_sync_running:
         return
@@ -184,7 +163,7 @@ async def _run_paper_sync_once() -> None:
     try:
         async with SessionLocal() as db:
             result = await run_fast_paper_cycle(db)
-        trend = result.get("trend") or {}
+        execution = result.get("unified_execution") or result.get("trend") or {}
         diagnostics = result.get("heart_diagnostics") or {}
         runtime_state.last_paper_sync_result = {
             "version": result.get("version"),
@@ -193,13 +172,19 @@ async def _run_paper_sync_once() -> None:
             "reason": result.get("reason"),
             "equity": result.get("equity"),
             "open_positions": result.get("open_positions"),
-            "signals_checked": trend.get("signals_checked"),
-            "heart_enter_signals": trend.get("heart_enter_signals"),
-            "blockers": trend.get("blockers"),
+            "signals_checked": execution.get("signals_checked"),
+            "candidates": execution.get("candidates"),
+            "rejected": execution.get("rejected"),
+            "defensive": execution.get("defensive"),
+            "defensive_learning_enabled": execution.get("defensive_learning_enabled"),
+            "risk_policy": execution.get("risk_policy"),
+            "trades": (execution.get("trades") or [])[:8],
             "heart_actions": diagnostics.get("actions"),
             "missing_checks": diagnostics.get("missing_checks"),
             "enter_symbols": diagnostics.get("enter_symbols"),
             "aggressive_learning": result.get("aggressive_learning"),
+            "swing_trajectory": result.get("swing_trajectory"),
+            "single_paper_authority": True,
         }
         runtime_state.last_paper_sync_ok = True
         runtime_state.last_paper_sync_error = None
@@ -302,13 +287,6 @@ async def _scanner_loop() -> None:
         await asyncio.sleep(SCANNER_LOOP_SECONDS)
 
 
-async def _paper_manage_loop() -> None:
-    await asyncio.sleep(12)
-    while True:
-        await _run_paper_manage_once()
-        await asyncio.sleep(settings.paper_manage_interval_seconds)
-
-
 async def _paper_sync_loop() -> None:
     await asyncio.sleep(15)
     while True:
@@ -346,7 +324,6 @@ async def start_runtime() -> list[asyncio.Task[Any]]:
         return []
     return [
         asyncio.create_task(_scanner_loop(), name="explodex-scanner-loop"),
-        asyncio.create_task(_paper_manage_loop(), name="explodex-paper-manage-loop"),
         asyncio.create_task(_paper_sync_loop(), name="explodex-visible-paper-heart-loop"),
         asyncio.create_task(_edge_loop(), name="explodex-edge-loop"),
         asyncio.create_task(_verdict_memory_loop(), name="explodex-verdict-memory-loop"),
