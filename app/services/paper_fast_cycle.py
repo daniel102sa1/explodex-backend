@@ -13,13 +13,19 @@ from app.services.paper_sizing_patch import install_corrected_paper_sizing
 from app.services.paper_unified_heart_executor import execute_unified_heart_contracts
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v5_unified_heart_only"
+VERSION = "paper_fast_cycle_v6_live_diagnostics"
+_LAST_FAST_CYCLE_RESULT: dict[str, Any] | None = None
 
 install_corrected_paper_sizing()
 
 
+def latest_fast_cycle_result() -> dict[str, Any] | None:
+    return dict(_LAST_FAST_CYCLE_RESULT) if isinstance(_LAST_FAST_CYCLE_RESULT, dict) else None
+
+
 async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
     """Visible PAPER portfolio driven by one canonical Heart contract only."""
+    global _LAST_FAST_CYCLE_RESULT
     await ensure_validation_schema(db)
     await base.ensure_paper_schema(db)
     await ensure_signal_fk(db)
@@ -40,14 +46,13 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
 
     diagnostics = await heart_diagnostics(db, minutes=30)
     summary = await base.paper_summary(db)
-    return {
+    result = {
         "version": VERSION,
         "closed": closed.get("closed", 0),
         "close_actions": closed.get("actions", [])[:10],
         "opened": int(execution.get("opened") or 0),
         "reason": execution.get("reason"),
         "unified_execution": execution,
-        # Compatibility aliases for existing runtime/UI diagnostics.
         "trend": execution,
         "aggressive_learning": {
             "opened": sum(1 for item in execution.get("trades", []) if item.get("lane") == "AGGRESSIVE_PAPER")
@@ -60,4 +65,7 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         "loss_brake": loss_brake,
         "equity": summary.get("equity"),
         "open_positions": len(summary.get("open_positions") or []),
+        "single_paper_authority": True,
     }
+    _LAST_FAST_CYCLE_RESULT = result
+    return result
