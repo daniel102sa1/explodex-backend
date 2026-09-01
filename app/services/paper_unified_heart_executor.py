@@ -10,8 +10,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import paper_portfolio as base
 from app.services.trade_thesis import mark_thesis_entered
 
-VERSION = "paper_unified_heart_executor_v1"
+VERSION = "paper_unified_heart_executor_v2_defensive_learning"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
+
+# DEFENSIVE is a portfolio risk state, not a simulator-off switch. PAPER must
+# keep generating evidence while using much smaller exposure.
+DEFENSIVE_RISK_CAP = 0.25
+DEFENSIVE_MAX_NEW_POSITIONS = 1
+DEFENSIVE_TACTICAL_MAX_RISK_SCORE = 65.0
+DEFENSIVE_SWING_MAX_RISK_SCORE = 60.0
+DEFENSIVE_SWING_MIN_SCORE = 68.0
+DEFENSIVE_SWING_MIN_EDGE = 16.0
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -43,6 +52,37 @@ def _geometry_ok(side: str, entry: float, stop: float, target: float) -> bool:
     return False
 
 
+def _defensive_lane_check(
+    *,
+    lane_name: str,
+    lane: dict[str, Any],
+    row: dict[str, Any],
+) -> tuple[bool, str | None]:
+    """Allow continued PAPER learning without letting drawdown increase activity.
+
+    - Tactical entries are already fully authorized by the canonical Heart, so
+      they remain available with reduced sizing unless risk is excessive.
+    - Early aggressive entries are disabled while defensive.
+    - Swing entries must have stronger trajectory separation than normal.
+    """
+    risk_score = _f(row.get("risk_score"), 100.0)
+    if lane_name == "AGGRESSIVE_PAPER":
+        return False, "defensive_aggressive_disabled"
+    if lane_name == "TACTICAL":
+        if risk_score > DEFENSIVE_TACTICAL_MAX_RISK_SCORE:
+            return False, "defensive_tactical_risk_too_high"
+        return True, None
+    if lane_name == "SWING_PAPER":
+        if risk_score > DEFENSIVE_SWING_MAX_RISK_SCORE:
+            return False, "defensive_swing_risk_too_high"
+        if _f(lane.get("trajectory_score")) < DEFENSIVE_SWING_MIN_SCORE:
+            return False, "defensive_swing_score_below_68"
+        if _f(lane.get("direction_edge")) < DEFENSIVE_SWING_MIN_EDGE:
+            return False, "defensive_swing_edge_below_16"
+        return True, None
+    return False, "defensive_unknown_lane"
+
+
 async def execute_unified_heart_contracts(
     db: AsyncSession,
     *,
@@ -53,16 +93,26 @@ async def execute_unified_heart_contracts(
 
     The executor may reject a stale fill, geometry or portfolio limit. It cannot
     invent a direction, upgrade WAIT to ENTER or choose a different strategy.
-    """
-    if defensive:
-        return {"version": VERSION, "opened": 0, "reason": "defensive_mode", "rejected": {}}
 
+    In portfolio DEFENSIVE mode PAPER keeps learning, but it can open at most one
+    new position and exposure is capped at 25% of normal. AGGRESSIVE_PAPER stays
+    disabled until portfolio conditions recover.
+    """
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
     slots = max(0, base.MAX_OPEN_POSITIONS - open_count)
+    if defensive:
+        slots = min(slots, DEFENSIVE_MAX_NEW_POSITIONS)
     if slots <= 0:
-        return {"version": VERSION, "opened": 0, "reason": "max_open_positions", "rejected": {}}
+        return {
+            "version": VERSION,
+            "opened": 0,
+            "reason": "max_open_positions",
+            "rejected": {},
+            "defensive": defensive,
+            "defensive_learning_enabled": defensive,
+        }
 
     rows = (await db.execute(text("""
         SELECT DISTINCT ON (s.symbol_id)
@@ -107,6 +157,15 @@ async def execute_unified_heart_contracts(
         if not lane.get("eligible"):
             reject(f"{lane_name.lower()}_not_eligible")
             continue
+        if defensive:
+            allowed, defensive_reason = _defensive_lane_check(
+                lane_name=lane_name,
+                lane=lane,
+                row=row,
+            )
+            if not allowed:
+                reject(defensive_reason or "defensive_rejected")
+                continue
         quality = (
             _f(lane.get("trajectory_score"))
             if lane_name == "SWING_PAPER"
@@ -150,7 +209,10 @@ async def execute_unified_heart_contracts(
         risk_budget_pct = max(0.1, min(1.0, _f(lane.get("risk_budget_pct"), 1.0)))
         lane_leverage = int(max(1, min(3, _f(lane.get("max_leverage"), 3.0))))
         sizing = base.size_position(balance, fill, stop, lane_leverage)
-        scale = risk_budget_pct * max(0.0, min(1.0, risk_multiplier))
+        effective_risk_multiplier = max(0.0, min(1.0, risk_multiplier))
+        if defensive:
+            effective_risk_multiplier = min(effective_risk_multiplier, DEFENSIVE_RISK_CAP)
+        scale = risk_budget_pct * effective_risk_multiplier
         for key in ("quantity", "notional", "margin", "risk_usdt"):
             sizing[key] = round(_f(sizing.get(key)) * scale, 10)
         if sizing["quantity"] <= 0 or sizing["margin"] <= 0:
@@ -167,9 +229,12 @@ async def execute_unified_heart_contracts(
             "primary_prediction": heart.get("primary_prediction"),
             "primary_action": _d(heart.get("execution_contract")).get("primary_action"),
             "risk_budget_pct": risk_budget_pct,
+            "effective_risk_multiplier": effective_risk_multiplier,
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
             "max_hold_minutes": lane.get("max_hold_minutes"),
             "experimental": bool(lane.get("paper_only")),
+            "portfolio_mode": "DEFENSIVE_LEARNING" if defensive else "NORMAL",
+            "defensive_learning": defensive,
             "executor_cannot_change_direction": True,
             "executor_cannot_upgrade_wait": True,
         }
@@ -219,15 +284,30 @@ async def execute_unified_heart_contracts(
             "risk_usdt": sizing["risk_usdt"],
             "leverage": lane_leverage,
             "max_hold_minutes": lane.get("max_hold_minutes"),
+            "defensive_learning": defensive,
+            "effective_risk_multiplier": effective_risk_multiplier,
         })
 
     await db.commit()
+    if opened_items:
+        reason = "opened_defensive_learning" if defensive else "opened_from_unified_heart"
+    else:
+        reason = "no_defensive_learning_candidate" if defensive else "no_executable_heart_contract"
     return {
         "version": VERSION,
         "opened": len(opened_items),
         "trades": opened_items,
-        "reason": "opened_from_unified_heart" if opened_items else "no_executable_heart_contract",
+        "reason": reason,
         "signals_checked": len(rows),
         "candidates": len(candidates),
         "rejected": rejected,
+        "defensive": defensive,
+        "defensive_learning_enabled": defensive,
+        "defensive_policy": {
+            "max_new_positions": DEFENSIVE_MAX_NEW_POSITIONS if defensive else None,
+            "risk_cap_multiplier": DEFENSIVE_RISK_CAP if defensive else None,
+            "aggressive_enabled": False if defensive else True,
+            "swing_min_score": DEFENSIVE_SWING_MIN_SCORE if defensive else None,
+            "swing_min_edge": DEFENSIVE_SWING_MIN_EDGE if defensive else None,
+        },
     }
