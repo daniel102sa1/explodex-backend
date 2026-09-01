@@ -8,13 +8,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.trade_thesis import mark_thesis_entered
 
-VERSION = "paper_unified_heart_executor_v2_defensive_learning"
+VERSION = "paper_unified_heart_executor_v3_conviction_risk"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
-# DEFENSIVE is a portfolio risk state, not a simulator-off switch. PAPER must
-# keep generating evidence while using much smaller exposure.
 DEFENSIVE_RISK_CAP = 0.25
 DEFENSIVE_MAX_NEW_POSITIONS = 1
 DEFENSIVE_TACTICAL_MAX_RISK_SCORE = 65.0
@@ -52,19 +51,7 @@ def _geometry_ok(side: str, entry: float, stop: float, target: float) -> bool:
     return False
 
 
-def _defensive_lane_check(
-    *,
-    lane_name: str,
-    lane: dict[str, Any],
-    row: dict[str, Any],
-) -> tuple[bool, str | None]:
-    """Allow continued PAPER learning without letting drawdown increase activity.
-
-    - Tactical entries are already fully authorized by the canonical Heart, so
-      they remain available with reduced sizing unless risk is excessive.
-    - Early aggressive entries are disabled while defensive.
-    - Swing entries must have stronger trajectory separation than normal.
-    """
+def _defensive_lane_check(*, lane_name: str, lane: dict[str, Any], row: dict[str, Any]) -> tuple[bool, str | None]:
     risk_score = _f(row.get("risk_score"), 100.0)
     if lane_name == "AGGRESSIVE_PAPER":
         return False, "defensive_aggressive_disabled"
@@ -89,14 +76,12 @@ async def execute_unified_heart_contracts(
     defensive: bool = False,
     risk_multiplier: float = 1.0,
 ) -> dict[str, Any]:
-    """Execute only the lane explicitly permitted by the persisted Heart.
+    """Execute exactly one lane authorized by the canonical Heart.
 
-    The executor may reject a stale fill, geometry or portfolio limit. It cannot
-    invent a direction, upgrade WAIT to ENTER or choose a different strategy.
-
-    In portfolio DEFENSIVE mode PAPER keeps learning, but it can open at most one
-    new position and exposure is capped at 25% of normal. AGGRESSIVE_PAPER stays
-    disabled until portfolio conditions recover.
+    Position size is no longer fixed. The same Heart evidence that authorizes a
+    lane also determines PAPER risk: roughly 0.25%-1.50% account risk before
+    portfolio brakes. Higher risk is allowed only when horizons, edge, net R/R,
+    quality and setup risk agree. This remains PAPER-only.
     """
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
@@ -158,11 +143,7 @@ async def execute_unified_heart_contracts(
             reject(f"{lane_name.lower()}_not_eligible")
             continue
         if defensive:
-            allowed, defensive_reason = _defensive_lane_check(
-                lane_name=lane_name,
-                lane=lane,
-                row=row,
-            )
+            allowed, defensive_reason = _defensive_lane_check(lane_name=lane_name, lane=lane, row=row)
             if not allowed:
                 reject(defensive_reason or "defensive_rejected")
                 continue
@@ -171,14 +152,7 @@ async def execute_unified_heart_contracts(
             if lane_name == "SWING_PAPER"
             else _f(lane.get("ignition_score"), _f(row.get("setup_score")))
         )
-        candidates.append((
-            LANE_PRIORITY[lane_name],
-            -quality,
-            _f(row.get("risk_score"), 100.0),
-            row,
-            heart,
-            lane,
-        ))
+        candidates.append((LANE_PRIORITY[lane_name], -quality, _f(row.get("risk_score"), 100.0), row, heart, lane))
 
     candidates.sort(key=lambda item: (item[0], item[1], item[2]))
     opened_items: list[dict[str, Any]] = []
@@ -206,13 +180,23 @@ async def execute_unified_heart_contracts(
             reject("invalid_live_fill_geometry")
             continue
 
-        risk_budget_pct = max(0.1, min(1.0, _f(lane.get("risk_budget_pct"), 1.0)))
+        contract = _d(heart.get("execution_contract"))
+        matrix = _d(contract.get("forecast_matrix")) or _d(heart.get("forecast_matrix"))
+        conviction = build_risk_conviction(
+            lane_name=lane_name,
+            lane=lane,
+            setup_score=_f(row.get("setup_score")),
+            risk_score=_f(row.get("risk_score"), 100.0),
+            forecast_matrix=matrix,
+        )
+        conviction_multiplier = max(0.25, min(1.50, _f(conviction.get("risk_budget_multiplier"), 0.25)))
+
         lane_leverage = int(max(1, min(3, _f(lane.get("max_leverage"), 3.0))))
         sizing = base.size_position(balance, fill, stop, lane_leverage)
-        effective_risk_multiplier = max(0.0, min(1.0, risk_multiplier))
+        portfolio_multiplier = max(0.0, min(1.0, risk_multiplier))
         if defensive:
-            effective_risk_multiplier = min(effective_risk_multiplier, DEFENSIVE_RISK_CAP)
-        scale = risk_budget_pct * effective_risk_multiplier
+            portfolio_multiplier = min(portfolio_multiplier, DEFENSIVE_RISK_CAP)
+        scale = conviction_multiplier * portfolio_multiplier
         for key in ("quantity", "notional", "margin", "risk_usdt"):
             sizing[key] = round(_f(sizing.get(key)) * scale, 10)
         if sizing["quantity"] <= 0 or sizing["margin"] <= 0:
@@ -224,12 +208,14 @@ async def execute_unified_heart_contracts(
             "strategy_mode": lane_name,
             "canonical_source": "UNIFIED_EXPLODEX_HEART",
             "heart_version": heart.get("version"),
-            "execution_contract_version": _d(heart.get("execution_contract")).get("version"),
+            "execution_contract_version": contract.get("version"),
             "contract_lane": lane,
             "primary_prediction": heart.get("primary_prediction"),
-            "primary_action": _d(heart.get("execution_contract")).get("primary_action"),
-            "risk_budget_pct": risk_budget_pct,
-            "effective_risk_multiplier": effective_risk_multiplier,
+            "primary_action": contract.get("primary_action"),
+            "risk_conviction": conviction,
+            "conviction_risk_multiplier": conviction_multiplier,
+            "portfolio_risk_multiplier": portfolio_multiplier,
+            "target_account_risk_pct_before_portfolio_brakes": conviction.get("target_account_risk_pct_before_portfolio_brakes"),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
             "max_hold_minutes": lane.get("max_hold_minutes"),
             "experimental": bool(lane.get("paper_only")),
@@ -285,7 +271,10 @@ async def execute_unified_heart_contracts(
             "leverage": lane_leverage,
             "max_hold_minutes": lane.get("max_hold_minutes"),
             "defensive_learning": defensive,
-            "effective_risk_multiplier": effective_risk_multiplier,
+            "conviction_score": conviction.get("conviction_score"),
+            "conviction_tier": conviction.get("tier"),
+            "conviction_risk_multiplier": conviction_multiplier,
+            "portfolio_risk_multiplier": portfolio_multiplier,
         })
 
     await db.commit()
@@ -303,6 +292,15 @@ async def execute_unified_heart_contracts(
         "rejected": rejected,
         "defensive": defensive,
         "defensive_learning_enabled": defensive,
+        "risk_policy": {
+            "base_account_risk_pct": 1.0,
+            "min_conviction_multiplier": 0.25,
+            "max_conviction_multiplier": 1.50,
+            "max_target_account_risk_pct": 1.50,
+            "defensive_cap_multiplier": DEFENSIVE_RISK_CAP,
+            "aggressive_max_multiplier": 0.50,
+            "swing_max_multiplier": 1.25,
+        },
         "defensive_policy": {
             "max_new_positions": DEFENSIVE_MAX_NEW_POSITIONS if defensive else None,
             "risk_cap_multiplier": DEFENSIVE_RISK_CAP if defensive else None,
