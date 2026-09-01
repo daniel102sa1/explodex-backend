@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-VERSION = "risk_conviction_engine_v1"
+VERSION = "risk_conviction_engine_v2_elliott"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -41,16 +41,12 @@ def build_risk_conviction(
     setup_score: float,
     risk_score: float,
     forecast_matrix: dict[str, Any] | None,
+    elliott_structure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Choose PAPER capital risk from the same Heart evidence.
-
-    Output is a multiplier of the portfolio's base 1% risk budget. For example,
-    1.50 means target roughly 1.5% account risk before portfolio brakes. This
-    changes PAPER sizing only; it never creates an entry or changes direction.
-    """
     lane_name = str(lane_name or "").upper()
     lane = _d(lane)
     matrix = _d(forecast_matrix)
+    elliott = _d(elliott_structure)
     direction = str(lane.get("direction") or "").upper()
     quality = _quality_for_lane(lane_name, lane, setup_score)
     net_rr = _selected_net_rr(lane)
@@ -58,7 +54,6 @@ def build_risk_conviction(
     conviction = 35.0 + max(0.0, quality - 55.0) * 0.65
     reasons: list[str] = [f"quality={quality:.1f}"]
 
-    # Reward plans with real room after estimated costs.
     if net_rr >= 3.5:
         conviction += 12.0
         reasons.append("net_rr>=3.5")
@@ -72,7 +67,6 @@ def build_risk_conviction(
         conviction += 2.0
         reasons.append("net_rr_positive")
 
-    # Risk score is a penalty, not a direction vote.
     risk_score = _f(risk_score, 100.0)
     conviction -= max(0.0, risk_score - 25.0) * 0.32
     if risk_score <= 30:
@@ -129,6 +123,24 @@ def build_risk_conviction(
         conviction -= min(15.0, opposing * 5.0)
         reasons.append(f"opposing_horizons={opposing}")
 
+    # Elliott is deliberately bounded. A subjective wave count can support or
+    # reduce size, but can never create an entry or override the canonical side.
+    ebest = _d(elliott.get("best"))
+    elliott_score = _f(ebest.get("score"))
+    elliott_direction = str(ebest.get("direction") or "").upper()
+    elliott_status = str(elliott.get("status") or "")
+    if elliott_status == "CLEAR_COUNT" and elliott_score >= 68.0:
+        if elliott_direction == direction:
+            bonus = 8.0 if elliott_score >= 82.0 else 5.0
+            if bool(elliott.get("timeframe_agreement")):
+                bonus += 2.0
+            conviction += min(10.0, bonus)
+            reasons.append(f"elliott_aligned={elliott_score:.1f}")
+        elif elliott_direction in {"LONG", "SHORT"}:
+            penalty = 12.0 if elliott_score >= 82.0 else 8.0
+            conviction -= penalty
+            reasons.append(f"elliott_conflict={elliott_score:.1f}")
+
     conviction = _clip(conviction)
 
     if conviction >= 90:
@@ -150,7 +162,6 @@ def build_risk_conviction(
         multiplier = 0.25
         tier = "MINIMAL"
 
-    # Experimental early entries never receive high-conviction sizing.
     if lane_name == "AGGRESSIVE_PAPER":
         multiplier = min(multiplier, 0.50)
         tier = "EARLY_CAPPED" if multiplier >= 0.50 else tier
@@ -159,12 +170,12 @@ def build_risk_conviction(
         if multiplier >= 1.25 and tier == "MAX_CONVICTION":
             tier = "HIGH_SWING_CAPPED"
 
-    # Explicit timeframe disagreement prevents large sizing even if other
-    # components are strong. The entry can remain valid, but size must shrink.
     if horizon_conflict:
         multiplier = min(multiplier, 0.50)
     if consensus in {"LONG", "SHORT"} and consensus != direction:
         multiplier = min(multiplier, 0.25)
+    if elliott_status == "CLEAR_COUNT" and elliott_direction in {"LONG", "SHORT"} and elliott_direction != direction and elliott_score >= 82.0:
+        multiplier = min(multiplier, 0.50)
 
     return {
         "version": VERSION,
@@ -185,6 +196,13 @@ def build_risk_conviction(
         "average_aligned_edge": round(avg_aligned_edge, 1),
         "horizon_conflict": horizon_conflict,
         "consensus": consensus,
+        "elliott": {
+            "status": elliott_status or "MISSING",
+            "direction": elliott_direction or None,
+            "score": round(elliott_score, 1),
+            "timeframe_agreement": bool(elliott.get("timeframe_agreement")),
+            "pattern": ebest.get("pattern"),
+        },
         "reasons": reasons,
-        "rule": "Higher Heart conviction may increase PAPER size; uncertainty, conflict and portfolio brakes reduce it.",
+        "rule": "Higher Heart conviction may increase PAPER size; uncertainty, conflict, Elliott disagreement and portfolio brakes reduce it.",
     }
