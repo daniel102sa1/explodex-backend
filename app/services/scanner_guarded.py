@@ -17,6 +17,7 @@ from app.services.pre_event_persistence import persist_pre_event_for_run
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.scanner_edge_gate import apply_edge_gate_to_scanner_run
 from app.services.server_snapshot_extensions import install_server_snapshot_extensions
+from app.services.shadow_forecast_memory import capture_shadow_forecasts_for_run, persist_shadow_calibration_for_run
 from app.services.trajectory_persistence import persist_trajectory_for_run
 from app.services.unified_heart_contract import finalize_unified_contract_for_run
 from app.services.verdict_memory_override import install_verdict_memory_overrides
@@ -46,6 +47,10 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             ("event_risk", persist_event_risk_for_run, "event_risk_persistence"),
             ("pre_event_prediction", persist_pre_event_for_run, "pre_event_persistence"),
             ("market_breadth", persist_market_breadth_for_run, "market_breadth"),
+            # Calibration only uses matured history from earlier forecasts.
+            ("shadow_calibration", persist_shadow_calibration_for_run, "shadow_forecast_memory"),
+            # Capture this run last so current observations can never influence themselves.
+            ("shadow_forecast_capture", capture_shadow_forecasts_for_run, "shadow_forecast_memory"),
         ]
         for key, fn, version in steps:
             try:
