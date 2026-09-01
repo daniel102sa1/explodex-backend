@@ -11,7 +11,7 @@ from app.services import paper_portfolio as base
 from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.trade_thesis import mark_thesis_entered
 
-VERSION = "paper_unified_heart_executor_v3_conviction_risk"
+VERSION = "paper_unified_heart_executor_v4_elliott_conviction"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -76,13 +76,6 @@ async def execute_unified_heart_contracts(
     defensive: bool = False,
     risk_multiplier: float = 1.0,
 ) -> dict[str, Any]:
-    """Execute exactly one lane authorized by the canonical Heart.
-
-    Position size is no longer fixed. The same Heart evidence that authorizes a
-    lane also determines PAPER risk: roughly 0.25%-1.50% account risk before
-    portfolio brakes. Higher risk is allowed only when horizons, edge, net R/R,
-    quality and setup risk agree. This remains PAPER-only.
-    """
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
@@ -90,14 +83,7 @@ async def execute_unified_heart_contracts(
     if defensive:
         slots = min(slots, DEFENSIVE_MAX_NEW_POSITIONS)
     if slots <= 0:
-        return {
-            "version": VERSION,
-            "opened": 0,
-            "reason": "max_open_positions",
-            "rejected": {},
-            "defensive": defensive,
-            "defensive_learning_enabled": defensive,
-        }
+        return {"version": VERSION, "opened": 0, "reason": "max_open_positions", "rejected": {}, "defensive": defensive, "defensive_learning_enabled": defensive}
 
     rows = (await db.execute(text("""
         SELECT DISTINCT ON (s.symbol_id)
@@ -133,11 +119,7 @@ async def execute_unified_heart_contracts(
         if lane_name not in LANE_PRIORITY:
             reject("heart_no_permitted_lane")
             continue
-        lane_key = {
-            "TACTICAL": "tactical",
-            "AGGRESSIVE_PAPER": "aggressive_paper",
-            "SWING_PAPER": "swing_paper",
-        }[lane_name]
+        lane_key = {"TACTICAL": "tactical", "AGGRESSIVE_PAPER": "aggressive_paper", "SWING_PAPER": "swing_paper"}[lane_name]
         lane = _d(_d(contract.get("lanes")).get(lane_key))
         if not lane.get("eligible"):
             reject(f"{lane_name.lower()}_not_eligible")
@@ -147,11 +129,7 @@ async def execute_unified_heart_contracts(
             if not allowed:
                 reject(defensive_reason or "defensive_rejected")
                 continue
-        quality = (
-            _f(lane.get("trajectory_score"))
-            if lane_name == "SWING_PAPER"
-            else _f(lane.get("ignition_score"), _f(row.get("setup_score")))
-        )
+        quality = _f(lane.get("trajectory_score")) if lane_name == "SWING_PAPER" else _f(lane.get("ignition_score"), _f(row.get("setup_score")))
         candidates.append((LANE_PRIORITY[lane_name], -quality, _f(row.get("risk_score"), 100.0), row, heart, lane))
 
     candidates.sort(key=lambda item: (item[0], item[1], item[2]))
@@ -182,12 +160,14 @@ async def execute_unified_heart_contracts(
 
         contract = _d(heart.get("execution_contract"))
         matrix = _d(contract.get("forecast_matrix")) or _d(heart.get("forecast_matrix"))
+        elliott = _d(contract.get("elliott_structure")) or _d(heart.get("elliott_structure"))
         conviction = build_risk_conviction(
             lane_name=lane_name,
             lane=lane,
             setup_score=_f(row.get("setup_score")),
             risk_score=_f(row.get("risk_score"), 100.0),
             forecast_matrix=matrix,
+            elliott_structure=elliott,
         )
         conviction_multiplier = max(0.25, min(1.50, _f(conviction.get("risk_budget_multiplier"), 0.25)))
 
@@ -213,6 +193,7 @@ async def execute_unified_heart_contracts(
             "primary_prediction": heart.get("primary_prediction"),
             "primary_action": contract.get("primary_action"),
             "risk_conviction": conviction,
+            "elliott_structure": elliott,
             "conviction_risk_multiplier": conviction_multiplier,
             "portfolio_risk_multiplier": portfolio_multiplier,
             "target_account_risk_pct_before_portfolio_brakes": conviction.get("target_account_risk_pct_before_portfolio_brakes"),
@@ -236,21 +217,12 @@ async def execute_unified_heart_contracts(
                 :margin, :risk_usdt, :opened_at, CAST(:metadata AS JSONB)
             ) ON CONFLICT (signal_id) DO NOTHING
         """), {
-            "signal_id": row["signal_id"],
-            "symbol": symbol,
-            "side": side,
+            "signal_id": row["signal_id"], "symbol": symbol, "side": side,
             "grade": "HEART" if lane_name == "TACTICAL" else "EARLY" if lane_name == "AGGRESSIVE_PAPER" else "SWING",
             "score": _f(lane.get("ignition_score"), _f(lane.get("trajectory_score"), _f(row.get("setup_score")))),
-            "leverage": lane_leverage,
-            "entry": fill,
-            "stop": stop,
-            "target": target,
-            "quantity": sizing["quantity"],
-            "notional": sizing["notional"],
-            "margin": sizing["margin"],
-            "risk_usdt": sizing["risk_usdt"],
-            "opened_at": datetime.now(timezone.utc),
-            "metadata": json.dumps(metadata),
+            "leverage": lane_leverage, "entry": fill, "stop": stop, "target": target,
+            "quantity": sizing["quantity"], "notional": sizing["notional"], "margin": sizing["margin"],
+            "risk_usdt": sizing["risk_usdt"], "opened_at": datetime.now(timezone.utc), "metadata": json.dumps(metadata),
         })
         if not result.rowcount:
             reject("duplicate_signal")
@@ -260,21 +232,12 @@ async def execute_unified_heart_contracts(
             await mark_thesis_entered(db, symbol)
 
         opened_items.append({
-            "symbol": symbol,
-            "lane": lane_name,
-            "side": side,
-            "entry": fill,
-            "stop": stop,
-            "target": target,
-            "target_name": lane.get("target_name"),
-            "risk_usdt": sizing["risk_usdt"],
-            "leverage": lane_leverage,
-            "max_hold_minutes": lane.get("max_hold_minutes"),
-            "defensive_learning": defensive,
-            "conviction_score": conviction.get("conviction_score"),
-            "conviction_tier": conviction.get("tier"),
-            "conviction_risk_multiplier": conviction_multiplier,
-            "portfolio_risk_multiplier": portfolio_multiplier,
+            "symbol": symbol, "lane": lane_name, "side": side, "entry": fill, "stop": stop, "target": target,
+            "target_name": lane.get("target_name"), "risk_usdt": sizing["risk_usdt"], "leverage": lane_leverage,
+            "max_hold_minutes": lane.get("max_hold_minutes"), "defensive_learning": defensive,
+            "conviction_score": conviction.get("conviction_score"), "conviction_tier": conviction.get("tier"),
+            "conviction_risk_multiplier": conviction_multiplier, "portfolio_risk_multiplier": portfolio_multiplier,
+            "elliott": conviction.get("elliott"),
         })
 
     await db.commit()
@@ -283,29 +246,13 @@ async def execute_unified_heart_contracts(
     else:
         reason = "no_defensive_learning_candidate" if defensive else "no_executable_heart_contract"
     return {
-        "version": VERSION,
-        "opened": len(opened_items),
-        "trades": opened_items,
-        "reason": reason,
-        "signals_checked": len(rows),
-        "candidates": len(candidates),
-        "rejected": rejected,
-        "defensive": defensive,
-        "defensive_learning_enabled": defensive,
+        "version": VERSION, "opened": len(opened_items), "trades": opened_items, "reason": reason,
+        "signals_checked": len(rows), "candidates": len(candidates), "rejected": rejected,
+        "defensive": defensive, "defensive_learning_enabled": defensive,
         "risk_policy": {
-            "base_account_risk_pct": 1.0,
-            "min_conviction_multiplier": 0.25,
-            "max_conviction_multiplier": 1.50,
-            "max_target_account_risk_pct": 1.50,
-            "defensive_cap_multiplier": DEFENSIVE_RISK_CAP,
-            "aggressive_max_multiplier": 0.50,
-            "swing_max_multiplier": 1.25,
-        },
-        "defensive_policy": {
-            "max_new_positions": DEFENSIVE_MAX_NEW_POSITIONS if defensive else None,
-            "risk_cap_multiplier": DEFENSIVE_RISK_CAP if defensive else None,
-            "aggressive_enabled": False if defensive else True,
-            "swing_min_score": DEFENSIVE_SWING_MIN_SCORE if defensive else None,
-            "swing_min_edge": DEFENSIVE_SWING_MIN_EDGE if defensive else None,
+            "base_account_risk_pct": 1.0, "min_conviction_multiplier": 0.25, "max_conviction_multiplier": 1.50,
+            "max_target_account_risk_pct": 1.50, "defensive_cap_multiplier": DEFENSIVE_RISK_CAP,
+            "aggressive_max_multiplier": 0.50, "swing_max_multiplier": 1.25,
+            "elliott_is_bounded_evidence": True,
         },
     }
