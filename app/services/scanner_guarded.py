@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import scanner as scanner_module
 from app.services.elliott_persistence import persist_elliott_for_run
 from app.services.entry_latch_persistence import apply_entry_latches_for_run
+from app.services.event_risk_persistence import persist_event_risk_for_run
 from app.services.heart_persistence import canonicalize_scanner_run
 from app.services.horizon_matrix_persistence import persist_horizon_matrix_for_run
 from app.services.microstructure_persistence_resilient import install_microstructure_persistence_hardening
@@ -66,13 +67,17 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
         except Exception as exc:
             result["horizon_forecast_matrix"] = {"version": "horizon_matrix_persistence_v1", "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
 
-        # Elliott is one more structural sensor inside the same Heart. It is
-        # attached last so it can compare its count with the already-finalized
-        # primary direction and horizon matrix without becoming another authority.
         try:
             result["elliott_structure"] = await persist_elliott_for_run(db, run_id)
         except Exception as exc:
             result["elliott_structure"] = {"version": "elliott_persistence_v1", "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+
+        # Event Risk is attached last so it can see the fully formed Heart and
+        # can only reduce/block risk; it never creates a lane or flips direction.
+        try:
+            result["event_risk"] = await persist_event_risk_for_run(db, run_id)
+        except Exception as exc:
+            result["event_risk"] = {"version": "event_risk_persistence_v1", "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
     return result
 
 
