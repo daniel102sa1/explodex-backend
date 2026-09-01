@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-VERSION = "risk_conviction_engine_v4_pre_event"
+VERSION = "risk_conviction_engine_v5_breadth_shadow"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -21,10 +21,8 @@ def _clip(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 
 def _quality_for_lane(lane_name: str, lane: dict[str, Any], setup_score: float) -> float:
-    if lane_name == "SWING_PAPER":
-        return _f(lane.get("trajectory_score"), setup_score)
-    if lane_name == "PRE_EVENT_PAPER":
-        return _f(lane.get("preparation_score"), setup_score)
+    if lane_name == "SWING_PAPER": return _f(lane.get("trajectory_score"), setup_score)
+    if lane_name == "PRE_EVENT_PAPER": return _f(lane.get("preparation_score"), setup_score)
     return _f(lane.get("ignition_score"), setup_score)
 
 
@@ -72,6 +70,14 @@ def build_risk_conviction(*, lane_name: str, lane: dict[str, Any], setup_score: 
             bonus = 8 if es >= 82 else 5; bonus += 2 if bool(elliott.get("timeframe_agreement")) else 0; conviction += min(10, bonus); reasons.append(f"elliott_aligned={es:.1f}")
         elif edir in {"LONG", "SHORT"}: conviction -= 12 if es >= 82 else 8; reasons.append(f"elliott_conflict={es:.1f}")
 
+    shadow_status = str(lane.get("shadow_calibration_status") or "CALIBRATING")
+    shadow_sample = int(_f(lane.get("shadow_calibration_sample"), 0))
+    shadow_adjustment = _f(lane.get("shadow_conviction_adjustment"), 0.0)
+    if shadow_status == "USABLE" and shadow_sample >= 30 and shadow_adjustment:
+        shadow_adjustment = max(-5.0, min(5.0, shadow_adjustment))
+        conviction += shadow_adjustment
+        reasons.append(f"shadow_history_adjustment={shadow_adjustment:+.1f}")
+
     conviction = _clip(conviction)
     if conviction >= 90: multiplier, tier = 1.50, "MAX_CONVICTION"
     elif conviction >= 82: multiplier, tier = 1.25, "HIGH"
@@ -83,8 +89,7 @@ def build_risk_conviction(*, lane_name: str, lane: dict[str, Any], setup_score: 
     if lane_name == "AGGRESSIVE_PAPER": multiplier = min(multiplier, 0.50); tier = "EARLY_CAPPED"
     elif lane_name == "SWING_PAPER": multiplier = min(multiplier, 1.25)
     elif lane_name == "PRE_EVENT_PAPER":
-        multiplier = min(multiplier, 0.25); tier = "PRE_EVENT_TINY"
-        reasons.append("pre_event_risk_cap=0.25")
+        multiplier = min(multiplier, 0.25); tier = "PRE_EVENT_TINY"; reasons.append("pre_event_risk_cap=0.25")
 
     if conflict: multiplier = min(multiplier, 0.50)
     if consensus in {"LONG", "SHORT"} and consensus != direction: multiplier = min(multiplier, 0.25)
@@ -94,6 +99,22 @@ def build_risk_conviction(*, lane_name: str, lane: dict[str, Any], setup_score: 
     event_type = str(lane.get("event_type") or "NORMAL"); event_severity = str(lane.get("event_severity") or "NORMAL"); event_bias = str(lane.get("event_directional_bias") or "NEUTRAL").upper()
     if event_multiplier < 1.0: multiplier *= event_multiplier; reasons.append(f"event_risk_multiplier={event_multiplier:.2f}")
     if event_bias in {"LONG", "SHORT"} and event_bias != direction and event_severity in {"HIGH", "CRITICAL"}: multiplier = min(multiplier, 0.25); reasons.append("event_direction_conflict")
+
+    breadth_multiplier = max(0.35, min(1.0, _f(lane.get("breadth_risk_multiplier"), 1.0)))
+    breadth_regime = str(lane.get("market_breadth_regime") or "MISSING")
+    breadth_alignment = str(lane.get("breadth_alignment") or "MISSING")
+    breadth_score = _f(lane.get("market_breadth_score"))
+    if breadth_multiplier < 1.0:
+        multiplier *= breadth_multiplier
+        reasons.append(f"breadth_risk_multiplier={breadth_multiplier:.2f}")
+
+    # Historical calibration is deliberately weaker than current hard evidence.
+    if shadow_status == "USABLE" and shadow_sample >= 30:
+        if shadow_adjustment >= 5: multiplier *= 1.10
+        elif shadow_adjustment >= 2.5: multiplier *= 1.05
+        elif shadow_adjustment <= -5: multiplier *= 0.80
+        elif shadow_adjustment <= -2.5: multiplier *= 0.90
+
     multiplier = max(0.05, min(1.50, multiplier))
 
     return {
@@ -105,6 +126,8 @@ def build_risk_conviction(*, lane_name: str, lane: dict[str, Any], setup_score: 
         "horizon_conflict": conflict, "consensus": consensus,
         "elliott": {"status": estat or "MISSING", "direction": edir or None, "score": round(es,1), "timeframe_agreement": bool(elliott.get("timeframe_agreement")), "pattern": ebest.get("pattern")},
         "event_risk": {"event_type": event_type, "severity": event_severity, "directional_bias": event_bias, "risk_multiplier": event_multiplier, "requires_extra_confirmation": bool(lane.get("event_requires_extra_confirmation"))},
+        "market_breadth": {"regime": breadth_regime, "score": round(breadth_score,1), "alignment": breadth_alignment, "risk_multiplier": breadth_multiplier},
+        "shadow_calibration": {"status": shadow_status, "sample": shadow_sample, "bounded_adjustment": shadow_adjustment, "minimum_sample": 30},
         "reasons": reasons,
-        "rule": "Risk rises only with Heart conviction; pre-event research is always tiny and event/portfolio brakes dominate."
+        "rule": "Risk rises only with current Heart evidence plus bounded matured history; breadth/event/portfolio brakes dominate and shadow scores are not probabilities."
     }
