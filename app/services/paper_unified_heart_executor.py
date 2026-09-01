@@ -9,9 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
 from app.services.risk_conviction_engine import build_risk_conviction
+from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 
-VERSION = "paper_unified_heart_executor_v4_elliott_conviction"
+VERSION = "paper_unified_heart_executor_v5_stop_survival"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -143,19 +144,32 @@ async def execute_unified_heart_contracts(
         side = str(lane.get("direction") or "").upper()
         entry_low = _f(lane.get("entry_low"))
         entry_high = _f(lane.get("entry_high"))
-        stop = _f(lane.get("stop_loss"))
-        target = _f(lane.get("target_price"))
+        original_stop = _f(lane.get("stop_loss"))
+        original_target = _f(lane.get("target_price"))
         fill = await base._latest_price(symbol)
 
-        if min(fill, entry_low, entry_high, stop, target) <= 0:
+        if min(fill, entry_low, entry_high, original_stop, original_target) <= 0:
             reject("invalid_contract_geometry")
             continue
         lo, hi = min(entry_low, entry_high), max(entry_low, entry_high)
         if not (lo <= fill <= hi):
             reject("stale_fill_outside_contract_zone")
             continue
-        if not _geometry_ok(side, fill, stop, target):
+        if not _geometry_ok(side, fill, original_stop, original_target):
             reject("invalid_live_fill_geometry")
+            continue
+
+        survival = build_stop_survival_plan(
+            heart=heart,
+            lane_name=lane_name,
+            lane=lane,
+            entry=fill,
+        )
+        survival_enabled = bool(survival.get("enabled"))
+        hard_stop = _f(survival.get("hard_stop"), original_stop) if survival_enabled else original_stop
+        target = _f(survival.get("target_price"), original_target) if survival_enabled else original_target
+        if not _geometry_ok(side, fill, hard_stop, target):
+            reject("invalid_survival_geometry")
             continue
 
         contract = _d(heart.get("execution_contract"))
@@ -172,7 +186,7 @@ async def execute_unified_heart_contracts(
         conviction_multiplier = max(0.25, min(1.50, _f(conviction.get("risk_budget_multiplier"), 0.25)))
 
         lane_leverage = int(max(1, min(3, _f(lane.get("max_leverage"), 3.0))))
-        sizing = base.size_position(balance, fill, stop, lane_leverage)
+        sizing = base.size_position(balance, fill, hard_stop, lane_leverage)
         portfolio_multiplier = max(0.0, min(1.0, risk_multiplier))
         if defensive:
             portfolio_multiplier = min(portfolio_multiplier, DEFENSIVE_RISK_CAP)
@@ -198,6 +212,13 @@ async def execute_unified_heart_contracts(
             "portfolio_risk_multiplier": portfolio_multiplier,
             "target_account_risk_pct_before_portfolio_brakes": conviction.get("target_account_risk_pct_before_portfolio_brakes"),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
+            "stop_survival": survival,
+            "soft_invalidation_stop": survival.get("soft_invalidation_stop") if survival_enabled else original_stop,
+            "hard_stop": hard_stop,
+            "stop_survival_enabled": survival_enabled,
+            "stop_was_fixed_before_entry": True,
+            "stop_can_widen_after_entry": False,
+            "size_calculated_from_hard_stop": True,
             "max_hold_minutes": lane.get("max_hold_minutes"),
             "experimental": bool(lane.get("paper_only")),
             "portfolio_mode": "DEFENSIVE_LEARNING" if defensive else "NORMAL",
@@ -220,7 +241,7 @@ async def execute_unified_heart_contracts(
             "signal_id": row["signal_id"], "symbol": symbol, "side": side,
             "grade": "HEART" if lane_name == "TACTICAL" else "EARLY" if lane_name == "AGGRESSIVE_PAPER" else "SWING",
             "score": _f(lane.get("ignition_score"), _f(lane.get("trajectory_score"), _f(row.get("setup_score")))),
-            "leverage": lane_leverage, "entry": fill, "stop": stop, "target": target,
+            "leverage": lane_leverage, "entry": fill, "stop": hard_stop, "target": target,
             "quantity": sizing["quantity"], "notional": sizing["notional"], "margin": sizing["margin"],
             "risk_usdt": sizing["risk_usdt"], "opened_at": datetime.now(timezone.utc), "metadata": json.dumps(metadata),
         })
@@ -232,11 +253,23 @@ async def execute_unified_heart_contracts(
             await mark_thesis_entered(db, symbol)
 
         opened_items.append({
-            "symbol": symbol, "lane": lane_name, "side": side, "entry": fill, "stop": stop, "target": target,
-            "target_name": lane.get("target_name"), "risk_usdt": sizing["risk_usdt"], "leverage": lane_leverage,
-            "max_hold_minutes": lane.get("max_hold_minutes"), "defensive_learning": defensive,
-            "conviction_score": conviction.get("conviction_score"), "conviction_tier": conviction.get("tier"),
-            "conviction_risk_multiplier": conviction_multiplier, "portfolio_risk_multiplier": portfolio_multiplier,
+            "symbol": symbol,
+            "lane": lane_name,
+            "side": side,
+            "entry": fill,
+            "soft_invalidation_stop": metadata["soft_invalidation_stop"],
+            "hard_stop": hard_stop,
+            "stop_survival_enabled": survival_enabled,
+            "target": target,
+            "target_name": survival.get("target_name") if survival_enabled else lane.get("target_name"),
+            "risk_usdt": sizing["risk_usdt"],
+            "leverage": lane_leverage,
+            "max_hold_minutes": lane.get("max_hold_minutes"),
+            "defensive_learning": defensive,
+            "conviction_score": conviction.get("conviction_score"),
+            "conviction_tier": conviction.get("tier"),
+            "conviction_risk_multiplier": conviction_multiplier,
+            "portfolio_risk_multiplier": portfolio_multiplier,
             "elliott": conviction.get("elliott"),
         })
 
@@ -246,13 +279,25 @@ async def execute_unified_heart_contracts(
     else:
         reason = "no_defensive_learning_candidate" if defensive else "no_executable_heart_contract"
     return {
-        "version": VERSION, "opened": len(opened_items), "trades": opened_items, "reason": reason,
-        "signals_checked": len(rows), "candidates": len(candidates), "rejected": rejected,
-        "defensive": defensive, "defensive_learning_enabled": defensive,
+        "version": VERSION,
+        "opened": len(opened_items),
+        "trades": opened_items,
+        "reason": reason,
+        "signals_checked": len(rows),
+        "candidates": len(candidates),
+        "rejected": rejected,
+        "defensive": defensive,
+        "defensive_learning_enabled": defensive,
         "risk_policy": {
-            "base_account_risk_pct": 1.0, "min_conviction_multiplier": 0.25, "max_conviction_multiplier": 1.50,
-            "max_target_account_risk_pct": 1.50, "defensive_cap_multiplier": DEFENSIVE_RISK_CAP,
-            "aggressive_max_multiplier": 0.50, "swing_max_multiplier": 1.25,
+            "base_account_risk_pct": 1.0,
+            "min_conviction_multiplier": 0.25,
+            "max_conviction_multiplier": 1.50,
+            "max_target_account_risk_pct": 1.50,
+            "defensive_cap_multiplier": DEFENSIVE_RISK_CAP,
+            "aggressive_max_multiplier": 0.50,
+            "swing_max_multiplier": 1.25,
             "elliott_is_bounded_evidence": True,
+            "stop_survival_sizes_from_hard_stop": True,
+            "stop_never_widens_after_entry": True,
         },
     }
