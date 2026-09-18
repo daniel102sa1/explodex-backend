@@ -7,9 +7,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.execution_math import choose_target_for_min_net_rr
+from app.services.lane_chase_guard import get_or_create_lane_anchor
 from app.services.pre_event_prediction import build_pre_event_prediction
 
-VERSION = "pre_event_persistence_v1"
+VERSION = "pre_event_persistence_v2_no_chase_anchor"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -56,6 +57,8 @@ async def persist_pre_event_for_run(db: AsyncSession, run_id: str) -> dict[str, 
     updated = 0
     candidates = 0
     lane_created = 0
+    no_chase = 0
+    waiting_original_zone = 0
     rejected: dict[str, int] = {}
 
     def reject(name: str) -> None:
@@ -97,9 +100,47 @@ async def persist_pre_event_for_run(db: AsyncSession, run_id: str) -> dict[str, 
         supporting = int(pre.get("supporting_signals") or 0)
         risk_score = _f(row.get("risk_score"), 100.0)
         current = _f(row.get("current_price"))
+        metrics = _d(reason.get("metrics"))
         plan = _d(heart.get("plan"))
         stop = _f(plan.get("stop_loss"))
         targets = [("TP1", _f(plan.get("tp1"))), ("TP2", _f(plan.get("tp2"))), ("TP3", _f(plan.get("tp3")))]
+
+        # Capture the origin as soon as the precursor becomes a valid candidate
+        # and agrees with the Heart, even if a higher-priority lane currently
+        # exists. This prevents PRE_EVENT from anchoring later at a worse price.
+        precursor_origin_valid = bool(
+            pre.get("paper_candidate")
+            and primary_direction in {"LONG", "SHORT"}
+            and pre_direction == primary_direction
+            and preparation >= 68
+            and supporting >= 4
+            and current > 0
+            and stop > 0
+        )
+
+        half_band_pct = 0.18
+        proposed_low = current * (1.0 - half_band_pct / 100.0) if current > 0 else 0.0
+        proposed_high = current * (1.0 + half_band_pct / 100.0) if current > 0 else 0.0
+
+        anchor = await get_or_create_lane_anchor(
+            db,
+            symbol=str(row.get("symbol") or ""),
+            lane="PRE_EVENT_PAPER",
+            direction=pre_direction,
+            current_price=current,
+            proposed_entry_low=proposed_low,
+            proposed_entry_high=proposed_high,
+            invalidation_price=stop,
+            atr_pct=_f(metrics.get("atr_pct"), 0.8),
+            ttl_minutes=240,
+            create_allowed=precursor_origin_valid,
+        )
+
+        entry_low = _f(anchor.get("entry_low"), proposed_low)
+        entry_high = _f(anchor.get("entry_high"), proposed_high)
+        anchor_status = str(anchor.get("status") or "")
+        anchor_reason = str(anchor.get("reason") or "")
+        anchor_entry_ok = bool(anchor.get("eligible_now"))
 
         blockers: list[str] = []
         if existing_lane:
@@ -119,8 +160,21 @@ async def persist_pre_event_for_run(db: AsyncSession, run_id: str) -> dict[str, 
         if current <= 0 or stop <= 0:
             blockers.append("missing_price_or_stop")
 
+        if precursor_origin_valid and not anchor_entry_ok:
+            if anchor_status == "NO_CHASE":
+                blockers.append("pre_event_no_chase_original_zone")
+                no_chase += 1
+            elif anchor_status == "INVALIDATED":
+                blockers.append("pre_event_anchor_invalidated")
+            elif anchor_reason == "waiting_original_anchor_zone":
+                blockers.append("pre_event_wait_original_entry_zone")
+                waiting_original_zone += 1
+            elif anchor_status == "NO_ANCHOR":
+                blockers.append("pre_event_anchor_unavailable")
+
         expected_math = {"accepted": False, "reason": "not_evaluated"}
-        if not blockers or set(blockers).issubset({"higher_priority_lane_exists"}):
+        non_math_blockers = [b for b in blockers if b not in {"higher_priority_lane_exists"}]
+        if not non_math_blockers:
             expected_math = choose_target_for_min_net_rr(
                 side=pre_direction,
                 entry=current,
@@ -137,12 +191,6 @@ async def persist_pre_event_for_run(db: AsyncSession, run_id: str) -> dict[str, 
         if target > 0 and not _geometry_ok(pre_direction, current, stop, target):
             blockers.append("invalid_pre_event_geometry")
 
-        # Pre-event uses a narrow live band around the current precursor price;
-        # unlike tactical entry it is intentionally early, but still refuses chase.
-        half_band_pct = 0.18
-        entry_low = current * (1.0 - half_band_pct / 100.0) if current > 0 else 0.0
-        entry_high = current * (1.0 + half_band_pct / 100.0) if current > 0 else 0.0
-
         lane = {
             "lane": "PRE_EVENT_PAPER",
             "paper_only": True,
@@ -151,6 +199,11 @@ async def persist_pre_event_for_run(db: AsyncSession, run_id: str) -> dict[str, 
             "direction": pre_direction,
             "entry_low": round(entry_low, 12),
             "entry_high": round(entry_high, 12),
+            "anchor_price": anchor.get("anchor_price"),
+            "chase_limit": anchor.get("chase_limit"),
+            "entry_zone_frozen": anchor_status not in {"NO_ANCHOR", ""},
+            "entry_zone_recenter_on_scan": False,
+            "lane_anchor": anchor,
             "stop_loss": stop,
             "target_name": chosen.get("name"),
             "target_price": chosen.get("price"),
@@ -170,7 +223,7 @@ async def persist_pre_event_for_run(db: AsyncSession, run_id: str) -> dict[str, 
             "event_risk_multiplier": _f(event.get("risk_multiplier"), 1.0),
             "blockers": list(dict.fromkeys(blockers)),
             "source": "HEART_PRE_EVENT_RESEARCH",
-            "reason": "Entrada PAPER pequeña para aprender precursores antes del evento; nunca crea recomendación real por sí sola.",
+            "reason": "PRE_EVENT usa la primera banda precursora congelada; no puede mover la entrada detrás del precio.",
         }
         lanes = _d(contract.get("lanes"))
         lanes["pre_event_paper"] = lane
@@ -205,7 +258,10 @@ async def persist_pre_event_for_run(db: AsyncSession, run_id: str) -> dict[str, 
         "updated": updated,
         "pre_event_candidates": candidates,
         "pre_event_lanes_created": lane_created,
+        "no_chase": no_chase,
+        "waiting_original_zone": waiting_original_zone,
         "rejected": rejected,
         "paper_only": True,
         "creates_real_entry": False,
+        "entry_zones_frozen": True,
     }
