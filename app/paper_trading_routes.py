@@ -13,6 +13,7 @@ from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
 from app.services.paper_portfolio import ensure_paper_schema, paper_history, paper_summary
+from app.services.paper_quant_risk_guard import paper_quant_risk_guard
 from app.services.paper_range_micro import range_summary, scan_all_eligible_ranges
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.validation_mode import ensure_validation_schema
@@ -60,6 +61,8 @@ async def summary(db: AsyncSession = Depends(get_db)):
             "defensive": execution.get("defensive"),
             "defensive_learning_enabled": execution.get("defensive_learning_enabled"),
             "risk_policy": execution.get("risk_policy"),
+            "quant_risk_guard": latest.get("quant_risk_guard"),
+            "effective_new_entry_risk_multiplier": latest.get("effective_new_entry_risk_multiplier"),
             "trades": (execution.get("trades") or [])[:8],
         }
     else:
@@ -72,6 +75,7 @@ async def summary(db: AsyncSession = Depends(get_db)):
     result["range_micro"] = await _safe_component(db, "range_micro", range_summary)
     result["micro_scalp"] = await _safe_component(db, "micro_scalp", micro_summary)
     result["loss_autopsy"] = await _safe_component(db, "loss_autopsy", lambda session: loss_autopsy_report(session, days=30))
+    result["quant_risk_guard"] = await _safe_component(db, "quant_risk_guard", paper_quant_risk_guard)
     return result
 
 
@@ -85,6 +89,12 @@ async def adaptive_edge_lab(days: int = Query(default=30, ge=1, le=365), db: Asy
 async def paper_loss_autopsy(days: int = Query(default=30, ge=1, le=365), db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
     return await loss_autopsy_report(db, days=days)
+
+
+@router.get("/quant-risk")
+async def quant_risk(db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return await paper_quant_risk_guard(db)
 
 
 @router.get("/history")
