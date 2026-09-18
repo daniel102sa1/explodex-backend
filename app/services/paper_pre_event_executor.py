@@ -8,10 +8,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.lane_chase_guard import mark_lane_anchor_used
 from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.stop_survival_engine import build_stop_survival_plan
 
-VERSION = "paper_pre_event_executor_v1"
+VERSION = "paper_pre_event_executor_v2_no_chase_anchor"
 MAX_NEW = 1
 
 
@@ -103,6 +104,7 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
             ON CONFLICT (signal_id) DO NOTHING
         """), {"signal_id":row["signal_id"],"symbol":symbol,"side":side,"score":_f(lane.get("preparation_score")),"leverage":leverage,"entry":fill,"stop":hard_stop,"target":live_target,"quantity":sizing["quantity"],"notional":sizing["notional"],"margin":sizing["margin"],"risk_usdt":sizing["risk_usdt"],"opened_at":datetime.now(timezone.utc),"metadata":json.dumps(metadata)})
         if not result.rowcount: reject("duplicate_signal"); continue
+        await mark_lane_anchor_used(db, symbol=symbol, lane="PRE_EVENT_PAPER")
         opened.append({"symbol":symbol,"lane":"PRE_EVENT_PAPER","side":side,"entry":fill,"hard_stop":hard_stop,"target":live_target,"risk_usdt":sizing["risk_usdt"],"preparation_score":lane.get("preparation_score"),"pre_event_type":lane.get("pre_event_type"),"defensive":defensive})
 
     await db.commit()
