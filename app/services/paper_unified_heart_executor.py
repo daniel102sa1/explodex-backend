@@ -8,11 +8,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.lane_chase_guard import mark_lane_anchor_used
 from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 
-VERSION = "paper_unified_heart_executor_v5_stop_survival"
+VERSION = "paper_unified_heart_executor_v6_no_chase_anchor"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -251,6 +252,8 @@ async def execute_unified_heart_contracts(
 
         if lane_name == "TACTICAL":
             await mark_thesis_entered(db, symbol)
+        elif lane_name == "SWING_PAPER":
+            await mark_lane_anchor_used(db, symbol=symbol, lane="SWING_PAPER")
 
         opened_items.append({
             "symbol": symbol,
