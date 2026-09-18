@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from math import sqrt
-from statistics import mean
+from math import ceil, log, sqrt
+from statistics import mean, stdev
 from typing import Any
 
 from sqlalchemy import text
@@ -26,7 +26,42 @@ def _wilson(wins: int, total: int, z: float = 1.96) -> float | None:
     return max(0.0, (center - margin) / denominator) * 100.0
 
 
-def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _quant_stats(r_values: list[float], trials: int = 1) -> dict[str, Any]:
+    if not r_values:
+        return {
+            "trade_sharpe": None,
+            "trade_sortino": None,
+            "cvar_95_r": None,
+            "deflated_sharpe_proxy": None,
+            "deflated_sharpe_is_exact": False,
+        }
+
+    avg = mean(r_values)
+    sigma = stdev(r_values) if len(r_values) >= 2 else 0.0
+    sharpe = avg / sigma if sigma > 1e-12 else (999.0 if avg > 0 else 0.0)
+
+    downside = [min(0.0, value) for value in r_values]
+    downside_rms = sqrt(sum(value * value for value in downside) / len(downside))
+    sortino = avg / downside_rms if downside_rms > 1e-12 else (999.0 if avg > 0 else 0.0)
+
+    tail_n = max(1, ceil(len(r_values) * 0.05))
+    cvar = mean(sorted(r_values)[:tail_n])
+
+    effective_trials = max(1, int(trials))
+    penalty = sqrt(2.0 * log(effective_trials) / max(1, len(r_values))) if effective_trials > 1 else 0.0
+    deflated_proxy = sharpe - penalty if sharpe != 999.0 else sharpe
+
+    return {
+        "trade_sharpe": round(sharpe, 4),
+        "trade_sortino": round(sortino, 4),
+        "cvar_95_r": round(cvar, 4),
+        "deflated_sharpe_proxy": round(deflated_proxy, 4),
+        "deflated_sharpe_is_exact": False,
+        "multiple_testing_trials_proxy": effective_trials,
+    }
+
+
+def _summary(rows: list[dict[str, Any]], *, trials: int = 1) -> dict[str, Any]:
     decided = [row for row in rows if row.get("outcome") in {"TP1_FIRST", "STOP_FIRST"}]
     wins = sum(1 for row in decided if row.get("outcome") == "TP1_FIRST")
     losses = len(decided) - wins
@@ -42,6 +77,16 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if wilson is not None and avg_rr is not None:
         p = wilson / 100.0
         conservative_ev = p * avg_rr - (1.0 - p)
+
+    r_values = []
+    for row in decided:
+        if row.get("outcome") == "STOP_FIRST":
+            r_values.append(-1.0)
+        else:
+            reward_r = _f(row.get("rr1"))
+            if reward_r > 0:
+                r_values.append(reward_r)
+
     return {
         "sample": len(decided),
         "wins": wins,
@@ -51,6 +96,7 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_rr1": avg_rr,
         "observed_ev_r": ev,
         "conservative_ev_r": conservative_ev,
+        **_quant_stats(r_values, trials=trials),
     }
 
 
@@ -63,14 +109,37 @@ def _cohort_key(row: dict[str, Any]) -> tuple[str, str, str]:
     return direction, regime, bucket
 
 
+def _regime_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        regime = str(row.get("market_regime") or "N/D")
+        counts[regime] = counts.get(regime, 0) + 1
+    total = sum(counts.values())
+    dominant_share = max(counts.values()) / total * 100.0 if total and counts else 0.0
+    meaningful = [name for name, n in counts.items() if name != "N/D" and n >= max(5, int(total * 0.05))]
+    if len(meaningful) >= 3 and dominant_share <= 75.0:
+        status = "BROAD"
+    elif len(meaningful) >= 2 and dominant_share <= 85.0:
+        status = "MODERATE"
+    else:
+        status = "LIMITED"
+    return {
+        "status": status,
+        "regime_counts": counts,
+        "meaningful_regimes": meaningful,
+        "dominant_regime_share_pct": round(dominant_share, 2),
+    }
+
+
 def _cohort_reports(train: list[dict[str, Any]], test: list[dict[str, Any]]) -> list[dict[str, Any]]:
     keys = sorted(set(_cohort_key(row) for row in train + test))
+    trials = max(1, len(keys))
     reports: list[dict[str, Any]] = []
     for key in keys:
         train_rows = [row for row in train if _cohort_key(row) == key]
         test_rows = [row for row in test if _cohort_key(row) == key]
-        train_summary = _summary(train_rows)
-        test_summary = _summary(test_rows)
+        train_summary = _summary(train_rows, trials=trials)
+        test_summary = _summary(test_rows, trials=trials)
         train_usable = train_summary["sample"] >= 30
         test_usable = test_summary["sample"] >= 12
         stability = "LEARNING"
@@ -115,15 +184,20 @@ async def build_walk_forward_report(db: AsyncSession, limit: int = 1200) -> dict
     )
     rows = [dict(row) for row in result.mappings().all()]
     total = len(rows)
+    cohort_trials = max(1, len(set(_cohort_key(row) for row in rows)))
+    coverage = _regime_coverage(rows)
+
     if total < 60:
         return {
             "mode": "SHADOW_ONLY",
             "status": "LEARNING",
             "total_sample": total,
             "minimum_required": 60,
-            "train": _summary(rows),
-            "test": _summary([]),
+            "train": _summary(rows, trials=cohort_trials),
+            "test": _summary([], trials=cohort_trials),
             "cohorts": [],
+            "regime_coverage": coverage,
+            "multiple_testing_trials_proxy": cohort_trials,
             "rule": "Walk-forward stays inactive until at least 60 chronologically resolved outcomes exist.",
             "can_create_entry": False,
         }
@@ -132,8 +206,8 @@ async def build_walk_forward_report(db: AsyncSession, limit: int = 1200) -> dict
     split = min(split, total - 18)
     train = rows[:split]
     test = rows[split:]
-    train_summary = _summary(train)
-    test_summary = _summary(test)
+    train_summary = _summary(train, trials=cohort_trials)
+    test_summary = _summary(test, trials=cohort_trials)
     cohorts = _cohort_reports(train, test)
 
     train_ev = train_summary.get("conservative_ev_r")
@@ -146,6 +220,13 @@ async def build_walk_forward_report(db: AsyncSession, limit: int = 1200) -> dict
     elif train_ev is None or train_ev <= 0:
         status = "NO_TRAIN_EDGE"
 
+    robust_validation = bool(
+        status == "HOLDS_OUT_OF_SAMPLE"
+        and coverage.get("status") in {"BROAD", "MODERATE"}
+        and _f(test_summary.get("deflated_sharpe_proxy"), -999.0) > 0
+        and test_summary.get("sample", 0) >= 18
+    )
+
     return {
         "mode": "SHADOW_ONLY",
         "status": status,
@@ -156,7 +237,11 @@ async def build_walk_forward_report(db: AsyncSession, limit: int = 1200) -> dict
         "cohorts": cohorts,
         "holding_cohorts": [row for row in cohorts if row["stability"] == "HOLDS_OUT_OF_SAMPLE"][:8],
         "failed_cohorts": [row for row in cohorts if row["stability"] == "FAILED_OUT_OF_SAMPLE"][:8],
+        "regime_coverage": coverage,
+        "multiple_testing_trials_proxy": cohort_trials,
+        "robust_validation_pass": robust_validation,
         "can_create_entry": False,
         "rule": "Training always precedes testing chronologically. Test outcomes never tune their own historical thresholds.",
         "probability_note": "Out-of-sample rates are validation statistics, not guaranteed probabilities for the next trade.",
+        "quant_note": "Sharpe/Sortino are trade-level R diagnostics. CVaR is the average worst 5% R outcomes. Deflated Sharpe is a conservative multiple-testing proxy until the full search-trial history is persisted.",
     }
