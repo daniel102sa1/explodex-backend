@@ -6,9 +6,10 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.lane_chase_guard import get_or_create_lane_anchor
 from app.services.trajectory_forecast import build_trajectory_forecast
 
-VERSION = "trajectory_persistence_v1"
+VERSION = "trajectory_persistence_v2_no_chase_anchor"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -44,6 +45,8 @@ async def persist_trajectory_for_run(db: AsyncSession, run_id: str) -> dict[str,
 
     updated = 0
     swing_ready = 0
+    no_chase = 0
+    waiting_original_zone = 0
     by_direction = {"LONG": 0, "SHORT": 0}
 
     for raw in rows:
@@ -66,6 +69,58 @@ async def persist_trajectory_for_run(db: AsyncSession, run_id: str) -> dict[str,
             "metrics": metrics,
         }
         trajectory = build_trajectory_forecast(score, prediction, htf, liquidity)
+        base_ready = bool(trajectory.get("should_enter_paper_swing"))
+        plan = _d(trajectory.get("swing_plan"))
+        direction = str(trajectory.get("direction") or "").upper()
+        current = _f(row.get("current_price"))
+        max_hold = int(trajectory.get("max_hold_minutes") or plan.get("max_hold_minutes") or 720)
+
+        anchor = await get_or_create_lane_anchor(
+            db,
+            symbol=str(row.get("symbol") or ""),
+            lane="SWING_PAPER",
+            direction=direction,
+            current_price=current,
+            proposed_entry_low=_f(plan.get("entry_low")),
+            proposed_entry_high=_f(plan.get("entry_high")),
+            invalidation_price=_f(plan.get("structural_stop")),
+            atr_pct=_f(metrics.get("atr_pct"), _f(plan.get("robust_4h_range_pct"), 0.8)),
+            ttl_minutes=min(720, max(180, max_hold // 2)),
+            create_allowed=base_ready,
+        )
+
+        if anchor.get("status") not in {"NO_ANCHOR", None}:
+            plan["entry_low"] = anchor.get("entry_low")
+            plan["entry_high"] = anchor.get("entry_high")
+            plan["anchor_price"] = anchor.get("anchor_price")
+            plan["chase_limit"] = anchor.get("chase_limit")
+            plan["entry_zone_frozen"] = True
+            plan["entry_zone_recenter_on_scan"] = False
+            trajectory["swing_plan"] = plan
+
+        anchor_reason = str(anchor.get("reason") or "")
+        anchor_status = str(anchor.get("status") or "")
+        anchor_entry_ok = bool(anchor.get("eligible_now"))
+        trajectory["lane_anchor"] = anchor
+        trajectory["chase_risk"] = anchor_status == "NO_CHASE"
+        trajectory["entry_zone_frozen"] = anchor_status not in {"NO_ANCHOR", ""}
+        trajectory["entry_zone_recenter_on_scan"] = False
+        trajectory["should_enter_paper_swing"] = bool(base_ready and anchor_entry_ok)
+
+        blockers = list(trajectory.get("blockers") or [])
+        if base_ready and not anchor_entry_ok:
+            if anchor_status == "NO_CHASE":
+                blockers.append("swing_no_chase_original_zone")
+                no_chase += 1
+            elif anchor_status == "INVALIDATED":
+                blockers.append("swing_anchor_invalidated")
+            elif anchor_reason == "waiting_original_anchor_zone":
+                blockers.append("swing_wait_original_entry_zone")
+                waiting_original_zone += 1
+            elif anchor_status == "NO_ANCHOR":
+                blockers.append("swing_anchor_unavailable")
+        trajectory["blockers"] = list(dict.fromkeys(blockers))
+
         heart["trajectory_forecast"] = trajectory
         heart["trajectory_lane"] = {
             "paper_only": True,
@@ -73,10 +128,15 @@ async def persist_trajectory_for_run(db: AsyncSession, run_id: str) -> dict[str,
             "action": (
                 f"SWING_{trajectory.get('direction')}"
                 if trajectory.get("should_enter_paper_swing")
+                else "NO_CHASE_ESPERAR_RETEST"
+                if trajectory.get("chase_risk")
                 else "OBSERVAR_TRAYECTORIA"
             ),
             "horizon": trajectory.get("horizon"),
-            "message": "La trayectoria no obliga al Heart táctico a entrar; sirve para PAPER de 4h-48h.",
+            "anchor": anchor,
+            "message": (
+                "SWING usa la primera zona válida congelada; los scans posteriores no pueden moverla detrás del precio."
+            ),
         }
         reason["explodex_heart"] = heart
         prediction["explodex_heart"] = heart
@@ -89,7 +149,6 @@ async def persist_trajectory_for_run(db: AsyncSession, run_id: str) -> dict[str,
         updated += 1
         if trajectory.get("should_enter_paper_swing"):
             swing_ready += 1
-            direction = str(trajectory.get("direction") or "")
             if direction in by_direction:
                 by_direction[direction] += 1
 
@@ -99,5 +158,8 @@ async def persist_trajectory_for_run(db: AsyncSession, run_id: str) -> dict[str,
         "seen": len(rows),
         "updated": updated,
         "swing_ready": swing_ready,
+        "no_chase": no_chase,
+        "waiting_original_zone": waiting_original_zone,
         "by_direction": by_direction,
+        "entry_zones_frozen": True,
     }
