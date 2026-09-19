@@ -29,6 +29,9 @@ def test_micro_scalp_accepts_mild_liquid_trend_without_chase():
     assert result["strategy_mode"] == "MICRO_SCALP"
     assert result["side"] == "LONG"
     assert result["stop_loss"] < result["entry_reference"] < result["take_profit"]
+    assert result["take_profit"] == result["tp1"]
+    assert result["tp1"] < result["tp2"] < result["tp3"]
+    assert result["technical_plan"]["stop_distance_atr"] >= 0.85
     assert result["tier"] in {"STANDARD", "EXPLORATION"}
 
 
@@ -70,3 +73,33 @@ def test_micro_cost_gate_accepts_net_positive_and_rejects_tiny_move():
     assert good["projected_gross_pnl"] > good["projected_net_pnl"]
     assert good["allowed"] is True
     assert tiny["allowed"] is False
+
+
+def test_fundamental_conflict_never_moves_stop_and_caps_runner():
+    base_result = {
+        "eligible": True,
+        "actionable": True,
+        "tier": "STANDARD",
+        "side": "LONG",
+        "score": 80.0,
+        "entry_reference": 100.0,
+        "stop_loss": 99.0,
+        "stop_distance": 1.0,
+        "target_distance": 1.25,
+        "tp1_distance": 1.25,
+        "tp2_distance": 2.0,
+        "tp3_distance": 3.0,
+        "tp1": 101.25,
+        "tp2": 102.0,
+        "tp3": 103.0,
+    }
+    updated = __import__("app.services.paper_micro_scalp", fromlist=["_apply_fundamental_context"])._apply_fundamental_context(
+        base_result,
+        {"sentiment": "NEGATIVE", "score_adjustment": -5.0, "headline_count": 4},
+    )
+
+    assert updated["stop_loss"] == 99.0
+    assert updated["tp1"] == 101.25
+    assert updated["tp2"] <= 101.75 + 1e-9
+    assert updated["tp3"] <= 102.40 + 1e-9
+    assert updated["fundamental_context"]["conflicts_with_side"] is True

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
 from app.services.binance import binance_client
+from app.services.news_context import news_context_for_symbol
 
 MICRO_SCAN_INTERVAL_SECONDS = 180
 MICRO_UNIVERSE_LIMIT = 40
@@ -70,6 +71,171 @@ def _atr(rows: list[list[Any]], period: int = 14) -> float:
         prev_close = close
     sample = trs[-period:]
     return sum(sample) / len(sample) if sample else 0.0
+
+
+
+def _technical_trade_plan(
+    *,
+    last: float,
+    atr: float,
+    highs: list[float],
+    lows: list[float],
+    side: str,
+    setup_type: str,
+    recent_high: float,
+    recent_low: float,
+) -> dict[str, Any]:
+    """Build SL/TP geometry from structure + ATR, not a fixed tiny percentage.
+
+    The stop is placed beyond the pre-entry swing with an ATR buffer and is never
+    widened after entry. Position sizing absorbs the wider distance. Targets use
+    R multiples capped by nearby favorable structure when that structure is
+    meaningful; TP1 must still offer at least 1.05R before costs.
+    """
+    prior_lows = lows[-13:-1] or lows[-12:]
+    prior_highs = highs[-13:-1] or highs[-12:]
+    structural_level = min(prior_lows) if side == "LONG" else max(prior_highs)
+    structure_buffer = atr * 0.25
+
+    raw_stop = structural_level - structure_buffer if side == "LONG" else structural_level + structure_buffer
+    structure_distance = abs(last - raw_stop)
+    min_stop_distance = max(last * 0.0032, atr * 0.85)
+    stop_distance = max(structure_distance, min_stop_distance)
+    max_stop_distance = max(last * 0.020, atr * 3.20)
+    if stop_distance > max_stop_distance:
+        return {
+            "eligible": False,
+            "reason": "structural_stop_too_wide",
+            "structural_level": structural_level,
+            "stop_distance": stop_distance,
+            "stop_distance_atr": stop_distance / atr if atr > 0 else None,
+        }
+
+    stop = last - stop_distance if side == "LONG" else last + stop_distance
+    risk = stop_distance
+
+    # Structural magnets from several horizons. Ignore levels inside 1.05R for
+    # TP1 because there is not enough reward to justify the stop distance.
+    levels: list[float] = []
+    for window in (12, 24, 48, 72):
+        hs = highs[-window:-1] if len(highs) > 1 else highs
+        ls = lows[-window:-1] if len(lows) > 1 else lows
+        if not hs or not ls:
+            continue
+        level = max(hs) if side == "LONG" else min(ls)
+        favorable = level > last if side == "LONG" else level < last
+        if favorable:
+            levels.append(level)
+
+    if setup_type == "MICRO_MEAN_REVERSION":
+        midpoint = (recent_high + recent_low) / 2.0
+        favorable_mid = midpoint > last if side == "LONG" else midpoint < last
+        if favorable_mid:
+            levels.append(midpoint)
+
+    # Deduplicate close prices while keeping the nearest favorable magnet first.
+    unique_levels = sorted(
+        {round(level, 12) for level in levels},
+        key=lambda level: abs(level - last),
+    )
+    level_distances = [abs(level - last) for level in unique_levels]
+
+    def choose_distance(base_r: float, min_structure_r: float) -> float:
+        base_distance = risk * base_r
+        usable = [d for d in level_distances if d >= risk * min_structure_r]
+        if usable:
+            return min(base_distance, usable[0])
+        return base_distance
+
+    tp1_distance = choose_distance(1.25, 1.05)
+    if tp1_distance / risk < 1.05:
+        return {
+            "eligible": False,
+            "reason": "poor_tp1_rr",
+            "structural_level": structural_level,
+            "stop_distance": stop_distance,
+        }
+    tp2_distance = max(tp1_distance + risk * 0.35, choose_distance(2.0, 1.60))
+    tp3_distance = max(tp2_distance + risk * 0.50, choose_distance(3.0, 2.40))
+
+    if side == "LONG":
+        tp1, tp2, tp3 = last + tp1_distance, last + tp2_distance, last + tp3_distance
+    else:
+        tp1, tp2, tp3 = last - tp1_distance, last - tp2_distance, last - tp3_distance
+
+    return {
+        "eligible": True,
+        "stop_loss": stop,
+        "stop_distance": stop_distance,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "tp1_distance": tp1_distance,
+        "tp2_distance": tp2_distance,
+        "tp3_distance": tp3_distance,
+        "target_distance": tp1_distance,
+        "structural_level": structural_level,
+        "structure_buffer_atr": 0.25,
+        "stop_distance_atr": stop_distance / atr if atr > 0 else None,
+        "tp1_rr": tp1_distance / risk if risk > 0 else None,
+        "tp2_rr": tp2_distance / risk if risk > 0 else None,
+        "tp3_rr": tp3_distance / risk if risk > 0 else None,
+        "structural_magnets": unique_levels[:4],
+        "rule": "SL beyond structure + ATR buffer; TP1/TP2/TP3 use R and nearby structure.",
+    }
+
+
+def _apply_fundamental_context(result: dict[str, Any], news: dict[str, Any] | None) -> dict[str, Any]:
+    """Use news/fundamental context as a risk/ambition filter, never as a raw price oracle."""
+    out = dict(result)
+    payload = news if isinstance(news, dict) else {}
+    sentiment = str(payload.get("sentiment") or "UNAVAILABLE").upper()
+    side = str(out.get("side") or "").upper()
+    adjustment = _f(payload.get("score_adjustment"))
+
+    aligned = (side == "LONG" and sentiment == "POSITIVE") or (side == "SHORT" and sentiment == "NEGATIVE")
+    conflict = (side == "LONG" and sentiment == "NEGATIVE") or (side == "SHORT" and sentiment == "POSITIVE")
+
+    entry = _f(out.get("entry_reference"))
+    risk = _f(out.get("stop_distance"))
+    tp1_distance = _f(out.get("tp1_distance"), _f(out.get("target_distance")))
+    tp2_distance = _f(out.get("tp2_distance"), risk * 2.0)
+    tp3_distance = _f(out.get("tp3_distance"), risk * 3.0)
+
+    # Fundamentals/news do not move the SL. When context conflicts, cap the
+    # runner ambition and require the technical trade to pay sooner.
+    if conflict and risk > 0:
+        tp2_distance = max(tp1_distance + risk * 0.30, min(tp2_distance, risk * 1.75))
+        tp3_distance = max(tp2_distance + risk * 0.40, min(tp3_distance, risk * 2.40))
+        out["score"] = round(max(0.0, _f(out.get("score")) - min(5.0, abs(adjustment))), 2)
+        if str(out.get("tier")) == "EXPLORATION" and abs(adjustment) >= 3.75:
+            out["eligible"] = False
+            out["actionable"] = False
+            out["reason"] = "strong_fundamental_conflict"
+    elif aligned:
+        out["score"] = round(min(100.0, _f(out.get("score")) + min(3.0, abs(adjustment) * 0.5)), 2)
+
+    if entry > 0 and risk > 0:
+        if side == "LONG":
+            out["tp2"] = entry + tp2_distance
+            out["tp3"] = entry + tp3_distance
+        elif side == "SHORT":
+            out["tp2"] = entry - tp2_distance
+            out["tp3"] = entry - tp3_distance
+        out["tp2_distance"] = tp2_distance
+        out["tp3_distance"] = tp3_distance
+
+    out["fundamental_context"] = {
+        "source": "news_context",
+        "sentiment": sentiment,
+        "score_adjustment": adjustment,
+        "aligned_with_side": aligned,
+        "conflicts_with_side": conflict,
+        "headline_count": int(payload.get("headline_count") or 0),
+        "runner_allowed": not conflict,
+        "rule": "Fundamental/news context can veto or cap TP2/TP3 ambition; it never widens SL.",
+    }
+    return out
 
 
 def analyze_micro_scalp(rows: list[list[Any]]) -> dict[str, Any]:
@@ -160,23 +326,31 @@ def analyze_micro_scalp(rows: list[list[Any]]) -> dict[str, Any]:
         + candle_quality * 0.12
     )
 
-    target_distance = max(last * 0.0040, atr * 0.90)
-    stop_distance = max(last * 0.0032, atr * 0.65)
-    target_distance = min(target_distance, last * 0.012)
-    stop_distance = min(stop_distance, last * 0.009)
+    plan = _technical_trade_plan(
+        last=last,
+        atr=atr,
+        highs=highs,
+        lows=lows,
+        side=side,
+        setup_type=setup_type,
+        recent_high=recent_high,
+        recent_low=recent_low,
+    )
+    if not plan.get("eligible"):
+        return {
+            "eligible": False,
+            "reason": str(plan.get("reason") or "invalid_trade_geometry"),
+            "side": side,
+            "setup_type": setup_type,
+            "score": round(score, 2),
+            "atr_pct": round(atr_pct, 4),
+            "technical_plan": plan,
+        }
 
-    if setup_type == "MICRO_MEAN_REVERSION":
-        midpoint = (recent_high + recent_low) / 2.0
-        structural_distance = midpoint - last if side == "LONG" else last - midpoint
-        if structural_distance > target_distance * 0.75:
-            target_distance = min(max(target_distance, structural_distance), last * 0.012)
-
-    if side == "LONG":
-        stop = last - stop_distance
-        target = last + target_distance
-    else:
-        stop = last + stop_distance
-        target = last - target_distance
+    stop = _f(plan.get("stop_loss"))
+    target = _f(plan.get("tp1"))
+    stop_distance = _f(plan.get("stop_distance"))
+    target_distance = _f(plan.get("tp1_distance"))
 
     tier = "STANDARD" if score >= STANDARD_SCORE else "EXPLORATION" if score >= EXPLORATION_SCORE else "REJECT"
     return {
@@ -190,8 +364,15 @@ def analyze_micro_scalp(rows: list[list[Any]]) -> dict[str, Any]:
         "entry_reference": last,
         "stop_loss": stop,
         "take_profit": target,
+        "tp1": target,
+        "tp2": _f(plan.get("tp2")),
+        "tp3": _f(plan.get("tp3")),
         "stop_distance": stop_distance,
         "target_distance": target_distance,
+        "tp1_distance": _f(plan.get("tp1_distance")),
+        "tp2_distance": _f(plan.get("tp2_distance")),
+        "tp3_distance": _f(plan.get("tp3_distance")),
+        "technical_plan": plan,
         "atr_pct": round(atr_pct, 4),
         "momentum_3_pct": round(momentum_3_pct, 4),
         "volume_ratio": round(volume_ratio, 4),
@@ -323,6 +504,22 @@ async def scan_micro_scalps(db: AsyncSession, *, force: bool = False) -> dict[st
     if len(selected) < 3:
         selected.extend(exploration[: 3 - len(selected)])
 
+    # Fundamental/news context is intentionally fetched only for finalists so
+    # the scanner stays fast. It can cap target ambition or veto a weak setup,
+    # but it never invents a direction or moves the technical SL.
+    enriched: list[tuple[str, float, dict[str, Any]]] = []
+    for symbol, quote_volume, result in selected:
+        try:
+            news = await news_context_for_symbol(symbol)
+        except Exception:
+            news = {"sentiment": "UNAVAILABLE", "score_adjustment": 0.0, "headline_count": 0}
+        updated = _apply_fundamental_context(result, news)
+        if not updated.get("eligible", True):
+            reasons[str(updated.get("reason") or "fundamental_rejected")] += 1
+            continue
+        enriched.append((symbol, quote_volume, updated))
+    selected = enriched
+
     inserted = 0
     for symbol, quote_volume, result in selected:
         duplicate = (await db.execute(text("""
@@ -419,13 +616,17 @@ async def open_micro_positions(db: AsyncSession) -> dict[str, Any]:
                 meta = {}
         side = str(row["side"]).upper()
         stop_distance = base._f(meta.get("stop_distance"), abs(entry_ref - base._f(row["stop_loss"])))
-        target_distance = base._f(meta.get("target_distance"), abs(base._f(row["take_profit"]) - entry_ref))
-        if stop_distance <= 0 or target_distance <= 0:
+        target_distance = base._f(meta.get("tp1_distance"), base._f(meta.get("target_distance"), abs(base._f(row["take_profit"]) - entry_ref)))
+        tp2_distance = base._f(meta.get("tp2_distance"), target_distance * 1.6)
+        tp3_distance = base._f(meta.get("tp3_distance"), target_distance * 2.4)
+        if min(stop_distance, target_distance, tp2_distance, tp3_distance) <= 0:
             skipped += 1
             continue
 
         stop = fill - stop_distance if side == "LONG" else fill + stop_distance
         target = fill + target_distance if side == "LONG" else fill - target_distance
+        tp2 = fill + tp2_distance if side == "LONG" else fill - tp2_distance
+        tp3 = fill + tp3_distance if side == "LONG" else fill - tp3_distance
         leverage = 2
         sizing = size_micro_position(balance, fill, stop, leverage)
         gate = micro_net_profit_gate(
@@ -452,6 +653,11 @@ async def open_micro_positions(db: AsyncSession) -> dict[str, Any]:
             "micro_setup_type": row.get("setup_type"),
             "micro_score": base._f(row.get("score")),
             "projected_net_gate": gate,
+            "tp1": target,
+            "tp2": tp2,
+            "tp3": tp3,
+            "technical_plan": meta.get("technical_plan"),
+            "fundamental_context": meta.get("fundamental_context"),
             "paper_exploration": str(row.get("tier")) == "EXPLORATION",
             "paper_only": True,
         })
