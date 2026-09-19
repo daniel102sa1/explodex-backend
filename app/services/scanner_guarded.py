@@ -19,6 +19,7 @@ from app.services.scanner_edge_gate import apply_edge_gate_to_scanner_run
 from app.services.server_snapshot_extensions import install_server_snapshot_extensions
 from app.services.shadow_forecast_memory import capture_shadow_forecasts_for_run, evaluate_shadow_forecasts, persist_shadow_calibration_for_run
 from app.services.storage_guard import SCANNER_JSON_PROXY, prune_market_snapshots
+from app.services.structure_retest_persistence import persist_structure_retest_for_run
 from app.services.trajectory_persistence import persist_trajectory_for_run
 from app.services.unified_heart_contract import finalize_unified_contract_for_run
 from app.services.verdict_memory_override import install_verdict_memory_overrides
@@ -68,6 +69,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             ("event_risk", persist_event_risk_for_run, "event_risk_persistence"),
             ("pre_event_prediction", persist_pre_event_for_run, "pre_event_persistence"),
             ("market_breadth", persist_market_breadth_for_run, "market_breadth"),
+            ("structure_retest", persist_structure_retest_for_run, "structure_retest_persistence"),
         ]
         for key, fn, version in steps:
             try:
