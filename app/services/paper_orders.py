@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import paper_portfolio as base
 
 
-ORDER_LEDGER_VERSION = "paper_orders_v1"
+ORDER_LEDGER_VERSION = "paper_orders_v2_safe_json_bind"
 
 
 def exit_role_for_reason(exit_reason: str | None) -> str:
@@ -83,12 +83,13 @@ async def _insert_position_orders(db: AsyncSession, row: dict[str, Any]) -> None
         ) VALUES (
             :signal_id, :position_id, :symbol, :position_side, :action, 'ENTRY', 'MARKET', 'FILLED',
             :entry_price, :entry_price, :quantity, :leverage, :opened_at, :opened_at, :opened_at,
-            '{"paper_only":true,"source":"paper_position"}'::jsonb
+            CAST(:metadata AS JSONB)
         ) ON CONFLICT (position_id, order_role) DO NOTHING
     """), {
         **common,
         "action": _open_action(row["side"]),
         "entry_price": row["entry_price"],
+        "metadata": '{"paper_only":true,"source":"paper_position"}',
     })
 
     await db.execute(text("""
@@ -98,12 +99,13 @@ async def _insert_position_orders(db: AsyncSession, row: dict[str, Any]) -> None
         ) VALUES (
             :signal_id, :position_id, :symbol, :position_side, :action, 'STOP', 'STOP_MARKET', 'PENDING',
             :trigger_price, :quantity, :leverage, :opened_at, :opened_at,
-            '{"paper_only":true,"protective":true}'::jsonb
+            CAST(:metadata AS JSONB)
         ) ON CONFLICT (position_id, order_role) DO NOTHING
     """), {
         **common,
         "action": _close_action(row["side"]),
         "trigger_price": row["stop_loss"],
+        "metadata": '{"paper_only":true,"protective":true}',
     })
 
     await db.execute(text("""
@@ -113,12 +115,13 @@ async def _insert_position_orders(db: AsyncSession, row: dict[str, Any]) -> None
         ) VALUES (
             :signal_id, :position_id, :symbol, :position_side, :action, 'TP1', 'TAKE_PROFIT_MARKET', 'PENDING',
             :trigger_price, :quantity, :leverage, :opened_at, :opened_at,
-            '{"paper_only":true,"protective":true}'::jsonb
+            CAST(:metadata AS JSONB)
         ) ON CONFLICT (position_id, order_role) DO NOTHING
     """), {
         **common,
         "action": _close_action(row["side"]),
         "trigger_price": row["take_profit"],
+        "metadata": '{"paper_only":true,"protective":true}',
     })
 
 

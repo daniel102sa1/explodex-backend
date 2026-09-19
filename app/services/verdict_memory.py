@@ -121,6 +121,10 @@ async def capture_enter_verdicts(db: AsyncSession, limit: int = 200) -> dict[str
     inserted = 0
     for source_row in rows:
         row = dict(source_row)
+        # verdict_memory uses canonical observed_at/entry_price names while
+        # signals stores those values as created_at/current_price.
+        row["observed_at"] = row.get("created_at")
+        row["entry_price"] = row.get("current_price")
         row["metadata"] = json.dumps(_learning_metadata(row.get("reason")), separators=(",", ":"))
         await db.execute(
             text(
