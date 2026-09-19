@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
 from app.services.risk_conviction_engine import build_risk_conviction
+from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 
@@ -76,6 +77,7 @@ async def execute_unified_heart_contracts(
     *,
     defensive: bool = False,
     risk_multiplier: float = 1.0,
+    btc_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
@@ -159,11 +161,17 @@ async def execute_unified_heart_contracts(
             reject("invalid_live_fill_geometry")
             continue
 
+        btc_side_multiplier, btc_side_reason = btc_side_risk_multiplier(side, btc_overlay)
+        if btc_side_multiplier <= 0:
+            reject(btc_side_reason or "btc_direction_block")
+            continue
+
         survival = build_stop_survival_plan(
             heart=heart,
             lane_name=lane_name,
             lane=lane,
             entry=fill,
+            btc_context=btc_overlay,
         )
         survival_enabled = bool(survival.get("enabled"))
         hard_stop = _f(survival.get("hard_stop"), original_stop) if survival_enabled else original_stop
@@ -190,7 +198,7 @@ async def execute_unified_heart_contracts(
         portfolio_multiplier = max(0.0, min(1.0, risk_multiplier))
         if defensive:
             portfolio_multiplier = min(portfolio_multiplier, DEFENSIVE_RISK_CAP)
-        scale = conviction_multiplier * portfolio_multiplier
+        scale = conviction_multiplier * portfolio_multiplier * btc_side_multiplier
         for key in ("quantity", "notional", "margin", "risk_usdt"):
             sizing[key] = round(_f(sizing.get(key)) * scale, 10)
         if sizing["quantity"] <= 0 or sizing["margin"] <= 0:
@@ -210,6 +218,9 @@ async def execute_unified_heart_contracts(
             "elliott_structure": elliott,
             "conviction_risk_multiplier": conviction_multiplier,
             "portfolio_risk_multiplier": portfolio_multiplier,
+            "btc_overlay": btc_overlay or {},
+            "btc_side_risk_multiplier": btc_side_multiplier,
+            "btc_side_reason": btc_side_reason,
             "target_account_risk_pct_before_portfolio_brakes": conviction.get("target_account_risk_pct_before_portfolio_brakes"),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
             "stop_survival": survival,
@@ -270,6 +281,9 @@ async def execute_unified_heart_contracts(
             "conviction_tier": conviction.get("tier"),
             "conviction_risk_multiplier": conviction_multiplier,
             "portfolio_risk_multiplier": portfolio_multiplier,
+            "btc_side_risk_multiplier": btc_side_multiplier,
+            "btc_stress": (btc_overlay or {}).get("stress"),
+            "btc_direction": (btc_overlay or {}).get("direction"),
             "elliott": conviction.get("elliott"),
         })
 
@@ -299,5 +313,6 @@ async def execute_unified_heart_contracts(
             "elliott_is_bounded_evidence": True,
             "stop_survival_sizes_from_hard_stop": True,
             "stop_never_widens_after_entry": True,
+            "btc_adaptive_risk": True,
         },
     }
