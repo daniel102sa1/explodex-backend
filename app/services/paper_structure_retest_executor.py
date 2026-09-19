@@ -173,7 +173,7 @@ async def execute_structure_retest_contracts(
             prediction_bundle = _d(reason_bundle.get("prediction"))
             heart_bundle = _d(reason_bundle.get("explodex_heart")) or _d(prediction_bundle.get("explodex_heart"))
             quant = _d(heart_bundle.get("quant_brain"))
-        quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"), 0.70)))
+        quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"), 1.0)))
 
         breadth_alignment = _d(lane.get("market_breadth_alignment"))
         breadth_multiplier = max(0.25, min(1.0, _f(breadth_alignment.get("risk_multiplier"), 1.0)))
