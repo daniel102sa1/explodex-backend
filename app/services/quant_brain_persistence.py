@@ -221,3 +221,58 @@ async def persist_quant_brain_for_run(db: AsyncSession, run_id: str) -> dict[str
         "can_upgrade_wait_to_entry": False,
         "can_reduce_or_block": True,
     }
+
+
+async def quant_brain_report(db: AsyncSession, *, minutes: int = 30, limit: int = 12) -> dict[str, Any]:
+    rows = [dict(row) for row in (await db.execute(text("""
+        SELECT DISTINCT ON (s.symbol_id)
+               sy.symbol, s.direction, s.state, s.setup_score, s.risk_score,
+               s.created_at, s.reason
+        FROM signals s
+        JOIN symbols sy ON sy.id=s.symbol_id
+        WHERE s.created_at >= NOW() - (:minutes * INTERVAL '1 minute')
+        ORDER BY s.symbol_id, s.created_at DESC
+    """), {"minutes": max(5, min(minutes, 240))})).mappings().all()]
+
+    items: list[dict[str, Any]] = []
+    stance_counts: dict[str, int] = {}
+    for raw in sorted(rows, key=lambda row: _f(row.get("setup_score")), reverse=True)[:max(1, min(limit, 50))]:
+        reason = _d(raw.get("reason"))
+        prediction = _d(reason.get("prediction"))
+        heart = _d(reason.get("explodex_heart")) or _d(prediction.get("explodex_heart"))
+        quant = _d(heart.get("quant_brain")) or _d(reason.get("quant_brain"))
+        if not quant:
+            continue
+        stance = str(quant.get("stance") or "UNAVAILABLE")
+        stance_counts[stance] = stance_counts.get(stance, 0) + 1
+        items.append({
+            "symbol": raw.get("symbol"),
+            "direction": raw.get("direction"),
+            "state": raw.get("state"),
+            "setup_score": _f(raw.get("setup_score")),
+            "risk_score": _f(raw.get("risk_score")),
+            "stance": stance,
+            "directional_edge": quant.get("directional_edge"),
+            "evidence_strength": quant.get("evidence_strength"),
+            "risk_multiplier": quant.get("risk_multiplier"),
+            "preferred_strategy": _d(quant.get("strategy_selector")).get("preferred"),
+            "regime": _d(quant.get("regime")).get("state"),
+            "hurst": _d(quant.get("regime")).get("hurst_exponent"),
+            "entropy": _d(quant.get("regime")).get("entropy_normalized"),
+            "btc_beta": _d(quant.get("btc_relationship")).get("beta_5m"),
+            "btc_correlation": _d(quant.get("btc_relationship")).get("correlation_5m"),
+            "calibration_status": _d(quant.get("calibration")).get("status"),
+            "calibration_sample": _d(quant.get("calibration")).get("sample"),
+            "block_new_entry": bool(quant.get("block_new_entry")),
+            "strong_conflict": bool(quant.get("strong_conflict")),
+        })
+
+    return {
+        "version": VERSION,
+        "quant_version": QUANT_VERSION,
+        "window_minutes": minutes,
+        "rows": items,
+        "stance_counts": stance_counts,
+        "score_is_probability": False,
+        "single_heart": True,
+    }
