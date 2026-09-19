@@ -289,7 +289,8 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
         positions.append({
             "id": row["id"], "symbol": row["symbol"], "side": row["side"], "leverage": row["leverage"],
             "entry_price": entry, "mark_price": mark, "mark_price_stale": mark_stale, "stop_loss": _f(row["stop_loss"]),
-            "take_profit": _f(row["take_profit"]), "margin_used": _f(row["margin_used"]),
+            "take_profit": _f(row["take_profit"]), "tp1": _f(row["take_profit"]),
+            "tp2": metadata.get("tp2"), "tp3": metadata.get("tp3"), "margin_used": _f(row["margin_used"]),
             "unrealized_pnl": round(raw, 6), "opened_at": row["opened_at"].isoformat(),
             "strategy_mode": metadata.get("strategy_mode"),
             "pattern_score": metadata.get("pattern_score"),
@@ -358,6 +359,11 @@ async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, An
         row["soft_invalidation_stop"] = metadata.get("soft_invalidation_stop") or metadata.get("soft_invalidation_level")
         row["hard_stop"] = metadata.get("hard_stop") or metadata.get("structural_stop") or row.get("stop_loss")
         row["stop_survival_enabled"] = bool(metadata.get("stop_survival_enabled"))
+        row["tp1"] = row.get("take_profit")
+        row["tp2"] = metadata.get("tp2")
+        row["tp3"] = metadata.get("tp3")
+        row["technical_plan"] = metadata.get("technical_plan")
+        row["fundamental_context"] = metadata.get("fundamental_context")
         row["net_rr"] = _meta(metadata.get("execution_math_live")).get("net_rr")
         output.append(row)
     return output
