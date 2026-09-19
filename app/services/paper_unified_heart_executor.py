@@ -182,7 +182,7 @@ async def execute_unified_heart_contracts(
 
         contract = _d(heart.get("execution_contract"))
         quant = _d(heart.get("quant_brain")) or _d(contract.get("quant_brain"))
-        quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"), 0.70)))
+        quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"), 1.0)))
         matrix = _d(contract.get("forecast_matrix")) or _d(heart.get("forecast_matrix"))
         elliott = _d(contract.get("elliott_structure")) or _d(heart.get("elliott_structure"))
         conviction = build_risk_conviction(
