@@ -17,7 +17,7 @@ from app.services.paper_sizing_patch import install_corrected_paper_sizing
 from app.services.paper_unified_heart_executor import execute_unified_heart_contracts
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v10_trade_auditor"
+VERSION = "paper_fast_cycle_v11_btc_adaptive"
 _LAST_FAST_CYCLE_RESULT: dict[str, Any] | None = None
 
 install_corrected_paper_sizing()
@@ -43,20 +43,25 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
     loss_brake = await portfolio_loss_brake(db)
     quant_guard = await paper_quant_risk_guard(db)
 
-    defensive = str(loss_brake.get("mode") or "NORMAL").upper() == "DEFENSIVE"
+    btc_overlay = regime.get("btc_overlay") or {}
+    defensive = (
+        str(loss_brake.get("mode") or "NORMAL").upper() == "DEFENSIVE"
+        or bool(btc_overlay.get("force_defensive"))
+    )
     risk_multiplier = float(loss_brake.get("trend_risk_multiplier") or 1.0)
-    risk_multiplier *= float(((policy.get("trend_premove") or {}).get("risk_multiplier")) or 1.0)
+    risk_multiplier *= float(((policy.get("trend_premove") or {}).get("risk_multiplier")) or 0.0)
     risk_multiplier *= float(quant_guard.get("risk_multiplier") or 0.0)
 
-    if quant_guard.get("halt_new_entries"):
+    btc_blocks_new_entries = bool(btc_overlay.get("block_new_entries"))
+    if quant_guard.get("halt_new_entries") or btc_blocks_new_entries:
         execution = {
             "version": "paper_unified_heart_executor_blocked_by_quant_guard",
             "opened": 0,
             "trades": [],
-            "reason": "quant_kill_switch",
+            "reason": "quant_kill_switch" if quant_guard.get("halt_new_entries") else "btc_shock_block",
             "signals_checked": 0,
             "candidates": 0,
-            "rejected": {"quant_kill_switch": 1},
+            "rejected": {"quant_kill_switch": 1} if quant_guard.get("halt_new_entries") else {"btc_shock_block": 1},
             "defensive": defensive,
             "defensive_learning_enabled": defensive,
             "risk_policy": {"quant_guard_multiplier": 0.0},
@@ -64,20 +69,21 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         pre_event_execution = {
             "opened": 0,
             "trades": [],
-            "reason": "quant_kill_switch",
-            "rejected": {"quant_kill_switch": 1},
+            "reason": "quant_kill_switch" if quant_guard.get("halt_new_entries") else "btc_shock_block",
+            "rejected": {"quant_kill_switch": 1} if quant_guard.get("halt_new_entries") else {"btc_shock_block": 1},
         }
         structure_retest_execution = {
             "opened": 0,
             "trades": [],
-            "reason": "quant_kill_switch",
-            "rejected": {"quant_kill_switch": 1},
+            "reason": "quant_kill_switch" if quant_guard.get("halt_new_entries") else "btc_shock_block",
+            "rejected": {"quant_kill_switch": 1} if quant_guard.get("halt_new_entries") else {"btc_shock_block": 1},
         }
     else:
         execution = await execute_unified_heart_contracts(
             db,
             defensive=defensive,
             risk_multiplier=risk_multiplier,
+            btc_overlay=btc_overlay,
         )
         pre_event_execution = {"opened": 0, "reason": "higher_priority_lane_opened", "rejected": {}}
         structure_retest_execution = {"opened": 0, "reason": "higher_priority_lane_opened", "rejected": {}}
@@ -86,12 +92,14 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
                 db,
                 defensive=defensive,
                 risk_multiplier=risk_multiplier,
+                btc_overlay=btc_overlay,
             )
         if int(execution.get("opened") or 0) == 0 and int(pre_event_execution.get("opened") or 0) == 0:
             structure_retest_execution = await execute_structure_retest_contracts(
                 db,
                 defensive=defensive,
                 risk_multiplier=risk_multiplier,
+                btc_overlay=btc_overlay,
             )
 
     all_trades = (
@@ -124,6 +132,8 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
 
     if quant_guard.get("halt_new_entries"):
         cycle_reason = "quant_kill_switch"
+    elif btc_blocks_new_entries:
+        cycle_reason = "btc_shock_block"
     elif int(pre_event_execution.get("opened") or 0):
         cycle_reason = pre_event_execution.get("reason")
     elif int(structure_retest_execution.get("opened") or 0):
@@ -149,6 +159,7 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         "regime": regime,
         "loss_brake": loss_brake,
         "quant_risk_guard": quant_guard,
+        "btc_overlay": btc_overlay,
         "trade_audit": trade_audit,
         "effective_new_entry_risk_multiplier": round(max(0.0, risk_multiplier), 4),
         "equity": summary.get("equity"),
@@ -157,6 +168,8 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         "authority": "UNIFIED_HEART_CONTRACT_ONLY",
         "quant_guard_can_choose_direction": False,
         "quant_guard_can_create_entry": False,
+        "btc_overlay_can_create_entry": False,
+        "btc_overlay_can_widen_stop_after_entry": False,
     }
     _LAST_FAST_CYCLE_RESULT = result
     return result
