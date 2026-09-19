@@ -165,6 +165,30 @@ def score_snapshot(snapshot: dict[str, Any], btc_context: dict[str, Any] | None 
     taker_latest = taker_values[-1] if taker_values else 1.0
     taker_avg_3 = mean(taker_values[-3:]) if taker_values else 1.0
     taker_prev_3 = mean(taker_values[-6:-3]) if len(taker_values) >= 6 else 1.0
+
+    # Binance takerlongshortRatio also exposes buyVol/sellVol. When present we
+    # aggregate the last 3x5m blocks into a true 15m buy/sell ratio instead of
+    # averaging ratios. OKX fallback does not fabricate historical buy/sell
+    # volumes, so the monitor clearly falls back to the 3x5m ratio proxy.
+    taker_last = taker[-1] if taker else {}
+    taker_5m_buy = float(taker_last.get("buyVol", 0) or 0)
+    taker_5m_sell = float(taker_last.get("sellVol", 0) or 0)
+    taker_5m_delta = taker_5m_buy - taker_5m_sell if (taker_5m_buy > 0 or taker_5m_sell > 0) else None
+
+    taker_15m_rows = taker[-3:] if len(taker) >= 3 else []
+    taker_15m_buy = sum(float(x.get("buyVol", 0) or 0) for x in taker_15m_rows)
+    taker_15m_sell = sum(float(x.get("sellVol", 0) or 0) for x in taker_15m_rows)
+    taker_15m_ratio = (
+        taker_15m_buy / taker_15m_sell
+        if taker_15m_sell > 0
+        else (9.99 if taker_15m_buy > 0 else None)
+    )
+    taker_15m_delta = (
+        taker_15m_buy - taker_15m_sell
+        if (taker_15m_buy > 0 or taker_15m_sell > 0)
+        else None
+    )
+
     taker_strengthening_long = taker_avg_3 > taker_prev_3 and taker_avg_3 >= 1.05
     taker_strengthening_short = taker_avg_3 < taker_prev_3 and taker_avg_3 <= 0.95
 
@@ -478,6 +502,15 @@ def score_snapshot(snapshot: dict[str, Any], btc_context: dict[str, Any] | None 
             "oi_change_pct": round(oi_change_pct, 4),
             "taker_latest": round(taker_latest, 4),
             "taker_avg_3": round(taker_avg_3, 4),
+            "taker_5m_buy_volume": round(taker_5m_buy, 6) if taker_5m_buy > 0 else None,
+            "taker_5m_sell_volume": round(taker_5m_sell, 6) if taker_5m_sell > 0 else None,
+            "taker_5m_delta": round(taker_5m_delta, 6) if taker_5m_delta is not None else None,
+            "taker_15m_buy_volume": round(taker_15m_buy, 6) if taker_15m_buy > 0 else None,
+            "taker_15m_sell_volume": round(taker_15m_sell, 6) if taker_15m_sell > 0 else None,
+            "taker_15m_ratio": round(taker_15m_ratio, 4) if taker_15m_ratio is not None else None,
+            "taker_15m_delta": round(taker_15m_delta, 6) if taker_15m_delta is not None else None,
+            "taker_15m_ratio_source": "AGGREGATED_3X5M_BUYSELL_VOLUME" if taker_15m_ratio is not None else "THREE_5M_RATIO_PROXY",
+
             "taker_prev_3": round(taker_prev_3, 4),
             "taker_strengthening_long": taker_strengthening_long,
             "taker_strengthening_short": taker_strengthening_short,
