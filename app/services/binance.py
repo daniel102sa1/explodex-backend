@@ -44,6 +44,9 @@ class BinancePublicClient:
         self._preferred_spot = 0
         self._preferred_okx = 0
         self._binance_blocked_until = 0.0
+        self._okx_backoff_until = 0.0
+        self._cache: dict[str, tuple[float, Any]] = {}
+        self._cache_locks: dict[str, asyncio.Lock] = {}
         self.active_source = "BINANCE_FUTURES"
         self.last_primary_error: str | None = None
         self.headers = {
@@ -93,6 +96,52 @@ class BinancePublicClient:
         self.last_primary_error = str(error)[:1000]
         self._binance_blocked_until = time.monotonic() + 1800
         self.active_source = "OKX_FALLBACK"
+
+    def recommended_concurrency(self) -> int:
+        return 2 if (not self._binance_available() or self.active_source == "OKX_FALLBACK") else 5
+
+    def _cache_get(self, key: str, max_age_seconds: float) -> Any | None:
+        row = self._cache.get(key)
+        if not row:
+            return None
+        saved_at, value = row
+        if time.monotonic() - saved_at <= max_age_seconds:
+            return value
+        return None
+
+    def _cache_put(self, key: str, value: Any) -> Any:
+        self._cache[key] = (time.monotonic(), value)
+        if len(self._cache) > 1200:
+            oldest = sorted(self._cache.items(), key=lambda item: item[1][0])[:200]
+            for old_key, _ in oldest:
+                self._cache.pop(old_key, None)
+                self._cache_locks.pop(old_key, None)
+        return value
+
+    async def _cached_call(
+        self,
+        *,
+        key: str,
+        ttl_seconds: float,
+        stale_seconds: float,
+        loader,
+    ) -> Any:
+        fresh = self._cache_get(key, ttl_seconds)
+        if fresh is not None:
+            return fresh
+        lock = self._cache_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            fresh = self._cache_get(key, ttl_seconds)
+            if fresh is not None:
+                return fresh
+            try:
+                value = await loader()
+                return self._cache_put(key, value)
+            except Exception:
+                stale = self._cache_get(key, stale_seconds)
+                if stale is not None:
+                    return stale
+                raise
 
     async def _request_with_failover(
         self,
@@ -145,13 +194,20 @@ class BinancePublicClient:
         )
 
     async def _okx_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        payload = await self._request_with_failover(
-            bases=self.okx_bases,
-            preferred_attr="_preferred_okx",
-            path=path,
-            params=params,
-            timeout=12.0,
-        )
+        if time.monotonic() < self._okx_backoff_until:
+            raise RuntimeError("OKX temporary backoff after HTTP 429")
+        try:
+            payload = await self._request_with_failover(
+                bases=self.okx_bases,
+                preferred_attr="_preferred_okx",
+                path=path,
+                params=params,
+                timeout=12.0,
+            )
+        except Exception as exc:
+            if "429" in str(exc) or "Too Many Requests" in str(exc):
+                self._okx_backoff_until = time.monotonic() + 8.0
+            raise
         if not isinstance(payload, dict) or str(payload.get("code", "0")) != "0":
             raise RuntimeError(f"OKX error for {path}: {payload}")
         self.active_source = "OKX_FALLBACK"
@@ -210,49 +266,71 @@ class BinancePublicClient:
         return normalized
 
     async def price(self, symbol: str) -> dict[str, Any]:
-        if self._binance_available():
-            try:
-                return await self._prefer_binance("/fapi/v1/ticker/price", {"symbol": symbol.upper()})
-            except Exception:
-                pass
-        payload = await self._okx_get("/api/v5/market/ticker", {"instId": self._okx_swap_id(symbol)})
-        rows = payload.get("data", [])
-        if not rows:
-            raise RuntimeError(f"OKX ticker unavailable for {symbol}")
-        return {"symbol": symbol.upper(), "price": rows[0].get("last"), "source": "OKX_FALLBACK"}
+        symbol = symbol.upper()
+
+        async def load() -> dict[str, Any]:
+            if self._binance_available():
+                try:
+                    return await self._prefer_binance("/fapi/v1/ticker/price", {"symbol": symbol})
+                except Exception:
+                    pass
+            payload = await self._okx_get("/api/v5/market/ticker", {"instId": self._okx_swap_id(symbol)})
+            rows = payload.get("data", [])
+            if not rows:
+                raise RuntimeError(f"OKX ticker unavailable for {symbol}")
+            return {"symbol": symbol, "price": rows[0].get("last"), "source": "OKX_FALLBACK"}
+
+        return await self._cached_call(
+            key=f"price:{symbol}",
+            ttl_seconds=4.0,
+            stale_seconds=90.0,
+            loader=load,
+        )
 
     async def klines(self, symbol: str, interval: str = "5m", limit: int = 120) -> list[list[Any]]:
-        if self._binance_available():
-            try:
-                return await self._prefer_binance(
-                    "/fapi/v1/klines",
-                    {"symbol": symbol.upper(), "interval": interval, "limit": limit},
-                )
-            except Exception:
-                pass
+        symbol = symbol.upper()
+        ttl_map = {"1m": 5.0, "3m": 8.0, "5m": 18.0, "15m": 40.0, "30m": 60.0, "1h": 90.0, "2h": 120.0, "4h": 180.0, "1d": 300.0}
+        ttl = ttl_map.get(interval, 20.0)
 
-        bar_map = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1D"}
-        bar = bar_map.get(interval, interval)
-        payload = await self._okx_get(
-            "/api/v5/market/candles",
-            {"instId": self._okx_swap_id(symbol), "bar": bar, "limit": min(max(limit, 1), 300)},
+        async def load() -> list[list[Any]]:
+            if self._binance_available():
+                try:
+                    return await self._prefer_binance(
+                        "/fapi/v1/klines",
+                        {"symbol": symbol, "interval": interval, "limit": limit},
+                    )
+                except Exception:
+                    pass
+
+            bar_map = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1D"}
+            bar = bar_map.get(interval, interval)
+            payload = await self._okx_get(
+                "/api/v5/market/candles",
+                {"instId": self._okx_swap_id(symbol), "bar": bar, "limit": min(max(limit, 1), 300)},
+            )
+            rows = list(reversed(payload.get("data", [])))
+            output: list[list[Any]] = []
+            for row in rows:
+                if len(row) < 5:
+                    continue
+                ts = int(row[0])
+                quote_volume = row[7] if len(row) > 7 else (row[6] if len(row) > 6 else "0")
+                output.append([
+                    ts,
+                    row[1], row[2], row[3], row[4],
+                    row[5] if len(row) > 5 else "0",
+                    ts + 1,
+                    quote_volume,
+                    0, 0, 0, 0,
+                ])
+            return output
+
+        return await self._cached_call(
+            key=f"klines:{symbol}:{interval}:{int(limit)}",
+            ttl_seconds=ttl,
+            stale_seconds=max(180.0, ttl * 8.0),
+            loader=load,
         )
-        rows = list(reversed(payload.get("data", [])))
-        output: list[list[Any]] = []
-        for row in rows:
-            if len(row) < 5:
-                continue
-            ts = int(row[0])
-            quote_volume = row[7] if len(row) > 7 else (row[6] if len(row) > 6 else "0")
-            output.append([
-                ts,
-                row[1], row[2], row[3], row[4],
-                row[5] if len(row) > 5 else "0",
-                ts + 1,
-                quote_volume,
-                0, 0, 0, 0,
-            ])
-        return output
 
     async def order_book(self, symbol: str, limit: int = 20) -> dict[str, Any]:
         if self._binance_available():

@@ -124,7 +124,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
         for startup_error in startup_errors:
             scanner_progress.errors.appendleft(startup_error)
 
-        semaphore = asyncio.Semaphore(5)
+        semaphore = asyncio.Semaphore(binance_client.recommended_concurrency())
 
         async def analyze_local(ticker: dict[str, Any]):
             symbol = ticker["symbol"]

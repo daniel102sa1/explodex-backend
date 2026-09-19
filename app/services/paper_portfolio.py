@@ -149,10 +149,16 @@ async def ensure_paper_schema(db: AsyncSession) -> None:
 
 
 async def _latest_price(symbol: str) -> float:
-    rows = await binance_client.klines(symbol, interval="1m", limit=3)
-    if not rows:
+    """Lightweight mark lookup.
+
+    A provider/rate-limit failure must not crash the whole PAPER cycle. Returning
+    0 lets callers keep the previous/entry mark rather than inventing a price.
+    """
+    try:
+        payload = await binance_client.price(symbol)
+        return _f(payload.get("price")) if isinstance(payload, dict) else 0.0
+    except Exception:
         return 0.0
-    return _f(rows[-1][4])
 
 
 async def _close_due_positions(db: AsyncSession) -> dict[str, int]:
@@ -274,12 +280,15 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
     for row in open_rows:
         mark = await _latest_price(row["symbol"])
         qty, entry = _f(row["quantity"]), _f(row["entry_price"])
+        mark_stale = mark <= 0
+        if mark_stale:
+            mark = entry
         raw = (mark-entry)*qty if row["side"] == "LONG" else (entry-mark)*qty
         unrealized += raw
         metadata = _meta(row.get("metadata"))
         positions.append({
             "id": row["id"], "symbol": row["symbol"], "side": row["side"], "leverage": row["leverage"],
-            "entry_price": entry, "mark_price": mark, "stop_loss": _f(row["stop_loss"]),
+            "entry_price": entry, "mark_price": mark, "mark_price_stale": mark_stale, "stop_loss": _f(row["stop_loss"]),
             "take_profit": _f(row["take_profit"]), "margin_used": _f(row["margin_used"]),
             "unrealized_pnl": round(raw, 6), "opened_at": row["opened_at"].isoformat(),
             "strategy_mode": metadata.get("strategy_mode"),
@@ -292,6 +301,8 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
             "stop_survival_enabled": bool(metadata.get("stop_survival_enabled")),
             "chase_limit": metadata.get("chase_limit"),
             "actual_stop_risk_usdt": metadata.get("actual_stop_risk_usdt"),
+            "chati_sarpon_612_monitor": metadata.get("chati_sarpon_612_monitor"),
+            "chati_sarpon_612_history": list(metadata.get("chati_sarpon_612_history") or [])[-8:],
             "net_rr": _meta(metadata.get("execution_math_live")).get("net_rr"),
         })
     cash = _f(account["cash_balance"])

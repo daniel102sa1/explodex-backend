@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.paper_portfolio import STARTING_BALANCE, ensure_paper_schema
 
-LOSS_AUTOPSY_VERSION = "paper_loss_autopsy_v1"
+LOSS_AUTOPSY_VERSION = "paper_loss_autopsy_v2_complete_stop_reasons"
+STOP_EXIT_REASONS = {"STOP", "AMBIGUOUS_STOP", "HARD_STOP", "AMBIGUOUS_HARD_STOP", "STRUCTURAL_CLOSE_INVALIDATION"}
 
 MIN_EXACT_SAMPLE = 6
 MIN_CONTEXT_SAMPLE = 10
@@ -83,7 +84,7 @@ def metrics_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for row in rows:
         reason = str(row.get("exit_reason") or "").upper()
         pnl = _f(row.get("net_pnl"))
-        if reason in {"STOP", "AMBIGUOUS_STOP"}:
+        if reason in STOP_EXIT_REASONS:
             stops += 1
         if reason == "TP1":
             tp1 += 1
@@ -287,7 +288,7 @@ async def evaluate_anti_loss_gate(
     ][:3]
     recent_symbol_stops = 0
     for row in same_symbol_recent:
-        if str(row.get("exit_reason") or "").upper() in {"STOP", "AMBIGUOUS_STOP"}:
+        if str(row.get("exit_reason") or "").upper() in STOP_EXIT_REASONS:
             recent_symbol_stops += 1
         else:
             break
