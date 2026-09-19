@@ -15,7 +15,7 @@ from app.services.scoring import build_btc_context, score_snapshot
 VERSION = "paper_trade_auditor_v1"
 MIN_CALIBRATION_SAMPLE = 30
 OPEN_AUDIT_REFRESH_MINUTES = 5
-CLOSED_BACKFILL_PER_CYCLE = 3
+CLOSED_BACKFILL_PER_CYCLE = 1
 
 
 def _f(value: Any, default: float = 0.0) -> float:
