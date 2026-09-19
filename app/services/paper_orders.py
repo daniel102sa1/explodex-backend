@@ -115,7 +115,7 @@ async def _insert_position_orders(db: AsyncSession, row: dict[str, Any]) -> None
         ) VALUES (
             :signal_id, :position_id, :symbol, :position_side, :action, 'TP1', 'TAKE_PROFIT_MARKET', 'PENDING',
             :trigger_price, :quantity, :leverage, :opened_at, :opened_at,
-            '{"paper_only":true,"protective":true}'::jsonb
+            CAST(:metadata AS JSONB)
         ) ON CONFLICT (position_id, order_role) DO NOTHING
     """), {
         **common,
