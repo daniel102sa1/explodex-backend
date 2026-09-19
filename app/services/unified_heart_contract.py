@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.execution_math import choose_target_for_min_net_rr
 
-VERSION = "unified_heart_contract_v1"
-HEART_VERSION = "explodex_heart_v7_unified"
+VERSION = "unified_heart_contract_v2_quant_brain"
+HEART_VERSION = "explodex_heart_v8_quant_unified"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -45,6 +45,7 @@ def _hard_safety_clear(heart: dict[str, Any], prediction: dict[str, Any]) -> tup
     guard = _d(prediction.get("decision_guard"))
     thesis = _d(heart.get("thesis"))
     latch = _d(heart.get("entry_latch"))
+    quant = _d(heart.get("quant_brain"))
 
     if bool(veto.get("blocked")) or bool(veto.get("hard_block")):
         blockers.append("hard_veto")
@@ -60,6 +61,10 @@ def _hard_safety_clear(heart: dict[str, Any], prediction: dict[str, Any]) -> tup
         blockers.append("thesis_cooldown")
     if str(latch.get("status") or "") in {"TRIGGERED", "IN_POSITION"}:
         blockers.append("entry_already_triggered")
+    if bool(quant.get("block_new_entry")):
+        blockers.append("quant_brain_block")
+    elif bool(quant.get("strong_conflict")):
+        blockers.append("quant_brain_conflict")
     return not blockers, blockers
 
 
@@ -247,6 +252,7 @@ def build_execution_contract(
     prediction: dict[str, Any],
 ) -> dict[str, Any]:
     safety_clear, safety_blockers = _hard_safety_clear(heart, prediction)
+    quant = _d(heart.get("quant_brain"))
     tactical = _tactical_lane(heart, score)
     aggressive = _aggressive_lane(heart, score, prediction, safety_clear, safety_blockers)
     swing = _swing_lane(heart, score, safety_clear, safety_blockers)
@@ -300,13 +306,18 @@ def build_execution_contract(
         "priority": ["TACTICAL", "AGGRESSIVE_PAPER", "SWING_PAPER"],
         "hard_safety_clear": safety_clear,
         "hard_safety_blockers": safety_blockers,
+        "quant_brain": quant,
+        "quant_risk_multiplier": max(0.20, min(1.0, _f(quant.get("risk_multiplier"), 0.70))) if quant else 0.70,
+        "quant_stance": quant.get("stance") if quant else "UNAVAILABLE",
+        "quant_directional_edge": quant.get("directional_edge") if quant else None,
+        "quant_strategy_selector": _d(quant.get("strategy_selector")),
         "forecast": forecast,
         "lanes": {
             "tactical": tactical,
             "aggressive_paper": aggressive,
             "swing_paper": swing,
         },
-        "rule": "Scanner, coin analysis and PAPER consume this same Heart contract. Executors may reject a stale fill but cannot invent a new direction or strategy.",
+        "rule": "Scanner, Quant Brain, coin analysis and PAPER consume this same Heart contract. Quant evidence may reduce/block risk but cannot invent a direction, upgrade WAIT to ENTER, or widen a live stop.",
     }
 
 
