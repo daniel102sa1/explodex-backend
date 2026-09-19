@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.chati_sarpon_612_monitor import monitor_open_paper_positions
 from app.services.paper_horizon_manager import close_due_positions
 from app.services.paper_loss_autopsy import portfolio_loss_brake
 from app.services.paper_pre_event_executor import execute_pre_event_contracts
@@ -17,7 +18,7 @@ from app.services.paper_sizing_patch import install_corrected_paper_sizing
 from app.services.paper_unified_heart_executor import execute_unified_heart_contracts
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v11_btc_adaptive"
+VERSION = "paper_fast_cycle_v12_chati_live_monitor"
 _LAST_FAST_CYCLE_RESULT: dict[str, Any] | None = None
 
 install_corrected_paper_sizing()
@@ -44,13 +45,31 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
     quant_guard = await paper_quant_risk_guard(db)
 
     btc_overlay = regime.get("btc_overlay") or {}
+    try:
+        live_monitor = await monitor_open_paper_positions(db, btc_overlay=btc_overlay)
+    except Exception as exc:
+        await db.rollback()
+        live_monitor = {
+            "version": "chati_sarpon_612_monitor_v1",
+            "paper_only": True,
+            "available": False,
+            "error_type": type(exc).__name__,
+            "portfolio_new_entry_risk_multiplier": 1.0,
+            "positions": [],
+            "counts": {},
+        }
+
+    live_counts = live_monitor.get("counts") or {}
+    live_red = int(live_counts.get("RED_DAMAGED") or 0)
     defensive = (
         str(loss_brake.get("mode") or "NORMAL").upper() == "DEFENSIVE"
         or bool(btc_overlay.get("force_defensive"))
+        or live_red > 0
     )
     risk_multiplier = float(loss_brake.get("trend_risk_multiplier") or 1.0)
     risk_multiplier *= float(((policy.get("trend_premove") or {}).get("risk_multiplier")) or 0.0)
     risk_multiplier *= float(quant_guard.get("risk_multiplier") or 0.0)
+    risk_multiplier *= float(live_monitor.get("portfolio_new_entry_risk_multiplier") or 1.0)
 
     btc_blocks_new_entries = bool(btc_overlay.get("block_new_entries"))
     if quant_guard.get("halt_new_entries") or btc_blocks_new_entries:
@@ -161,6 +180,7 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         "quant_risk_guard": quant_guard,
         "btc_overlay": btc_overlay,
         "trade_audit": trade_audit,
+        "chati_sarpon_612_live_monitor": live_monitor,
         "effective_new_entry_risk_multiplier": round(max(0.0, risk_multiplier), 4),
         "equity": summary.get("equity"),
         "open_positions": len(summary.get("open_positions") or []),
@@ -170,6 +190,9 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         "quant_guard_can_create_entry": False,
         "btc_overlay_can_create_entry": False,
         "btc_overlay_can_widen_stop_after_entry": False,
+        "chati_monitor_can_create_entry": False,
+        "chati_monitor_can_flip_direction": False,
+        "chati_monitor_can_widen_stop_after_entry": False,
     }
     _LAST_FAST_CYCLE_RESULT = result
     return result
