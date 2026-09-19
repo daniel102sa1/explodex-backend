@@ -301,6 +301,8 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
             "stop_survival_enabled": bool(metadata.get("stop_survival_enabled")),
             "chase_limit": metadata.get("chase_limit"),
             "actual_stop_risk_usdt": metadata.get("actual_stop_risk_usdt"),
+            "chati_sarpon_612_monitor": metadata.get("chati_sarpon_612_monitor"),
+            "chati_sarpon_612_history": list(metadata.get("chati_sarpon_612_history") or [])[-8:],
             "net_rr": _meta(metadata.get("execution_math_live")).get("net_rr"),
         })
     cash = _f(account["cash_balance"])
