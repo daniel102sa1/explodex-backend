@@ -140,6 +140,9 @@ def detect_structure_retest(
             level = prior_low
 
         if crossed:
+            # Anchor the FIRST clean break of the established range. Later
+            # continuation candles can make fresh highs/lows, but they are not
+            # allowed to redefine the original breakout level behind price.
             breakout = {
                 "index": i,
                 "level": level,
@@ -148,6 +151,7 @@ def detect_structure_retest(
                 "prior_low": prior_low,
                 "volume_ratio": volume_ratio,
             }
+            break
 
     if not breakout:
         return {
