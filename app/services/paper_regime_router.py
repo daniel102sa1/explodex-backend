@@ -59,8 +59,9 @@ def _percentile_rank(values: list[float], value: float) -> float:
     clean = sorted(v for v in values if v >= 0)
     if not clean:
         return 0.0
-    below_or_equal = sum(1 for item in clean if item <= value)
-    return below_or_equal / len(clean) * 100.0
+    below = sum(1 for item in clean if item < value)
+    equal = sum(1 for item in clean if abs(item - value) <= 1e-12)
+    return (below + 0.5 * equal) / len(clean) * 100.0
 
 
 def _rolling_atr_pct(rows: list[list[Any]], period: int = 14) -> list[float]:
