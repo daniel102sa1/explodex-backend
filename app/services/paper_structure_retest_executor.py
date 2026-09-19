@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
 from app.services.execution_math import evaluate_trade_math
+from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.structure_retest_persistence import mark_structure_retest_entered
 
 VERSION = "paper_structure_retest_executor_v1"
@@ -55,6 +56,7 @@ async def execute_structure_retest_contracts(
     *,
     defensive: bool = False,
     risk_multiplier: float = 1.0,
+    btc_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
@@ -146,6 +148,11 @@ async def execute_structure_retest_contracts(
             reject("invalid_live_structure_geometry")
             continue
 
+        btc_side_multiplier, btc_side_reason = btc_side_risk_multiplier(side, btc_overlay)
+        if btc_side_multiplier <= 0:
+            reject(btc_side_reason or "btc_direction_block")
+            continue
+
         math = evaluate_trade_math(
             side=side,
             entry=fill,
@@ -166,7 +173,7 @@ async def execute_structure_retest_contracts(
         event_multiplier = max(0.0, min(1.0, _f(event.get("risk_multiplier"), 1.0)))
         global_multiplier = max(0.0, min(1.0, risk_multiplier))
         lane_scale = DEFENSIVE_RISK_SCALE if defensive else NORMAL_RISK_SCALE
-        scale = lane_scale * breadth_multiplier * event_multiplier * global_multiplier
+        scale = lane_scale * breadth_multiplier * event_multiplier * global_multiplier * btc_side_multiplier
 
         quantity = _f(sizing.get("quantity")) * scale
         notional = quantity * fill
@@ -212,6 +219,9 @@ async def execute_structure_retest_contracts(
             "breadth_risk_multiplier": breadth_multiplier,
             "event_risk_multiplier": event_multiplier,
             "actual_stop_risk_usdt": round(actual_risk, 8),
+            "btc_overlay": btc_overlay or {},
+            "btc_side_risk_multiplier": btc_side_multiplier,
+            "btc_side_reason": btc_side_reason,
             "max_hold_minutes": lane.get("max_hold_minutes"),
         }
 
@@ -262,6 +272,9 @@ async def execute_structure_retest_contracts(
             "net_rr": math.get("net_rr"),
             "setup_id": setup_id,
             "stop_basis": "STRUCTURE_NOT_MONEY",
+            "btc_side_risk_multiplier": btc_side_multiplier,
+            "btc_stress": (btc_overlay or {}).get("stress"),
+            "btc_direction": (btc_overlay or {}).get("direction"),
         })
 
     await db.commit()
@@ -279,5 +292,6 @@ async def execute_structure_retest_contracts(
             "stop_is_structural": True,
             "size_adapts_to_stop": True,
             "stop_never_widens_after_entry": True,
+            "btc_adaptive_risk": True,
         },
     }
