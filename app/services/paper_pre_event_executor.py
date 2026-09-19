@@ -83,12 +83,12 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
         live_target = _f(survival.get("target_price"), target) if survival.get("enabled") else target
         if not _geometry_ok(side, fill, hard_stop, live_target): reject("invalid_survival_geometry"); continue
 
-        contract = _d(heart.get("execution_contract")); matrix = _d(contract.get("forecast_matrix")) or _d(heart.get("forecast_matrix")); elliott = _d(contract.get("elliott_structure")) or _d(heart.get("elliott_structure"))
+        contract = _d(heart.get("execution_contract")); quant = _d(heart.get("quant_brain")) or _d(contract.get("quant_brain")); quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"),0.70))); matrix = _d(contract.get("forecast_matrix")) or _d(heart.get("forecast_matrix")); elliott = _d(contract.get("elliott_structure")) or _d(heart.get("elliott_structure"))
         conviction = build_risk_conviction(lane_name="PRE_EVENT_PAPER", lane=lane, setup_score=_f(row.get("setup_score")), risk_score=_f(row.get("risk_score"),100.0), forecast_matrix=matrix, elliott_structure=elliott)
         conv_mult = min(0.25, max(0.05, _f(conviction.get("risk_budget_multiplier"),0.05)))
         portfolio_mult = max(0.0, min(1.0, risk_multiplier)); portfolio_mult = min(portfolio_mult, 0.25) if defensive else portfolio_mult
         leverage = int(max(1, min(2, _f(lane.get("max_leverage"),2.0))))
-        sizing = base.size_position(balance, fill, hard_stop, leverage); scale = conv_mult * portfolio_mult * btc_side_multiplier
+        sizing = base.size_position(balance, fill, hard_stop, leverage); scale = conv_mult * portfolio_mult * btc_side_multiplier * quant_multiplier
         for key in ("quantity","notional","margin","risk_usdt"): sizing[key] = round(_f(sizing.get(key))*scale,10)
         if sizing["quantity"] <= 0: reject("position_size_zero"); continue
 
@@ -100,6 +100,7 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
             "portfolio_mode": "DEFENSIVE_LEARNING" if defensive else "NORMAL", "pre_event_risk_cap": 0.25,
             "executor_cannot_change_direction": True, "executor_cannot_create_lane": True,
             "btc_overlay": btc_overlay or {}, "btc_side_risk_multiplier": btc_side_multiplier, "btc_side_reason": btc_side_reason,
+            "quant_brain": quant, "quant_risk_multiplier": quant_multiplier,
         }
         result = await db.execute(text("""
             INSERT INTO paper_positions (signal_id,symbol,side,grade,fingerprint_score,leverage,entry_price,stop_loss,take_profit,quantity,notional,margin_used,risk_usdt,opened_at,metadata)
@@ -107,7 +108,7 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
             ON CONFLICT (signal_id) DO NOTHING
         """), {"signal_id":row["signal_id"],"symbol":symbol,"side":side,"score":_f(lane.get("preparation_score")),"leverage":leverage,"entry":fill,"stop":hard_stop,"target":live_target,"quantity":sizing["quantity"],"notional":sizing["notional"],"margin":sizing["margin"],"risk_usdt":sizing["risk_usdt"],"opened_at":datetime.now(timezone.utc),"metadata":json.dumps(metadata)})
         if not result.rowcount: reject("duplicate_signal"); continue
-        opened.append({"symbol":symbol,"lane":"PRE_EVENT_PAPER","side":side,"entry":fill,"hard_stop":hard_stop,"target":live_target,"risk_usdt":sizing["risk_usdt"],"preparation_score":lane.get("preparation_score"),"pre_event_type":lane.get("pre_event_type"),"defensive":defensive,"btc_side_risk_multiplier":btc_side_multiplier,"btc_stress":(btc_overlay or {}).get("stress"),"btc_direction":(btc_overlay or {}).get("direction")})
+        opened.append({"symbol":symbol,"lane":"PRE_EVENT_PAPER","side":side,"entry":fill,"hard_stop":hard_stop,"target":live_target,"risk_usdt":sizing["risk_usdt"],"preparation_score":lane.get("preparation_score"),"pre_event_type":lane.get("pre_event_type"),"defensive":defensive,"btc_side_risk_multiplier":btc_side_multiplier,"btc_stress":(btc_overlay or {}).get("stress"),"btc_direction":(btc_overlay or {}).get("direction"),"quant_risk_multiplier":quant_multiplier,"quant_stance":quant.get("stance")})
 
     await db.commit()
     return {"version":VERSION,"opened":len(opened),"trades":opened,"reason":"opened_pre_event_paper" if opened else "no_pre_event_fill","signals_checked":len(rows),"candidates":len(candidates),"rejected":rejected,"paper_only":True}
