@@ -12,11 +12,12 @@ from app.services.paper_quant_risk_guard import paper_quant_risk_guard
 from app.services.paper_regime_router import current_paper_regime
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.paper_structure_retest_executor import execute_structure_retest_contracts
+from app.services.paper_trade_auditor import run_paper_trade_audits
 from app.services.paper_sizing_patch import install_corrected_paper_sizing
 from app.services.paper_unified_heart_executor import execute_unified_heart_contracts
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v9_structure_retest"
+VERSION = "paper_fast_cycle_v10_trade_auditor"
 _LAST_FAST_CYCLE_RESULT: dict[str, Any] | None = None
 
 install_corrected_paper_sizing()
@@ -104,6 +105,21 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         + int(structure_retest_execution.get("opened") or 0)
     )
     diagnostics = await heart_diagnostics(db, minutes=30)
+
+    # Auditor is deliberately advisory. A failure here must never break the
+    # canonical Heart/PAPER execution cycle.
+    try:
+        trade_audit = await run_paper_trade_audits(db)
+    except Exception as exc:
+        await db.rollback()
+        trade_audit = {
+            "version": "paper_trade_auditor_v1",
+            "paper_only": True,
+            "available": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:240],
+        }
+
     summary = await base.paper_summary(db)
 
     if quant_guard.get("halt_new_entries"):
@@ -133,6 +149,7 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         "regime": regime,
         "loss_brake": loss_brake,
         "quant_risk_guard": quant_guard,
+        "trade_audit": trade_audit,
         "effective_new_entry_risk_multiplier": round(max(0.0, risk_multiplier), 4),
         "equity": summary.get("equity"),
         "open_positions": len(summary.get("open_positions") or []),
