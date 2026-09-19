@@ -181,6 +181,8 @@ async def execute_unified_heart_contracts(
             continue
 
         contract = _d(heart.get("execution_contract"))
+        quant = _d(heart.get("quant_brain")) or _d(contract.get("quant_brain"))
+        quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"), 0.70)))
         matrix = _d(contract.get("forecast_matrix")) or _d(heart.get("forecast_matrix"))
         elliott = _d(contract.get("elliott_structure")) or _d(heart.get("elliott_structure"))
         conviction = build_risk_conviction(
@@ -198,7 +200,7 @@ async def execute_unified_heart_contracts(
         portfolio_multiplier = max(0.0, min(1.0, risk_multiplier))
         if defensive:
             portfolio_multiplier = min(portfolio_multiplier, DEFENSIVE_RISK_CAP)
-        scale = conviction_multiplier * portfolio_multiplier * btc_side_multiplier
+        scale = conviction_multiplier * portfolio_multiplier * btc_side_multiplier * quant_multiplier
         for key in ("quantity", "notional", "margin", "risk_usdt"):
             sizing[key] = round(_f(sizing.get(key)) * scale, 10)
         if sizing["quantity"] <= 0 or sizing["margin"] <= 0:
@@ -221,6 +223,8 @@ async def execute_unified_heart_contracts(
             "btc_overlay": btc_overlay or {},
             "btc_side_risk_multiplier": btc_side_multiplier,
             "btc_side_reason": btc_side_reason,
+            "quant_brain": quant,
+            "quant_risk_multiplier": quant_multiplier,
             "target_account_risk_pct_before_portfolio_brakes": conviction.get("target_account_risk_pct_before_portfolio_brakes"),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
             "stop_survival": survival,
@@ -284,6 +288,9 @@ async def execute_unified_heart_contracts(
             "btc_side_risk_multiplier": btc_side_multiplier,
             "btc_stress": (btc_overlay or {}).get("stress"),
             "btc_direction": (btc_overlay or {}).get("direction"),
+            "quant_risk_multiplier": quant_multiplier,
+            "quant_stance": quant.get("stance"),
+            "quant_directional_edge": quant.get("directional_edge"),
             "elliott": conviction.get("elliott"),
         })
 
@@ -314,5 +321,6 @@ async def execute_unified_heart_contracts(
             "stop_survival_sizes_from_hard_stop": True,
             "stop_never_widens_after_entry": True,
             "btc_adaptive_risk": True,
+            "quant_brain_risk": True,
         },
     }
