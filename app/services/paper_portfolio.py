@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,6 +25,18 @@ def _f(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _meta(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def choose_leverage(grade: str | None, fingerprint_score: float, catalyst_state: str | None) -> int:
@@ -263,11 +276,23 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
         qty, entry = _f(row["quantity"]), _f(row["entry_price"])
         raw = (mark-entry)*qty if row["side"] == "LONG" else (entry-mark)*qty
         unrealized += raw
+        metadata = _meta(row.get("metadata"))
         positions.append({
             "id": row["id"], "symbol": row["symbol"], "side": row["side"], "leverage": row["leverage"],
             "entry_price": entry, "mark_price": mark, "stop_loss": _f(row["stop_loss"]),
             "take_profit": _f(row["take_profit"]), "margin_used": _f(row["margin_used"]),
             "unrealized_pnl": round(raw, 6), "opened_at": row["opened_at"].isoformat(),
+            "strategy_mode": metadata.get("strategy_mode"),
+            "pattern_score": metadata.get("pattern_score"),
+            "phase": metadata.get("phase"),
+            "breakout_level": metadata.get("breakout_level"),
+            "retest_price": metadata.get("retest_price"),
+            "soft_invalidation_stop": metadata.get("soft_invalidation_stop") or metadata.get("soft_invalidation_level"),
+            "hard_stop": metadata.get("hard_stop") or metadata.get("structural_stop") or _f(row["stop_loss"]),
+            "stop_survival_enabled": bool(metadata.get("stop_survival_enabled")),
+            "chase_limit": metadata.get("chase_limit"),
+            "actual_stop_risk_usdt": metadata.get("actual_stop_risk_usdt"),
+            "net_rr": _meta(metadata.get("execution_math_live")).get("net_rr"),
         })
     cash = _f(account["cash_balance"])
     equity = cash + unrealized
@@ -308,10 +333,23 @@ async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, An
     await ensure_paper_schema(db)
     rows = (await db.execute(text("""
         SELECT id, symbol, side, leverage, entry_price, exit_price, stop_loss, take_profit,
-               opened_at, closed_at, exit_reason, gross_pnl, net_pnl, fees, slippage, funding_estimate
+               opened_at, closed_at, exit_reason, gross_pnl, net_pnl, fees, slippage, funding_estimate,
+               metadata
         FROM paper_positions WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT :limit
     """), {"limit": limit})).mappings().all()
-    return [dict(r) for r in rows]
+    output: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        metadata = _meta(row.pop("metadata", {}))
+        row["strategy_mode"] = metadata.get("strategy_mode")
+        row["pattern_score"] = metadata.get("pattern_score")
+        row["phase"] = metadata.get("phase")
+        row["soft_invalidation_stop"] = metadata.get("soft_invalidation_stop") or metadata.get("soft_invalidation_level")
+        row["hard_stop"] = metadata.get("hard_stop") or metadata.get("structural_stop") or row.get("stop_loss")
+        row["stop_survival_enabled"] = bool(metadata.get("stop_survival_enabled"))
+        row["net_rr"] = _meta(metadata.get("execution_math_live")).get("net_rr")
+        output.append(row)
+    return output
 
 
 async def run_paper_cycle(db: AsyncSession) -> dict[str, Any]:
