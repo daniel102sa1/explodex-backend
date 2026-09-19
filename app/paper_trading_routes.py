@@ -8,8 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.services.paper_edge_lab import edge_lab_report
 from app.services.chati_sarpon_612_monitor import open_monitor_report
-from app.services.paper_execution_v2 import EXECUTION_VERSION, run_paper_cycle_v2
-from app.services.paper_fast_cycle import latest_fast_cycle_result, run_fast_paper_cycle
+from app.services.paper_fast_cycle import VERSION as EXECUTION_VERSION, latest_fast_cycle_result, run_fast_paper_cycle
 from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
@@ -185,4 +184,10 @@ async def run_fast_cycle(db: AsyncSession = Depends(get_db)):
 @router.post("/run")
 async def run_cycle(db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
-    return {"version": "paper_portfolio_v1", "execution_version": EXECUTION_VERSION, "paper_only": True, "result": await run_paper_cycle_v2(db), "note": "Ciclo completo PAPER y laboratorios secundarios. La entrada TREND/PRE-MOVE viene del ExplodeX Heart."}
+    return {
+        "version": "paper_portfolio_v1",
+        "execution_version": EXECUTION_VERSION,
+        "paper_only": True,
+        "result": await run_fast_paper_cycle(db),
+        "note": "Alias seguro del único ciclo PAPER canónico. Los laboratorios legacy ya no pueden abrir posiciones desde este endpoint.",
+    }
