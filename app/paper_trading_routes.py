@@ -16,6 +16,7 @@ from app.services.paper_portfolio import ensure_paper_schema, paper_history, pap
 from app.services.paper_quant_risk_guard import paper_quant_risk_guard
 from app.services.paper_range_micro import range_summary, scan_all_eligible_ranges
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
+from app.services.paper_trade_auditor import paper_trade_audit_report, run_paper_trade_audits
 from app.services.validation_mode import ensure_validation_schema
 
 router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
@@ -79,6 +80,7 @@ async def summary(db: AsyncSession = Depends(get_db)):
     result["micro_scalp"] = await _safe_component(db, "micro_scalp", micro_summary)
     result["loss_autopsy"] = await _safe_component(db, "loss_autopsy", lambda session: loss_autopsy_report(session, days=30))
     result["quant_risk_guard"] = await _safe_component(db, "quant_risk_guard", paper_quant_risk_guard)
+    result["trade_audit"] = await _safe_component(db, "trade_audit", paper_trade_audit_report)
     return result
 
 
@@ -98,6 +100,22 @@ async def paper_loss_autopsy(days: int = Query(default=30, ge=1, le=365), db: As
 async def quant_risk(db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
     return await paper_quant_risk_guard(db)
+
+
+@router.get("/audit")
+async def trade_audit(closed_limit: int = Query(default=20, ge=1, le=100), db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return await paper_trade_audit_report(db, closed_limit=closed_limit)
+
+
+@router.post("/audit/run")
+async def run_trade_audit(db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return {
+        "paper_only": True,
+        "result": await run_paper_trade_audits(db),
+        "note": "Audita stops, +1R, TP1 y manejo. No ensancha ni modifica stops vivos.",
+    }
 
 
 @router.get("/history")
