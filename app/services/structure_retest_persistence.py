@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.binance import binance_client
 from app.services.execution_math import choose_target_for_min_net_rr
+from app.services.paper_regime_router import current_paper_regime
 from app.services.structure_retest_strategy import detect_structure_retest
 
 VERSION = "structure_retest_persistence_v1"
@@ -208,6 +209,18 @@ async def persist_structure_retest_for_run(db: AsyncSession, run_id: str) -> dic
         LIMIT :limit
     """), {"run_id": run_id, "limit": MAX_SYMBOLS_PER_RUN})).mappings().all()
 
+    try:
+        regime = await current_paper_regime()
+        btc_overlay = _d(regime.get("btc_overlay"))
+    except Exception:
+        btc_overlay = {
+            "stress": "UNKNOWN",
+            "direction": "NEUTRAL",
+            "stop_buffer_multiplier": 1.0,
+            "block_new_entries": False,
+            "min_quality_bonus": 5.0,
+        }
+
     updated = 0
     eligible = 0
     frozen = 0
@@ -241,6 +254,7 @@ async def persist_structure_retest_for_run(db: AsyncSession, run_id: str) -> dic
                 current_price=current,
                 klines_15m=klines15,
                 klines_1h=klines1h,
+                btc_stop_buffer_multiplier=_f(btc_overlay.get("stop_buffer_multiplier"), 1.0),
             )
         except Exception as exc:
             reject("market_data_error")
@@ -259,12 +273,15 @@ async def persist_structure_retest_for_run(db: AsyncSession, run_id: str) -> dic
         risk_score = _f(row.get("risk_score"), 100.0)
 
         blockers: list[str] = []
+        if bool(btc_overlay.get("block_new_entries")):
+            blockers.append("btc_shock_block")
         if primary_direction not in {"LONG", "SHORT"}:
             blockers.append("primary_direction_missing")
         if not bool(analysis.get("paper_candidate")):
             blockers.append("structure_retest_not_confirmed")
-        if _f(analysis.get("pattern_score")) < 72.0:
-            blockers.append("pattern_score_below_72")
+        min_pattern_score = 72.0 + _f(btc_overlay.get("min_quality_bonus"), 0.0)
+        if _f(analysis.get("pattern_score")) < min_pattern_score:
+            blockers.append(f"pattern_score_below_{int(min_pattern_score)}")
         if risk_score > 60.0:
             blockers.append("risk_score_above_60")
         if not bool(contract.get("hard_safety_clear", True)):
@@ -342,6 +359,7 @@ async def persist_structure_retest_for_run(db: AsyncSession, run_id: str) -> dic
             "market_breadth_alignment": breadth_alignment,
             "event_risk": event,
             "analysis": analysis,
+            "btc_overlay": btc_overlay,
             "blockers": list(dict.fromkeys(blockers)),
             "reason": "Breakout + retest + structure continuation. Stop comes from structural invalidation plus ATR buffer; size adapts to that stop.",
             "source": "HEART_STRUCTURE_RETEST_EXPERIMENT",
@@ -394,4 +412,5 @@ async def persist_structure_retest_for_run(db: AsyncSession, run_id: str) -> dic
         "no_chase": no_chase,
         "rejected": rejected,
         "paper_only": True,
+        "btc_overlay": btc_overlay,
     }

@@ -22,7 +22,7 @@ def _targets_for_lane(heart: dict[str, Any], lane_name: str, lane: dict[str, Any
     return [("TP1", _f(lane.get("tp1"), _f(plan.get("tp1")))), ("TP2", _f(lane.get("tp2"), _f(plan.get("tp2")))), ("TP3", _f(lane.get("tp3"), _f(plan.get("tp3"))))]
 
 
-def build_stop_survival_plan(*, heart: dict[str, Any], lane_name: str, lane: dict[str, Any], entry: float) -> dict[str, Any]:
+def build_stop_survival_plan(*, heart: dict[str, Any], lane_name: str, lane: dict[str, Any], entry: float, btc_context: dict[str, Any] | None = None) -> dict[str, Any]:
     lane_name = str(lane_name or "").upper(); lane = _d(lane); direction = str(lane.get("direction") or "").upper(); entry = _f(entry); soft_stop = _f(lane.get("stop_loss"))
     if direction not in {"LONG", "SHORT"} or entry <= 0 or soft_stop <= 0:
         return {"version": VERSION, "enabled": False, "reason": "invalid_geometry", "creates_entry": False, "changes_direction": False}
@@ -41,6 +41,12 @@ def build_stop_survival_plan(*, heart: dict[str, Any], lane_name: str, lane: dic
         buffer_pct, max_total_stop_pct, confirmation_minutes, min_net_rr = max(0.15, min(1.00, robust4*0.22)), 4.0, 5, 2.4
         hold_hours = max(0.5, min(6.0, _f(lane.get("max_hold_minutes"),120.0)/60.0))
 
+    btc_context = _d(btc_context)
+    btc_buffer_multiplier = max(1.0, min(1.35, _f(btc_context.get("stop_buffer_multiplier"), 1.0)))
+    btc_confirmation_minutes = int(max(5, min(15, _f(btc_context.get("confirmation_minutes"), confirmation_minutes))))
+    buffer_pct = min(max_total_stop_pct * 0.45, buffer_pct * btc_buffer_multiplier)
+    confirmation_minutes = max(confirmation_minutes, btc_confirmation_minutes)
+
     elliott = _d(heart.get("elliott_structure")) or _d(_d(heart.get("execution_contract")).get("elliott_structure")); best = _d(elliott.get("best"))
     es = _f(best.get("score")); edir = str(best.get("direction") or "").upper(); einv = _f(best.get("invalidation")); reference = soft_stop; elliott_used = False
     if es >= 72 and edir == direction and einv > 0:
@@ -58,4 +64,4 @@ def build_stop_survival_plan(*, heart: dict[str, Any], lane_name: str, lane: dic
     if not math.get("accepted"):
         return {"version":VERSION,"enabled":False,"reason":"survival_stop_breaks_min_net_rr","soft_invalidation_stop":round(soft_stop,12),"proposed_hard_stop":round(hard_stop,12),"buffer_pct":round(buffer_pct,4),"execution_math":math,"creates_entry":False,"changes_direction":False}
     chosen = _d(math.get("chosen_target")); soft_pct = abs(entry-soft_stop)/entry*100.0; hard_pct = abs(entry-hard_stop)/entry*100.0
-    return {"version":VERSION,"enabled":True,"mode":"CLOSE_CONFIRMATION_WITH_HARD_STOP","direction":direction,"soft_invalidation_stop":round(soft_stop,12),"hard_stop":round(hard_stop,12),"soft_stop_distance_pct":round(soft_pct,4),"hard_stop_distance_pct":round(hard_pct,4),"extra_room_pct":round(max(0.0,hard_pct-soft_pct),4),"confirmation_minutes":confirmation_minutes,"buffer_pct":round(buffer_pct,4),"elliott_invalidation_used":elliott_used,"elliott_invalidation":round(einv,12) if einv>0 else None,"elliott_score":round(es,1) if es>0 else None,"target_name":chosen.get("name"),"target_price":chosen.get("price"),"execution_math":math,"hard_stop_fixed_before_entry":True,"widen_after_entry":False,"size_from_hard_stop":True,"creates_entry":False,"changes_direction":False,"rule":"A wick through soft invalidation is tolerated; candle close beyond it confirms exit, or hard stop exits immediately."}
+    return {"version":VERSION,"enabled":True,"mode":"CLOSE_CONFIRMATION_WITH_HARD_STOP","direction":direction,"soft_invalidation_stop":round(soft_stop,12),"hard_stop":round(hard_stop,12),"soft_stop_distance_pct":round(soft_pct,4),"hard_stop_distance_pct":round(hard_pct,4),"extra_room_pct":round(max(0.0,hard_pct-soft_pct),4),"confirmation_minutes":confirmation_minutes,"buffer_pct":round(buffer_pct,4),"btc_stop_buffer_multiplier":round(btc_buffer_multiplier,3),"btc_stress":btc_context.get("stress"),"elliott_invalidation_used":elliott_used,"elliott_invalidation":round(einv,12) if einv>0 else None,"elliott_score":round(es,1) if es>0 else None,"target_name":chosen.get("name"),"target_price":chosen.get("price"),"execution_math":math,"hard_stop_fixed_before_entry":True,"widen_after_entry":False,"size_from_hard_stop":True,"creates_entry":False,"changes_direction":False,"rule":"A wick through soft invalidation is tolerated; candle close beyond it confirms exit, or hard stop exits immediately."}

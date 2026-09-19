@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
 from app.services.risk_conviction_engine import build_risk_conviction
+from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
 
 VERSION = "paper_pre_event_executor_v1"
@@ -33,7 +34,7 @@ def _geometry_ok(side: str, entry: float, stop: float, target: float) -> bool:
     return (side == "LONG" and stop < entry < target) or (side == "SHORT" and target < entry < stop)
 
 
-async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk_multiplier: float) -> dict[str, Any]:
+async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk_multiplier: float, btc_overlay: dict[str, Any] | None = None) -> dict[str, Any]:
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
     if open_count >= base.MAX_OPEN_POSITIONS:
         return {"version": VERSION, "opened": 0, "reason": "max_open_positions", "rejected": {}}
@@ -75,7 +76,9 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
         if not min(low, high) <= fill <= max(low, high): reject("stale_fill_outside_pre_event_band"); continue
         if not _geometry_ok(side, fill, stop, target): reject("invalid_live_geometry"); continue
 
-        survival = build_stop_survival_plan(heart=heart, lane_name="PRE_EVENT_PAPER", lane=lane, entry=fill)
+        btc_side_multiplier, btc_side_reason = btc_side_risk_multiplier(side, btc_overlay)
+        if btc_side_multiplier <= 0: reject(btc_side_reason or "btc_direction_block"); continue
+        survival = build_stop_survival_plan(heart=heart, lane_name="PRE_EVENT_PAPER", lane=lane, entry=fill, btc_context=btc_overlay)
         hard_stop = _f(survival.get("hard_stop"), stop) if survival.get("enabled") else stop
         live_target = _f(survival.get("target_price"), target) if survival.get("enabled") else target
         if not _geometry_ok(side, fill, hard_stop, live_target): reject("invalid_survival_geometry"); continue
@@ -85,7 +88,7 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
         conv_mult = min(0.25, max(0.05, _f(conviction.get("risk_budget_multiplier"),0.05)))
         portfolio_mult = max(0.0, min(1.0, risk_multiplier)); portfolio_mult = min(portfolio_mult, 0.25) if defensive else portfolio_mult
         leverage = int(max(1, min(2, _f(lane.get("max_leverage"),2.0))))
-        sizing = base.size_position(balance, fill, hard_stop, leverage); scale = conv_mult * portfolio_mult
+        sizing = base.size_position(balance, fill, hard_stop, leverage); scale = conv_mult * portfolio_mult * btc_side_multiplier
         for key in ("quantity","notional","margin","risk_usdt"): sizing[key] = round(_f(sizing.get(key))*scale,10)
         if sizing["quantity"] <= 0: reject("position_size_zero"); continue
 
@@ -96,6 +99,7 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
             "hard_stop": hard_stop, "max_hold_minutes": lane.get("max_hold_minutes"), "experimental": True,
             "portfolio_mode": "DEFENSIVE_LEARNING" if defensive else "NORMAL", "pre_event_risk_cap": 0.25,
             "executor_cannot_change_direction": True, "executor_cannot_create_lane": True,
+            "btc_overlay": btc_overlay or {}, "btc_side_risk_multiplier": btc_side_multiplier, "btc_side_reason": btc_side_reason,
         }
         result = await db.execute(text("""
             INSERT INTO paper_positions (signal_id,symbol,side,grade,fingerprint_score,leverage,entry_price,stop_loss,take_profit,quantity,notional,margin_used,risk_usdt,opened_at,metadata)
@@ -103,7 +107,7 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
             ON CONFLICT (signal_id) DO NOTHING
         """), {"signal_id":row["signal_id"],"symbol":symbol,"side":side,"score":_f(lane.get("preparation_score")),"leverage":leverage,"entry":fill,"stop":hard_stop,"target":live_target,"quantity":sizing["quantity"],"notional":sizing["notional"],"margin":sizing["margin"],"risk_usdt":sizing["risk_usdt"],"opened_at":datetime.now(timezone.utc),"metadata":json.dumps(metadata)})
         if not result.rowcount: reject("duplicate_signal"); continue
-        opened.append({"symbol":symbol,"lane":"PRE_EVENT_PAPER","side":side,"entry":fill,"hard_stop":hard_stop,"target":live_target,"risk_usdt":sizing["risk_usdt"],"preparation_score":lane.get("preparation_score"),"pre_event_type":lane.get("pre_event_type"),"defensive":defensive})
+        opened.append({"symbol":symbol,"lane":"PRE_EVENT_PAPER","side":side,"entry":fill,"hard_stop":hard_stop,"target":live_target,"risk_usdt":sizing["risk_usdt"],"preparation_score":lane.get("preparation_score"),"pre_event_type":lane.get("pre_event_type"),"defensive":defensive,"btc_side_risk_multiplier":btc_side_multiplier,"btc_stress":(btc_overlay or {}).get("stress"),"btc_direction":(btc_overlay or {}).get("direction")})
 
     await db.commit()
     return {"version":VERSION,"opened":len(opened),"trades":opened,"reason":"opened_pre_event_paper" if opened else "no_pre_event_fill","signals_checked":len(rows),"candidates":len(candidates),"rejected":rejected,"paper_only":True}

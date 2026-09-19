@@ -64,6 +64,8 @@ async def summary(db: AsyncSession = Depends(get_db)):
             "risk_policy": execution.get("risk_policy"),
             "quant_risk_guard": latest.get("quant_risk_guard"),
             "effective_new_entry_risk_multiplier": latest.get("effective_new_entry_risk_multiplier"),
+            "regime": latest.get("regime") or {},
+            "btc_overlay": latest.get("btc_overlay") or {},
             "trades": (execution.get("trades") or [])[:8],
             "pre_event_execution": latest.get("pre_event_execution") or {},
             "structure_retest_execution": latest.get("structure_retest_execution") or {},
