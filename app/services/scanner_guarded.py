@@ -14,6 +14,7 @@ from app.services.market_breadth_persistence import persist_market_breadth_for_r
 from app.services.microstructure_persistence_resilient import install_microstructure_persistence_hardening
 from app.services.plan_lifecycle_persistence import expire_exhausted_plans_for_run
 from app.services.pre_event_persistence import persist_pre_event_for_run
+from app.services.quant_brain_persistence import persist_quant_brain_for_run
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.scanner_edge_gate import apply_edge_gate_to_scanner_run
 from app.services.server_snapshot_extensions import install_server_snapshot_extensions
@@ -60,6 +61,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
         steps = [
             ("edge_gate", apply_edge_gate_to_scanner_run, "scanner_edge_gate"),
             ("explodex_heart", canonicalize_scanner_run, "explodex_heart"),
+            ("quant_brain", persist_quant_brain_for_run, "quant_brain_persistence"),
             ("trajectory_forecast", persist_trajectory_for_run, "trajectory_persistence"),
             ("entry_latch", apply_entry_latches_for_run, "entry_latch_persistence"),
             ("plan_lifecycle", expire_exhausted_plans_for_run, "plan_lifecycle_persistence"),

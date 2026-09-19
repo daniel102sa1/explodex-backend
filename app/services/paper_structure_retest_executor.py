@@ -167,13 +167,21 @@ async def execute_structure_retest_contracts(
         leverage = int(max(1, min(2, _f(lane.get("max_leverage"), 2))))
         sizing = base.size_position(balance, fill, stop, leverage)
 
+        quant = _d(_d(row.get("reason")).get("quant_brain"))
+        if not quant:
+            reason_bundle = _d(row.get("reason"))
+            prediction_bundle = _d(reason_bundle.get("prediction"))
+            heart_bundle = _d(reason_bundle.get("explodex_heart")) or _d(prediction_bundle.get("explodex_heart"))
+            quant = _d(heart_bundle.get("quant_brain"))
+        quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"), 1.0)))
+
         breadth_alignment = _d(lane.get("market_breadth_alignment"))
         breadth_multiplier = max(0.25, min(1.0, _f(breadth_alignment.get("risk_multiplier"), 1.0)))
         event = _d(lane.get("event_risk"))
         event_multiplier = max(0.0, min(1.0, _f(event.get("risk_multiplier"), 1.0)))
         global_multiplier = max(0.0, min(1.0, risk_multiplier))
         lane_scale = DEFENSIVE_RISK_SCALE if defensive else NORMAL_RISK_SCALE
-        scale = lane_scale * breadth_multiplier * event_multiplier * global_multiplier * btc_side_multiplier
+        scale = lane_scale * breadth_multiplier * event_multiplier * global_multiplier * btc_side_multiplier * quant_multiplier
 
         quantity = _f(sizing.get("quantity")) * scale
         notional = quantity * fill
@@ -222,6 +230,8 @@ async def execute_structure_retest_contracts(
             "btc_overlay": btc_overlay or {},
             "btc_side_risk_multiplier": btc_side_multiplier,
             "btc_side_reason": btc_side_reason,
+            "quant_brain": quant,
+            "quant_risk_multiplier": quant_multiplier,
             "max_hold_minutes": lane.get("max_hold_minutes"),
         }
 
@@ -275,6 +285,8 @@ async def execute_structure_retest_contracts(
             "btc_side_risk_multiplier": btc_side_multiplier,
             "btc_stress": (btc_overlay or {}).get("stress"),
             "btc_direction": (btc_overlay or {}).get("direction"),
+            "quant_risk_multiplier": quant_multiplier,
+            "quant_stance": quant.get("stance"),
         })
 
     await db.commit()
@@ -293,5 +305,6 @@ async def execute_structure_retest_contracts(
             "size_adapts_to_stop": True,
             "stop_never_widens_after_entry": True,
             "btc_adaptive_risk": True,
+            "quant_brain_risk": True,
         },
     }

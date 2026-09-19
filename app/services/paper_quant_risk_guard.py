@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from math import ceil, log, sqrt
+import random
 from statistics import mean, stdev
 from typing import Any
 
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.paper_portfolio import STARTING_BALANCE, ensure_paper_schema
 
-VERSION = "paper_quant_risk_guard_v1"
+VERSION = "paper_quant_risk_guard_v2_kelly_monte_carlo"
 
 MIN_RECENT_SAMPLE = 20
 HARD_DRAWDOWN_24H_PCT = 4.0
@@ -115,6 +116,99 @@ def _trade_ratios(r_values: list[float], trials: int = 1) -> dict[str, Any]:
     }
 
 
+def _q(values: list[float], quantile: float) -> float:
+    clean = sorted(values)
+    if not clean:
+        return 0.0
+    if len(clean) == 1:
+        return clean[0]
+    pos = (len(clean) - 1) * max(0.0, min(1.0, quantile))
+    lo = int(pos)
+    hi = min(len(clean) - 1, lo + 1)
+    weight = pos - lo
+    return clean[lo] * (1.0 - weight) + clean[hi] * weight
+
+
+def _expectancy_kelly(r_values: list[float]) -> dict[str, Any]:
+    sample = len(r_values)
+    wins = [r for r in r_values if r > 0]
+    losses = [abs(r) for r in r_values if r < 0]
+    p = len(wins) / sample if sample else 0.0
+    avg_win = mean(wins) if wins else 0.0
+    avg_loss = mean(losses) if losses else 0.0
+    payoff = avg_win / avg_loss if avg_loss > 1e-12 else None
+    expectancy_r = mean(r_values) if r_values else None
+
+    full_kelly = None
+    if payoff is not None and payoff > 1e-12 and sample:
+        full_kelly = p - (1.0 - p) / payoff
+    quarter_kelly = None if full_kelly is None else max(0.0, min(0.25, full_kelly * 0.25))
+
+    return {
+        "sample": sample,
+        "expectancy_r": round(expectancy_r, 4) if expectancy_r is not None else None,
+        "win_rate_pct": round(p * 100.0, 2) if sample else None,
+        "average_win_r": round(avg_win, 4) if wins else None,
+        "average_loss_r": round(avg_loss, 4) if losses else None,
+        "payoff_ratio": round(payoff, 4) if payoff is not None else None,
+        "full_kelly_fraction": round(full_kelly, 4) if full_kelly is not None else None,
+        "quarter_kelly_reference_fraction": round(quarter_kelly, 4) if quarter_kelly is not None else None,
+        "status": "USABLE_REFERENCE" if sample >= 30 else "CALIBRATING",
+        "kelly_is_direct_position_size": False,
+        "note": "Kelly is a bounded reference only; ExplodeX still sizes from structural stop and risk guards.",
+    }
+
+
+def _paper_monte_carlo(r_values: list[float], *, paths: int = 2000, trades_forward: int = 50) -> dict[str, Any]:
+    sample = len(r_values)
+    if sample < 20:
+        return {
+            "available": False,
+            "sample": sample,
+            "paths": 0,
+            "status": "CALIBRATING",
+        }
+
+    seed = 7919 + sample * 31 + int(sum(abs(r) for r in r_values) * 10000) % 104729
+    rng = random.Random(seed)
+    endings: list[float] = []
+    max_drawdowns: list[float] = []
+
+    # Simulate at 1% account risk per 1R only to compare strategy-path risk.
+    # This is not the live sizing rule.
+    for _ in range(paths):
+        equity = 1.0
+        peak = 1.0
+        max_dd = 0.0
+        for _trade in range(trades_forward):
+            r = r_values[rng.randrange(sample)]
+            equity *= max(0.01, 1.0 + r * 0.01)
+            peak = max(peak, equity)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - equity) / peak)
+        endings.append((equity - 1.0) * 100.0)
+        max_drawdowns.append(max_dd * 100.0)
+
+    return {
+        "available": True,
+        "sample": sample,
+        "paths": paths,
+        "trades_forward": trades_forward,
+        "assumed_risk_per_1r_pct": 1.0,
+        "median_ending_return_pct": round(_q(endings, 0.50), 3),
+        "p10_ending_return_pct": round(_q(endings, 0.10), 3),
+        "p90_ending_return_pct": round(_q(endings, 0.90), 3),
+        "median_max_drawdown_pct": round(_q(max_drawdowns, 0.50), 3),
+        "p90_max_drawdown_pct": round(_q(max_drawdowns, 0.90), 3),
+        "drawdown_ge_10pct_frequency_pct": round(sum(1 for x in max_drawdowns if x >= 10.0) / paths * 100.0, 2),
+        "drawdown_ge_20pct_frequency_pct": round(sum(1 for x in max_drawdowns if x >= 20.0) / paths * 100.0, 2),
+        "ending_loss_frequency_pct": round(sum(1 for x in endings if x < 0.0) / paths * 100.0, 2),
+        "status": "USABLE_REFERENCE" if sample >= 30 else "CALIBRATING",
+        "is_forecast_probability": False,
+        "note": "Bootstrap of observed PAPER R-multiples; model-risk diagnostic, not a guarantee.",
+    }
+
+
 def build_quant_metrics(
     rows_desc: list[dict[str, Any]],
     *,
@@ -124,6 +218,9 @@ def build_quant_metrics(
     recent = list(rows_desc[:max(1, recent_window)])
     r_values = [r for row in recent if (r := _trade_r(row)) is not None]
     ratios = _trade_ratios(r_values, trials=trials)
+    long_r_values = [r for row in rows_desc[:120] if (r := _trade_r(row)) is not None]
+    expectancy_kelly = _expectancy_kelly(long_r_values)
+    monte_carlo = _paper_monte_carlo(long_r_values)
     net = sum(_f(row.get("net_pnl")) for row in recent)
     winners = sum(1 for row in recent if _f(row.get("net_pnl")) > 0)
     closed = len(recent)
@@ -131,6 +228,8 @@ def build_quant_metrics(
 
     return {
         **ratios,
+        "expectancy_kelly": expectancy_kelly,
+        "paper_monte_carlo": monte_carlo,
         "recent_trades": closed,
         "recent_net_pnl": round(net, 6),
         "recent_expectancy_usdt": round(net / closed, 6) if closed else 0.0,
@@ -154,6 +253,12 @@ def evaluate_quant_guard(
     streak = int(metrics.get("consecutive_losses") or 0)
     cvar_r = metrics.get("cvar_95_r")
     cvar_r_f = _f(cvar_r) if cvar_r is not None else None
+    kelly = metrics.get("expectancy_kelly") if isinstance(metrics.get("expectancy_kelly"), dict) else {}
+    monte_carlo = metrics.get("paper_monte_carlo") if isinstance(metrics.get("paper_monte_carlo"), dict) else {}
+    kelly_sample = int(kelly.get("sample") or 0)
+    full_kelly = kelly.get("full_kelly_fraction")
+    mc_sample = int(monte_carlo.get("sample") or 0)
+    mc_dd20 = _f(monte_carlo.get("drawdown_ge_20pct_frequency_pct"))
 
     hard_reasons: list[str] = []
     reduce_hard_reasons: list[str] = []
@@ -174,6 +279,10 @@ def evaluate_quant_guard(
         reduce_hard_reasons.append("recent_profit_factor_below_0_80")
     if trades >= MIN_RECENT_SAMPLE and cvar_r_f is not None and cvar_r_f <= -1.35:
         reduce_hard_reasons.append("cvar95_worse_than_minus_1_35r")
+    if kelly_sample >= 30 and full_kelly is not None and _f(full_kelly) <= 0:
+        reduce_hard_reasons.append("kelly_reference_non_positive")
+    if mc_sample >= 30 and mc_dd20 >= 35.0:
+        reduce_hard_reasons.append("monte_carlo_drawdown20_frequency_ge_35pct")
 
     if drawdown_24h_pct >= REDUCE_DRAWDOWN_24H_PCT:
         reduce_reasons.append("daily_drawdown_ge_1pct")
@@ -181,6 +290,8 @@ def evaluate_quant_guard(
         reduce_reasons.append("three_consecutive_losses")
     if trades >= MIN_RECENT_SAMPLE and expectancy < 0 and pf < REDUCE_PROFIT_FACTOR:
         reduce_reasons.append("recent_profit_factor_below_0_95")
+    if mc_sample >= 30 and mc_dd20 >= 20.0:
+        reduce_reasons.append("monte_carlo_drawdown20_frequency_ge_20pct")
 
     if hard_reasons:
         state = "HALT_NEW_ENTRIES"
@@ -209,7 +320,7 @@ def evaluate_quant_guard(
         "can_create_entry": False,
         "can_change_direction": False,
         "manages_existing_exits": False,
-        "rule": "Quant guard can only reduce or halt NEW PAPER entries. Existing positions remain managed by the canonical Heart/PAPER exit logic.",
+        "rule": "Quant guard combines R-expectancy, bounded Kelly reference, CVaR and PAPER Monte Carlo. It can only reduce/halt NEW PAPER entries; structural stop remains the sizing anchor.",
     }
 
 
@@ -241,5 +352,5 @@ async def paper_quant_risk_guard(db: AsyncSession, *, limit: int = 500) -> dict[
         **guard,
         "net_24h": round(net_24h, 6),
         "cohort_trials_proxy": max(1, len(cohorts)),
-        "statistics_note": "Sharpe/Sortino are per-trade R-multiple diagnostics, not annualized portfolio ratios. Deflated Sharpe is a conservative proxy until the full strategy-search trial history is persisted.",
+        "statistics_note": "Sharpe/Sortino use per-trade R. Kelly is reference-only. Monte Carlo bootstraps observed PAPER R-multiples at a standardized 1% per R for path-risk comparison; none of these are guaranteed next-trade probabilities.",
     }

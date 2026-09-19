@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.execution_math import choose_target_for_min_net_rr
 
-VERSION = "unified_heart_contract_v1"
-HEART_VERSION = "explodex_heart_v7_unified"
+VERSION = "unified_heart_contract_v2_quant_brain"
+HEART_VERSION = "explodex_heart_v8_quant_unified"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -45,6 +45,7 @@ def _hard_safety_clear(heart: dict[str, Any], prediction: dict[str, Any]) -> tup
     guard = _d(prediction.get("decision_guard"))
     thesis = _d(heart.get("thesis"))
     latch = _d(heart.get("entry_latch"))
+    quant = _d(heart.get("quant_brain"))
 
     if bool(veto.get("blocked")) or bool(veto.get("hard_block")):
         blockers.append("hard_veto")
@@ -60,6 +61,10 @@ def _hard_safety_clear(heart: dict[str, Any], prediction: dict[str, Any]) -> tup
         blockers.append("thesis_cooldown")
     if str(latch.get("status") or "") in {"TRIGGERED", "IN_POSITION"}:
         blockers.append("entry_already_triggered")
+    if bool(quant.get("block_new_entry")):
+        blockers.append("quant_brain_block")
+    elif bool(quant.get("strong_conflict")):
+        blockers.append("quant_brain_conflict")
     return not blockers, blockers
 
 
@@ -114,12 +119,16 @@ def _aggressive_lane(
     direction = str(heart.get("direction") or score.get("direction") or "").upper()
     current = _f(score.get("current_price"))
     blockers = list(safety_blockers)
+    quant = _d(heart.get("quant_brain"))
+    preferred_strategy = str(_d(quant.get("strategy_selector")).get("preferred") or "")
 
     action = str(decision.get("action") or "").upper()
     stage = str(ignition.get("stage") or "").upper()
     ignition_score = _f(ignition.get("score"))
     if action != "ESPERAR":
         blockers.append("tactical_action_not_waiting")
+    if preferred_strategy in {"DEFENSIVE_CONFIRMATION", "DEFENSIVE_WAIT_OR_CONFIRMED_BREAKOUT", "WAIT_FOR_CONFIRMATION"}:
+        blockers.append("quant_regime_disallows_early_aggressive")
     if not bool(thesis.get("frozen_plan")):
         blockers.append("no_frozen_thesis")
     if str(thesis.get("status") or "").upper() not in {"WAITING_ENTRY", "ENTER_NOW"}:
@@ -167,6 +176,7 @@ def _aggressive_lane(
         "max_hold_minutes": 120,
         "blockers": blockers,
         "reason": "Entrada temprana PAPER emitida por el mismo Heart; nunca sustituye la recomendación táctica principal.",
+        "quant_strategy_fit": preferred_strategy,
         "source": "HEART_IGNITION_EXPERIMENT",
     }
 
@@ -182,6 +192,8 @@ def _swing_lane(
     direction = str(trajectory.get("direction") or "").upper()
     current = _f(score.get("current_price"))
     blockers = list(safety_blockers)
+    quant = _d(heart.get("quant_brain"))
+    preferred_strategy = str(_d(quant.get("strategy_selector")).get("preferred") or "")
 
     if not trajectory:
         blockers.append("missing_trajectory")
@@ -192,6 +204,8 @@ def _swing_lane(
         blockers.append("direction_edge_below_12")
     if _f(trajectory.get("trajectory_score")) < 62.0:
         blockers.append("trajectory_score_below_62")
+    if preferred_strategy == "MEAN_REVERSION_RETEST" and _f(quant.get("directional_edge")) < 15.0:
+        blockers.append("quant_range_regime_not_swing")
     if not _inside(current, _f(plan.get("entry_low")), _f(plan.get("entry_high"))):
         blockers.append("price_outside_swing_band")
 
@@ -236,6 +250,7 @@ def _swing_lane(
         "max_hold_minutes": max_hold,
         "blockers": blockers,
         "reason": "Trayectoria 4h-48h emitida por el mismo Heart con stop estructural y tamaño reducido.",
+        "quant_strategy_fit": preferred_strategy,
         "source": "HEART_TRAJECTORY",
     }
 
@@ -247,6 +262,7 @@ def build_execution_contract(
     prediction: dict[str, Any],
 ) -> dict[str, Any]:
     safety_clear, safety_blockers = _hard_safety_clear(heart, prediction)
+    quant = _d(heart.get("quant_brain"))
     tactical = _tactical_lane(heart, score)
     aggressive = _aggressive_lane(heart, score, prediction, safety_clear, safety_blockers)
     swing = _swing_lane(heart, score, safety_clear, safety_blockers)
@@ -300,13 +316,18 @@ def build_execution_contract(
         "priority": ["TACTICAL", "AGGRESSIVE_PAPER", "SWING_PAPER"],
         "hard_safety_clear": safety_clear,
         "hard_safety_blockers": safety_blockers,
+        "quant_brain": quant,
+        "quant_risk_multiplier": max(0.20, min(1.0, _f(quant.get("risk_multiplier"), 1.0))) if quant else 1.0,
+        "quant_stance": quant.get("stance") if quant else "UNAVAILABLE",
+        "quant_directional_edge": quant.get("directional_edge") if quant else None,
+        "quant_strategy_selector": _d(quant.get("strategy_selector")),
         "forecast": forecast,
         "lanes": {
             "tactical": tactical,
             "aggressive_paper": aggressive,
             "swing_paper": swing,
         },
-        "rule": "Scanner, coin analysis and PAPER consume this same Heart contract. Executors may reject a stale fill but cannot invent a new direction or strategy.",
+        "rule": "Scanner, Quant Brain, coin analysis and PAPER consume this same Heart contract. Quant evidence may reduce/block risk but cannot invent a direction, upgrade WAIT to ENTER, or widen a live stop.",
     }
 
 
