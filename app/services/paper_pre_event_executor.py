@@ -83,7 +83,7 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
         live_target = _f(survival.get("target_price"), target) if survival.get("enabled") else target
         if not _geometry_ok(side, fill, hard_stop, live_target): reject("invalid_survival_geometry"); continue
 
-        contract = _d(heart.get("execution_contract")); quant = _d(heart.get("quant_brain")) or _d(contract.get("quant_brain")); quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"),0.70))); matrix = _d(contract.get("forecast_matrix")) or _d(heart.get("forecast_matrix")); elliott = _d(contract.get("elliott_structure")) or _d(heart.get("elliott_structure"))
+        contract = _d(heart.get("execution_contract")); quant = _d(heart.get("quant_brain")) or _d(contract.get("quant_brain")); quant_multiplier = max(0.20, min(1.0, _f(quant.get("risk_multiplier"),1.0))); matrix = _d(contract.get("forecast_matrix")) or _d(heart.get("forecast_matrix")); elliott = _d(contract.get("elliott_structure")) or _d(heart.get("elliott_structure"))
         conviction = build_risk_conviction(lane_name="PRE_EVENT_PAPER", lane=lane, setup_score=_f(row.get("setup_score")), risk_score=_f(row.get("risk_score"),100.0), forecast_matrix=matrix, elliott_structure=elliott)
         conv_mult = min(0.25, max(0.05, _f(conviction.get("risk_budget_multiplier"),0.05)))
         portfolio_mult = max(0.0, min(1.0, risk_multiplier)); portfolio_mult = min(portfolio_mult, 0.25) if defensive else portfolio_mult
