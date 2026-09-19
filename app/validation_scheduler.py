@@ -6,14 +6,18 @@ from typing import Any, Awaitable, Callable
 
 from app.config import settings
 from app.database import SessionLocal
-from app.services.paper_execution_v2 import run_paper_cycle_v2
 from app.services.validation_mode import run_validation_cycle
 
 logger = logging.getLogger("explodex.validation")
 
 
 class ValidationScheduler:
-    """ASGI wrapper that runs research validation and PAPER simulation only."""
+    """ASGI wrapper for research validation only.
+
+    Visible PAPER execution has one authority: paper_fast_cycle / Unified Heart.
+    This scheduler may label/evaluate signals but must never open or close
+    paper_positions.
+    """
 
     def __init__(self, app: Any, interval_seconds: int = 300, startup_delay_seconds: int = 90) -> None:
         self.app = app
@@ -27,14 +31,10 @@ class ValidationScheduler:
             try:
                 async with SessionLocal() as db:
                     await run_validation_cycle(db)
-                    # The PAPER cycle now includes TREND/PRE-MOVE plus an independent
-                    # all-eligible-universe RANGE MICRO scanner. RANGE MICRO is cached
-                    # internally to ~5m, so this loop can stay conservative.
-                    await run_paper_cycle_v2(db)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Validation/PAPER cycle failed")
+                logger.exception("Validation research cycle failed")
             await asyncio.sleep(self.interval_seconds)
 
     async def __call__(
