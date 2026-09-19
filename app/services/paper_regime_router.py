@@ -5,7 +5,7 @@ from typing import Any
 
 from app.services.binance import binance_client
 
-REGIME_VERSION = "paper_regime_router_v1"
+REGIME_VERSION = "paper_regime_router_v2_btc_adaptive"
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -55,6 +55,114 @@ def _ret(rows: list[list[Any]], bars: int) -> float:
     return (end / start - 1.0) * 100.0
 
 
+def _percentile_rank(values: list[float], value: float) -> float:
+    clean = sorted(v for v in values if v >= 0)
+    if not clean:
+        return 0.0
+    below_or_equal = sum(1 for item in clean if item <= value)
+    return below_or_equal / len(clean) * 100.0
+
+
+def _rolling_atr_pct(rows: list[list[Any]], period: int = 14) -> list[float]:
+    usable = [row for row in rows if len(row) >= 5]
+    if len(usable) < period + 2:
+        return []
+    out: list[float] = []
+    for end in range(period + 1, len(usable) + 1):
+        sample = usable[:end]
+        value = _atr_pct(sample, period)
+        if value > 0:
+            out.append(value)
+    return out
+
+
+def _direction_label(trend: float, ret_15m: float, ret_60m: float) -> str:
+    signed = trend * 0.55 + (1.0 if ret_15m > 0 else -1.0 if ret_15m < 0 else 0.0) * 0.20 + (1.0 if ret_60m > 0 else -1.0 if ret_60m < 0 else 0.0) * 0.25
+    if signed >= 0.35:
+        return "BULLISH"
+    if signed <= -0.35:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def btc_adaptive_overlay(btc_5m: list[list[Any]], btc_15m: list[list[Any]]) -> dict[str, Any]:
+    btc = _asset_features(btc_5m, btc_15m)
+    atr_series = _rolling_atr_pct(btc_5m, 14)
+    current_atr = btc.get("atr_pct", 0.0)
+    atr_percentile = _percentile_rank(atr_series[-180:-1] or atr_series[:-1], current_atr) if atr_series else 0.0
+
+    ret_5m = abs(_ret(btc_5m, 1))
+    ret_15m = abs(btc.get("ret_15m_pct", 0.0))
+    ret_60m = abs(btc.get("ret_60m_pct", 0.0))
+    direction = _direction_label(
+        btc.get("trend", 0.0),
+        btc.get("ret_15m_pct", 0.0),
+        btc.get("ret_60m_pct", 0.0),
+    )
+
+    if ret_5m >= 1.20 or ret_15m >= 2.30 or ret_60m >= 4.20:
+        stress = "SHOCK"
+        risk_multiplier = 0.0
+        stop_buffer_multiplier = 1.0
+        countertrend_multiplier = 0.0
+        force_defensive = True
+        block_new_entries = True
+        min_quality_bonus = 18.0
+    elif atr_percentile >= 95 or ret_15m >= 1.65 or ret_60m >= 3.20:
+        stress = "EXTREME"
+        risk_multiplier = 0.30
+        stop_buffer_multiplier = 1.30
+        countertrend_multiplier = 0.0
+        force_defensive = True
+        block_new_entries = False
+        min_quality_bonus = 10.0
+    elif atr_percentile >= 85 or ret_15m >= 1.10 or ret_60m >= 2.20:
+        stress = "HIGH"
+        risk_multiplier = 0.50
+        stop_buffer_multiplier = 1.18
+        countertrend_multiplier = 0.35
+        force_defensive = True
+        block_new_entries = False
+        min_quality_bonus = 6.0
+    elif atr_percentile >= 70 or ret_15m >= 0.70 or ret_60m >= 1.40:
+        stress = "ELEVATED"
+        risk_multiplier = 0.75
+        stop_buffer_multiplier = 1.08
+        countertrend_multiplier = 0.70
+        force_defensive = False
+        block_new_entries = False
+        min_quality_bonus = 3.0
+    else:
+        stress = "NORMAL"
+        risk_multiplier = 1.0
+        stop_buffer_multiplier = 1.0
+        countertrend_multiplier = 1.0
+        force_defensive = False
+        block_new_entries = False
+        min_quality_bonus = 0.0
+
+    confirmation_minutes = 15 if stress in {"HIGH", "EXTREME", "SHOCK"} else 5
+    return {
+        "version": "btc_adaptive_overlay_v1",
+        "stress": stress,
+        "direction": direction,
+        "atr_pct": round(current_atr, 4),
+        "atr_percentile_recent": round(atr_percentile, 2),
+        "abs_move_5m_pct": round(ret_5m, 4),
+        "abs_move_15m_pct": round(ret_15m, 4),
+        "abs_move_60m_pct": round(ret_60m, 4),
+        "risk_multiplier": risk_multiplier,
+        "stop_buffer_multiplier": stop_buffer_multiplier,
+        "countertrend_multiplier": countertrend_multiplier,
+        "force_defensive": force_defensive,
+        "block_new_entries": block_new_entries,
+        "min_quality_bonus": min_quality_bonus,
+        "confirmation_minutes": confirmation_minutes,
+        "stop_policy": "Wider structural buffer is allowed only BEFORE entry; position size must shrink from the final stop. Never widen after entry.",
+        "note": "BTC stress is relative to recent BTC volatility plus absolute shock thresholds; not a probability forecast.",
+    }
+
+
 def _asset_features(rows_5m: list[list[Any]], rows_15m: list[list[Any]]) -> dict[str, float]:
     closes_5 = [_f(row[4]) for row in rows_5m if len(row) >= 5][-72:]
     closes_15 = [_f(row[4]) for row in rows_15m if len(row) >= 5][-48:]
@@ -99,6 +207,7 @@ def classify_regime(
 ) -> dict[str, Any]:
     btc = _asset_features(btc_5m, btc_15m)
     eth = _asset_features(eth_5m, eth_15m)
+    btc_overlay = btc_adaptive_overlay(btc_5m, btc_15m)
 
     trend_score = 0.62 * btc["trend"] * btc["strength"] + 0.38 * eth["trend"] * eth["strength"]
     trend_strength = abs(trend_score)
@@ -106,9 +215,9 @@ def classify_regime(
     shock_move = max(abs(btc["ret_15m_pct"]), abs(eth["ret_15m_pct"]), abs(btc["ret_60m_pct"]), abs(eth["ret_60m_pct"]))
     aligned = btc["trend"] != 0 and btc["trend"] == eth["trend"]
 
-    if avg_atr >= 1.15 or shock_move >= 2.2:
+    if btc_overlay["stress"] in {"HIGH", "EXTREME", "SHOCK"} or avg_atr >= 1.15 or shock_move >= 2.2:
         regime = "HIGH_VOLATILITY"
-        label = "VOLATILIDAD ALTA"
+        label = "VOLATILIDAD ALTA BTC" if btc_overlay["stress"] != "SHOCK" else "SHOCK BTC"
     elif aligned and trend_strength >= 28:
         regime = "TREND_UP" if trend_score > 0 else "TREND_DOWN"
         label = "TENDENCIA ALCISTA" if trend_score > 0 else "TENDENCIA BAJISTA"
@@ -133,7 +242,10 @@ def classify_regime(
     elif regime == "HIGH_VOLATILITY":
         policy["range_micro"] = {"enabled": False, "risk_multiplier": 0.0}
         policy["micro_scalp"] = {"enabled": False, "risk_multiplier": 0.0}
-        policy["trend_premove"] = {"enabled": True, "risk_multiplier": 0.55}
+        policy["trend_premove"] = {
+            "enabled": not bool(btc_overlay.get("block_new_entries")),
+            "risk_multiplier": min(0.55, float(btc_overlay.get("risk_multiplier") or 0.0)),
+        }
     else:
         policy["range_micro"] = {"enabled": True, "risk_multiplier": 0.55}
         policy["micro_scalp"] = {"enabled": True, "risk_multiplier": 0.55}
@@ -149,6 +261,7 @@ def classify_regime(
         "shock_move_pct": round(shock_move, 4),
         "btc": {k: round(v, 4) for k, v in btc.items()},
         "eth": {k: round(v, 4) for k, v in eth.items()},
+        "btc_overlay": btc_overlay,
         "policy": policy,
         "paper_only": True,
         "note": "Enruta estrategias PAPER según régimen; no crea entradas por sí solo.",
@@ -157,10 +270,10 @@ def classify_regime(
 
 async def current_paper_regime() -> dict[str, Any]:
     values = await asyncio.gather(
-        binance_client.klines("BTCUSDT", "5m", 72),
-        binance_client.klines("BTCUSDT", "15m", 48),
-        binance_client.klines("ETHUSDT", "5m", 72),
-        binance_client.klines("ETHUSDT", "15m", 48),
+        binance_client.klines("BTCUSDT", "5m", 240),
+        binance_client.klines("BTCUSDT", "15m", 160),
+        binance_client.klines("ETHUSDT", "5m", 120),
+        binance_client.klines("ETHUSDT", "15m", 80),
         return_exceptions=True,
     )
 
@@ -175,6 +288,18 @@ async def current_paper_regime() -> dict[str, Any]:
                 "trend_premove": {"enabled": True, "risk_multiplier": 0.70},
                 "range_micro": {"enabled": True, "risk_multiplier": 0.50},
                 "micro_scalp": {"enabled": True, "risk_multiplier": 0.50},
+            },
+            "btc_overlay": {
+                "version": "btc_adaptive_overlay_v1",
+                "stress": "UNKNOWN",
+                "direction": "NEUTRAL",
+                "risk_multiplier": 0.70,
+                "stop_buffer_multiplier": 1.0,
+                "countertrend_multiplier": 0.70,
+                "force_defensive": True,
+                "block_new_entries": False,
+                "min_quality_bonus": 5.0,
+                "confirmation_minutes": 15,
             },
             "provider_source": binance_client.active_source,
         }
