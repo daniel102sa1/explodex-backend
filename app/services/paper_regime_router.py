@@ -268,6 +268,32 @@ def classify_regime(
     }
 
 
+def btc_side_risk_multiplier(side: str, overlay: dict[str, Any] | None) -> tuple[float, str | None]:
+    overlay = overlay if isinstance(overlay, dict) else {}
+    if bool(overlay.get("block_new_entries")):
+        return 0.0, "btc_shock_blocks_new_entries"
+
+    side = str(side or "").upper()
+    btc_direction = str(overlay.get("direction") or "NEUTRAL").upper()
+    stress = str(overlay.get("stress") or "UNKNOWN").upper()
+
+    if side not in {"LONG", "SHORT"}:
+        return 0.0, "invalid_side"
+
+    if btc_direction == "NEUTRAL":
+        neutral_multiplier = 0.70 if stress in {"HIGH", "EXTREME"} else 0.85 if stress == "ELEVATED" else 1.0
+        return neutral_multiplier, None
+
+    aligned = (side == "LONG" and btc_direction == "BULLISH") or (side == "SHORT" and btc_direction == "BEARISH")
+    if aligned:
+        return 1.0, None
+
+    multiplier = max(0.0, min(1.0, _f(overlay.get("countertrend_multiplier"), 1.0)))
+    if multiplier <= 0:
+        return 0.0, f"btc_{stress.lower()}_countertrend_block"
+    return multiplier, f"btc_{stress.lower()}_countertrend_reduced"
+
+
 async def current_paper_regime() -> dict[str, Any]:
     values = await asyncio.gather(
         binance_client.klines("BTCUSDT", "5m", 240),
