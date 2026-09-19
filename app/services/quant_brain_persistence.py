@@ -12,7 +12,7 @@ from app.services.quant_brain import VERSION as QUANT_VERSION, build_quant_brain
 from app.services.shadow_forecast_memory import shadow_calibration_report
 
 VERSION = "quant_brain_persistence_v1"
-MAX_SYMBOLS = 16
+MAX_SYMBOLS = 20
 CONCURRENCY = 4
 
 
