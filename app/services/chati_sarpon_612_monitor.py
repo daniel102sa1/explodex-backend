@@ -250,9 +250,13 @@ def build_manual_monitor(
         }
 
     ratio_5m = _f(metrics.get("taker_latest"), 1.0)
-    # Existing scanner stores mean of last three 5m taker blocks. Operationally
-    # this is our 15m CHATI confirmation layer.
-    ratio_15m = _f(metrics.get("taker_avg_3"), 1.0)
+    ratio_15m_raw = metrics.get("taker_15m_ratio")
+    ratio_15m = _f(ratio_15m_raw, _f(metrics.get("taker_avg_3"), 1.0))
+    ratio_15m_source = (
+        str(metrics.get("taker_15m_ratio_source") or "AGGREGATED_3X5M_BUYSELL_VOLUME")
+        if ratio_15m_raw is not None
+        else "THREE_5M_RATIO_PROXY"
+    )
     futures_delta = _f(metrics.get("futures_delta_ratio"))
     spot_delta = _f(metrics.get("spot_delta_ratio"))
     oi_change = _f(metrics.get("oi_change_pct"))
@@ -396,7 +400,10 @@ def build_manual_monitor(
         "components": {key: round(value, 2) for key, value in components.items()},
         "chati": {
             "ratio_5m": round(ratio_5m, 4),
-            "ratio_15m_proxy_from_3x5m": round(ratio_15m, 4),
+            "ratio_15m": round(ratio_15m, 4),
+            "ratio_15m_source": ratio_15m_source,
+            "taker_5m_delta": metrics.get("taker_5m_delta"),
+            "taker_15m_delta": metrics.get("taker_15m_delta"),
             "futures_delta_ratio": round(futures_delta, 4),
             "spot_delta_ratio": round(spot_delta, 4),
             "five_minute_aligned": five_aligned,
