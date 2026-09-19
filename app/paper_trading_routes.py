@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.services.paper_edge_lab import edge_lab_report
+from app.services.chati_sarpon_612_monitor import open_monitor_report
 from app.services.paper_execution_v2 import EXECUTION_VERSION, run_paper_cycle_v2
 from app.services.paper_fast_cycle import latest_fast_cycle_result, run_fast_paper_cycle
 from app.services.paper_loss_autopsy import loss_autopsy_report
@@ -67,6 +68,7 @@ async def summary(db: AsyncSession = Depends(get_db)):
             "effective_new_entry_risk_multiplier": latest.get("effective_new_entry_risk_multiplier"),
             "regime": latest.get("regime") or {},
             "btc_overlay": latest.get("btc_overlay") or {},
+            "chati_sarpon_612_live_monitor": latest.get("chati_sarpon_612_live_monitor") or {},
             "trades": (execution.get("trades") or [])[:8],
             "pre_event_execution": latest.get("pre_event_execution") or {},
             "structure_retest_execution": latest.get("structure_retest_execution") or {},
@@ -84,6 +86,7 @@ async def summary(db: AsyncSession = Depends(get_db)):
     result["loss_autopsy"] = await _safe_component(db, "loss_autopsy", lambda session: loss_autopsy_report(session, days=30))
     result["quant_risk_guard"] = await _safe_component(db, "quant_risk_guard", paper_quant_risk_guard)
     result["quant_brain"] = await _safe_component(db, "quant_brain", quant_brain_report)
+    result["chati_sarpon_612_monitor"] = await _safe_component(db, "chati_sarpon_612_monitor", open_monitor_report)
     result["trade_audit"] = await _safe_component(db, "trade_audit", paper_trade_audit_report)
     return result
 
@@ -98,6 +101,12 @@ async def adaptive_edge_lab(days: int = Query(default=30, ge=1, le=365), db: Asy
 async def paper_loss_autopsy(days: int = Query(default=30, ge=1, le=365), db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
     return await loss_autopsy_report(db, days=days)
+
+
+@router.get("/chati-sarpon-612")
+async def chati_sarpon_612(db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return await open_monitor_report(db)
 
 
 @router.get("/quant-brain")
