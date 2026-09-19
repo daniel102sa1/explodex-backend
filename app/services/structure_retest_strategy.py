@@ -89,11 +89,13 @@ def detect_structure_retest(
     current_price: float,
     klines_15m: list[list[Any]],
     klines_1h: list[list[Any]] | None = None,
+    btc_stop_buffer_multiplier: float = 1.0,
 ) -> dict[str, Any]:
     direction = str(direction or "").upper()
     bars15 = _bars(klines_15m)
     bars1h = _bars(klines_1h or [])
     current_price = _f(current_price)
+    btc_stop_buffer_multiplier = max(1.0, min(1.35, _f(btc_stop_buffer_multiplier, 1.0)))
 
     if direction not in {"LONG", "SHORT"} or len(bars15) < 40 or current_price <= 0:
         return {
@@ -200,7 +202,7 @@ def detect_structure_retest(
             recent_lows = [bar["low"] for bar in subsequent[-4:]]
             higher_low_or_lower_high = bool(recent_lows) and min(recent_lows) >= retest_bar["low"] - atr * 0.08
             structural_level = min(recent_lows + [retest_bar["low"]])
-            structural_buffer = max(atr * 0.45, current_price * 0.0015)
+            structural_buffer = max(atr * 0.45, current_price * 0.0015) * btc_stop_buffer_multiplier * btc_stop_buffer_multiplier
             structural_stop = structural_level - structural_buffer
         else:
             continuation = latest["close"] <= level - atr * 0.18 and latest["close"] < retest_bar["close"]
@@ -301,6 +303,7 @@ def detect_structure_retest(
             "position_size_must_adapt_to_stop": True,
             "stop_fixed_before_entry": True,
             "stop_never_widens_after_entry": True,
+            "btc_stop_buffer_multiplier": round(btc_stop_buffer_multiplier, 3),
         },
         "reason": "breakout_retest_structure" if paper_candidate else phase.lower(),
     }
