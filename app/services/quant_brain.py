@@ -596,22 +596,22 @@ def build_quant_brain(
     if regime in {"TREND_UP", "TREND_DOWN"}:
         weights = {
             "trend": 0.22, "momentum": 0.16, "vwap": 0.08, "macd": 0.10,
-            "flow": 0.22, "btc": 0.14, "mean_reversion": 0.03, "cointegration": 0.05,
+            "flow": 0.22, "btc_beta_context": 0.14, "mean_reversion": 0.03, "cointegration": 0.05,
         }
     elif regime == "RANGE":
         weights = {
             "trend": 0.08, "momentum": 0.08, "vwap": 0.10, "macd": 0.08,
-            "flow": 0.20, "btc": 0.10, "mean_reversion": 0.22, "cointegration": 0.14,
+            "flow": 0.20, "btc_beta_context": 0.10, "mean_reversion": 0.22, "cointegration": 0.14,
         }
     elif regime == "VOLATILE":
         weights = {
             "trend": 0.12, "momentum": 0.14, "vwap": 0.07, "macd": 0.07,
-            "flow": 0.27, "btc": 0.23, "mean_reversion": 0.04, "cointegration": 0.06,
+            "flow": 0.27, "btc_beta_context": 0.23, "mean_reversion": 0.04, "cointegration": 0.06,
         }
     else:
         weights = {
             "trend": 0.15, "momentum": 0.12, "vwap": 0.10, "macd": 0.09,
-            "flow": 0.23, "btc": 0.15, "mean_reversion": 0.08, "cointegration": 0.08,
+            "flow": 0.23, "btc_beta_context": 0.15, "mean_reversion": 0.08, "cointegration": 0.08,
         }
 
     components = {
