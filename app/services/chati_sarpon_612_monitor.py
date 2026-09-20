@@ -469,8 +469,6 @@ def build_manual_monitor(
             "may_upgrade_wait_to_entry": False,
             "murphy_nison_confirmation_required_when_available": True,
             "unknown_sarpon_books_are_not_invented": True,
-            "murphy_nison_confirmation_required_when_available": True,
-            "unknown_sarpon_books_are_not_invented": True,
         },
         "note": "Manual 612 weighting is a discipline/confluence score. It is not a statistically calibrated probability.",
     }
