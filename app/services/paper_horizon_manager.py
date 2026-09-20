@@ -13,6 +13,46 @@ from app.services.binance import binance_client
 VERSION = "paper_horizon_manager_v2_stop_survival"
 DEFAULT_MAX_HOLD_MINUTES = 120
 
+STRATEGY_MAX_HOLD_FALLBACK = {
+    "MICRO_SCALP": 35,
+    "RANGE_MICRO": 60,
+    "AGGRESSIVE_PAPER": 120,
+    "TACTICAL": 180,
+    "TREND_PREMOVE": 240,
+    "PRE_EVENT_PAPER": 360,
+    "STRUCTURE_RETEST_PAPER": 360,
+    "SWING_PAPER": 720,
+    "SWING_TRAJECTORY_PAPER": 720,
+}
+
+
+def planned_max_hold_minutes(metadata: dict[str, Any]) -> int:
+    """Resolve time horizon from the plan instead of forcing every trade into 2h.
+
+    Explicit plan metadata always wins. Older PAPER rows may lack it, so swing
+    strategies get a horizon-aware fallback rather than the generic 120-minute
+    timeout that previously cut them too early.
+    """
+    explicit = metadata.get("max_hold_minutes")
+    if explicit not in {None, ""}:
+        return max(30, min(int(_f(explicit, DEFAULT_MAX_HOLD_MINUTES)), 4320))
+
+    horizon = str(
+        metadata.get("planned_horizon")
+        or metadata.get("horizon")
+        or _d(metadata.get("contract_lane")).get("horizon")
+        or ""
+    ).lower()
+    if "24-48" in horizon or "24–48" in horizon:
+        return 2880
+    if "8-24" in horizon or "8–24" in horizon:
+        return 1440
+    if "4-12" in horizon or "4–12" in horizon:
+        return 720
+
+    strategy = str(metadata.get("strategy_mode") or "").upper()
+    return STRATEGY_MAX_HOLD_FALLBACK.get(strategy, DEFAULT_MAX_HOLD_MINUTES)
+
 
 def _d(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
@@ -99,8 +139,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
         if opened_at.tzinfo is None:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
 
-        max_hold = int(metadata.get("max_hold_minutes") or DEFAULT_MAX_HOLD_MINUTES)
-        max_hold = max(30, min(max_hold, 4320))
+        max_hold = planned_max_hold_minutes(metadata)
         age_minutes = (now - opened_at).total_seconds() / 60.0
 
         survival = _d(metadata.get("stop_survival"))
