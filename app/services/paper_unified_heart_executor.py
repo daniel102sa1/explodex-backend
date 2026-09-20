@@ -12,6 +12,7 @@ from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
+from app.services.vnext_evaluation import EVALUATION_GENERATION
 
 VERSION = "paper_unified_heart_executor_v5_stop_survival"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
@@ -277,6 +278,7 @@ async def execute_unified_heart_contracts(
 
         metadata = {
             "execution_version": VERSION,
+            "evaluation_generation": EVALUATION_GENERATION,
             "strategy_mode": lane_name,
             "trade_profile": lane.get("trade_profile") or lane_name,
             "planned_horizon": lane.get("horizon"),
