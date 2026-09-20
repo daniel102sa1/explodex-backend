@@ -130,3 +130,52 @@ def test_loss_autopsy_counts_new_hard_and_structural_stop_labels():
     assert metrics["trades"] == 4
     assert metrics["stops"] == 3
     assert metrics["stop_rate"] == 0.75
+
+
+
+def test_sarpon_classic_yellow_keeps_manual_monitor_in_preactivation():
+    monitor = build_manual_monitor(
+        side="LONG",
+        metrics=_healthy_long_metrics(),
+        current_price=101.0,
+        entry_low=100.5,
+        entry_high=101.2,
+        entry_price=101.0,
+        stop=99.5,
+        tp1=103.0,
+        btc_overlay={"direction": "BULLISH", "stress": "NORMAL"},
+        sarpon_classic={
+            "available": True,
+            "stage": "YELLOW_FORMING",
+            "score": 74.0,
+            "murphy": {"aligned": True, "retest": True},
+            "nison": {"confirmed": False},
+        },
+    )
+
+    assert monitor["phase"] == "YELLOW_PREACTIVATION"
+    assert monitor["entry_gate"] == "WAIT"
+    assert "sarpon_murphy_nison_waiting_confirmation" in monitor["contradictions"]
+
+
+def test_sarpon_classic_red_hard_blocks_even_when_flow_is_healthy():
+    monitor = build_manual_monitor(
+        side="LONG",
+        metrics=_healthy_long_metrics(),
+        current_price=101.0,
+        entry_low=100.5,
+        entry_high=101.2,
+        entry_price=101.0,
+        stop=99.5,
+        tp1=103.0,
+        btc_overlay={"direction": "BULLISH", "stress": "NORMAL"},
+        sarpon_classic={
+            "available": True,
+            "stage": "RED_INVALIDATED",
+            "score": 20.0,
+        },
+    )
+
+    assert monitor["phase"] == "RED_DAMAGED"
+    assert monitor["entry_gate"] == "BLOCK"
+    assert "sarpon_murphy_nison_invalidated" in monitor["contradictions"]
