@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-VERSION = "chati_sarpon_612_monitor_v1"
+VERSION = "chati_sarpon_612_monitor_v2_sarpon_classic"
 
 # Exact discipline weights from the CHATI/SARPON/612 manual. They are a
 # confluence rubric, not a calibrated next-trade probability.
@@ -234,11 +234,13 @@ def build_manual_monitor(
     stop: float = 0.0,
     tp1: float = 0.0,
     btc_overlay: dict[str, Any] | None = None,
+    sarpon_classic: dict[str, Any] | None = None,
     is_open_position: bool = False,
 ) -> dict[str, Any]:
     side = str(side or "").upper()
     metrics = _d(metrics)
     btc_overlay = _d(btc_overlay)
+    sarpon_classic = _d(sarpon_classic)
     if side not in {"LONG", "SHORT"}:
         return {
             "version": VERSION,
@@ -280,6 +282,15 @@ def build_manual_monitor(
         delta_score = min(delta_score, 25.0)
 
     structure_score = _clip(_trend_score(side, trend_15m) * 0.65 + _trend_score(side, trend_1h) * 0.35)
+    classic_available = bool(sarpon_classic.get("available"))
+    classic_stage = str(sarpon_classic.get("stage") or "NO_DATA").upper()
+    classic_score = _f(sarpon_classic.get("score"), 50.0)
+    classic_green = classic_available and classic_stage == "GREEN_CONFIRMATION"
+    classic_red = classic_available and classic_stage == "RED_INVALIDATED"
+    if classic_available:
+        # Murphy/Nison evidence refines the structure component but cannot create
+        # an entry on its own. Yellow means the manual setup is still forming.
+        structure_score = _clip(structure_score * 0.65 + classic_score * 0.35)
     if selected_absorption:
         structure_score = min(structure_score, 38.0)
 
@@ -344,11 +355,18 @@ def build_manual_monitor(
         contradictions.append("15m_structure_opposed")
     if btc_hard_conflict:
         contradictions.append("btc_high_stress_direction_conflict")
+    if classic_green:
+        support.append("sarpon_murphy_nison_confirmed")
+    elif classic_red:
+        contradictions.append("sarpon_murphy_nison_invalidated")
+    elif classic_available:
+        contradictions.append("sarpon_murphy_nison_waiting_confirmation")
     contradictions.extend(note for note in btc_notes if "conflict" in note or "shock" in note)
 
     hard_damaged = bool(
         selected_absorption
         or btc_hard_conflict
+        or classic_red
         or (fifteen_opposed and oi_deteriorated)
         or (fifteen_opposed and flow_opposed and structure_opposed)
         or score < 38.0
@@ -362,6 +380,7 @@ def build_manual_monitor(
         and oi_change >= -0.25
         and not structure_opposed
         and not btc_hard_conflict
+        and (not classic_available or classic_green)
         and score >= 64.0
     )
 
@@ -418,6 +437,11 @@ def build_manual_monitor(
             "stop_invalidation": stop,
             "tp1": tp1,
             "no_chase_score": round(extension_score, 2),
+            "classic": sarpon_classic if classic_available else {
+                "available": False,
+                "stage": "NO_DATA",
+                "note": "Murphy/Nison candle-structure context was not available for this evaluation.",
+            },
         },
         "participation": {
             "oi_change_pct": round(oi_change, 4),
@@ -443,6 +467,8 @@ def build_manual_monitor(
             "does_not_widen_live_stop": True,
             "may_downgrade_entry": True,
             "may_upgrade_wait_to_entry": False,
+            "murphy_nison_confirmation_required_when_available": True,
+            "unknown_sarpon_books_are_not_invented": True,
         },
         "note": "Manual 612 weighting is a discipline/confluence score. It is not a statistically calibrated probability.",
     }
@@ -485,6 +511,7 @@ async def persist_manual_monitor_for_run(db: AsyncSession, run_id: str) -> dict[
             stop=_f(plan.get("stop_loss"), _f(row.get("stop_loss"))),
             tp1=_f(plan.get("tp1"), _f(row.get("tp1"))),
             btc_overlay=_d(heart.get("btc_overlay")),
+            sarpon_classic=_d(prediction.get("sarpon_classic")),
             is_open_position=False,
         )
 
