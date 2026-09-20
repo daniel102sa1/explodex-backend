@@ -11,6 +11,7 @@ from app.services import paper_portfolio as base
 from app.services.execution_math import evaluate_trade_math
 from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.structure_retest_persistence import mark_structure_retest_entered
+from app.services.vnext_evaluation import EVALUATION_GENERATION
 
 VERSION = "paper_structure_retest_executor_v1"
 
@@ -193,6 +194,7 @@ async def execute_structure_retest_contracts(
 
         metadata = {
             "execution_version": VERSION,
+            "evaluation_generation": EVALUATION_GENERATION,
             "strategy_mode": "STRUCTURE_RETEST_PAPER",
             "canonical_source": "UNIFIED_EXPLODEX_HEART",
             "paper_only": True,
@@ -206,6 +208,18 @@ async def execute_structure_retest_contracts(
             "soft_invalidation_stop": lane.get("soft_invalidation_level"),
             "structural_stop": stop,
             "hard_stop": stop,
+            "profit_lock": {
+                "enabled": True,
+                "stage": "INITIAL",
+                "tp1": _f(lane.get("tp1"), target),
+                "tp2": _f(lane.get("tp2")),
+                "tp3": _f(lane.get("tp3")),
+                "final_target": target,
+                "after_tp1": "MOVE_STOP_TO_BREAKEVEN_PLUS_COST_BUFFER_ON_NEXT_CANDLE",
+                "after_tp2": "MOVE_STOP_TO_TP1_ON_NEXT_CANDLE",
+                "pre_tp1_protection": "85pct_route_plus_confirmed_rejection",
+                "never_widen_stop": True,
+            },
             "stop_survival_enabled": True,
             "stop_survival": {
                 "enabled": True,
