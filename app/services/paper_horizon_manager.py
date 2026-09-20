@@ -226,6 +226,11 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
         tp1 = _f(profit_lock.get("tp1"))
         tp2 = _f(profit_lock.get("tp2"))
         lock_stage = str(profit_lock.get("stage") or "INITIAL")
+        resume_after_ms = int(_f(profit_lock.get("last_milestone_candle_ms")))
+        if lock_stage != "INITIAL" and resume_after_ms > 0:
+            # The tightened stop did not exist before its milestone candle.
+            # Resume after activation so we never retroactively stop a trade.
+            future = [k for k in future if len(k) >= 5 and int(k[0]) > resume_after_ms]
         lock_changed = False
 
         for candle in future:
