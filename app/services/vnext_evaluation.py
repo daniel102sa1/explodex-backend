@@ -58,29 +58,39 @@ async def vnext_evaluation_report(db: AsyncSession) -> dict[str, Any]:
         "minimum_comparable_closed_trades": 30,
     }
 
-    shadow_total = int((await db.execute(text("""
-        SELECT COUNT(*)
-        FROM heart_shadow_forecasts
-        WHERE metadata->>'evaluation_generation'=:generation
-    """), {"generation": EVALUATION_GENERATION})).scalar_one() or 0)
-
+    shadow_table_exists = bool((await db.execute(text("SELECT to_regclass('public.heart_shadow_forecasts')"))).scalar_one())
+    shadow_total = 0
     horizons: dict[str, Any] = {}
+    if shadow_table_exists:
+        shadow_total = int((await db.execute(text("""
+            SELECT COUNT(*)
+            FROM heart_shadow_forecasts
+            WHERE metadata->>'evaluation_generation'=:generation
+        """), {"generation": EVALUATION_GENERATION})).scalar_one() or 0)
+
     for horizon in SHADOW_HORIZONS:
+        if not shadow_table_exists:
+            horizons[horizon] = {
+                "sample": 0, "correct": 0, "accuracy_pct": None,
+                "avg_directional_return_pct": None, "avg_mfe_pct": None,
+                "avg_mae_pct": None, "status": "CALIBRATING",
+            }
+            continue
         row = dict((await db.execute(text("""
             SELECT
                 COUNT(*) FILTER (
-                    WHERE COALESCE((outcomes #>> ARRAY[:h,'mature'])::boolean,FALSE)
+                    WHERE COALESCE((outcomes -> :h ->> 'mature')::boolean,FALSE)
                 ) AS sample,
                 COUNT(*) FILTER (
-                    WHERE COALESCE((outcomes #>> ARRAY[:h,'mature'])::boolean,FALSE)
-                      AND COALESCE((outcomes #>> ARRAY[:h,'correct'])::boolean,FALSE)
+                    WHERE COALESCE((outcomes -> :h ->> 'mature')::boolean,FALSE)
+                      AND COALESCE((outcomes -> :h ->> 'correct')::boolean,FALSE)
                 ) AS correct,
-                AVG(NULLIF(outcomes #>> ARRAY[:h,'directional_return_pct'],'')::double precision)
-                  FILTER (WHERE COALESCE((outcomes #>> ARRAY[:h,'mature'])::boolean,FALSE)) AS avg_directional_return_pct,
-                AVG(NULLIF(outcomes #>> ARRAY[:h,'mfe_pct'],'')::double precision)
-                  FILTER (WHERE COALESCE((outcomes #>> ARRAY[:h,'mature'])::boolean,FALSE)) AS avg_mfe_pct,
-                AVG(NULLIF(outcomes #>> ARRAY[:h,'mae_pct'],'')::double precision)
-                  FILTER (WHERE COALESCE((outcomes #>> ARRAY[:h,'mature'])::boolean,FALSE)) AS avg_mae_pct
+                AVG(NULLIF(outcomes -> :h ->> 'directional_return_pct','')::double precision)
+                  FILTER (WHERE COALESCE((outcomes -> :h ->> 'mature')::boolean,FALSE)) AS avg_directional_return_pct,
+                AVG(NULLIF(outcomes -> :h ->> 'mfe_pct','')::double precision)
+                  FILTER (WHERE COALESCE((outcomes -> :h ->> 'mature')::boolean,FALSE)) AS avg_mfe_pct,
+                AVG(NULLIF(outcomes -> :h ->> 'mae_pct','')::double precision)
+                  FILTER (WHERE COALESCE((outcomes -> :h ->> 'mature')::boolean,FALSE)) AS avg_mae_pct
             FROM heart_shadow_forecasts
             WHERE metadata->>'evaluation_generation'=:generation
         """), {"generation": EVALUATION_GENERATION, "h": horizon})).mappings().one())
