@@ -53,6 +53,66 @@ def _geometry_ok(side: str, entry: float, stop: float, target: float) -> bool:
     return False
 
 
+def _sarpon_leverage_policy(
+    *,
+    lane_name: str,
+    lane: dict[str, Any],
+    heart: dict[str, Any],
+    conviction: dict[str, Any],
+    defensive: bool,
+    btc_overlay: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Allow only a small PAPER leverage step-up under full current confluence.
+
+    This never raises the account risk budget; sizing still comes from the hard
+    stop and risk multipliers. Higher leverage can only reduce margin required
+    to express the already-approved risk size.
+    """
+    base_cap = int(max(1, min(4, _f(lane.get("max_leverage"), 2.0))))
+    monitor = _d(heart.get("chati_sarpon_612_monitor"))
+    sarpon = _d(monitor.get("sarpon"))
+    classic = _d(sarpon.get("classic"))
+    phase_green = str(monitor.get("phase") or "") == "GREEN_CONFIRMATION"
+    classic_green = str(classic.get("stage") or "") == "GREEN_CONFIRMATION"
+    no_contradictions = not list(monitor.get("contradictions") or [])
+    tier = str(conviction.get("tier") or "")
+    conviction_high = tier in {"HIGH", "MAX_CONVICTION"}
+    btc = _d(btc_overlay)
+    btc_safe = str(btc.get("stress") or "NORMAL").upper() not in {"EXTREME", "SHOCK"} and not bool(_d(monitor.get("btc")).get("hard_conflict"))
+
+    eligible = bool(
+        not defensive
+        and lane_name in {"TACTICAL", "SWING_PAPER"}
+        and phase_green
+        and classic_green
+        and no_contradictions
+        and conviction_high
+        and btc_safe
+    )
+    if eligible:
+        boosted_cap = min(4, base_cap + 1)
+        reason = "full_sarpon_chati_612_confluence"
+    else:
+        boosted_cap = base_cap
+        reason = "base_cap"
+
+    return {
+        "eligible": eligible,
+        "base_cap": base_cap,
+        "selected_leverage": boosted_cap,
+        "reason": reason,
+        "risk_budget_unchanged": True,
+        "requires": {
+            "chati_sarpon_612_green": phase_green,
+            "sarpon_murphy_nison_green": classic_green,
+            "no_contradictions": no_contradictions,
+            "conviction_high": conviction_high,
+            "btc_safe": btc_safe,
+            "not_defensive": not defensive,
+        },
+    }
+
+
 def _defensive_lane_check(*, lane_name: str, lane: dict[str, Any], row: dict[str, Any]) -> tuple[bool, str | None]:
     risk_score = _f(row.get("risk_score"), 100.0)
     if lane_name == "AGGRESSIVE_PAPER":
@@ -195,7 +255,15 @@ async def execute_unified_heart_contracts(
         )
         conviction_multiplier = max(0.25, min(1.50, _f(conviction.get("risk_budget_multiplier"), 0.25)))
 
-        lane_leverage = int(max(1, min(3, _f(lane.get("max_leverage"), 3.0))))
+        leverage_policy = _sarpon_leverage_policy(
+            lane_name=lane_name,
+            lane=lane,
+            heart=heart,
+            conviction=conviction,
+            defensive=defensive,
+            btc_overlay=btc_overlay,
+        )
+        lane_leverage = int(leverage_policy["selected_leverage"])
         sizing = base.size_position(balance, fill, hard_stop, lane_leverage)
         portfolio_multiplier = max(0.0, min(1.0, risk_multiplier))
         if defensive:
@@ -214,6 +282,7 @@ async def execute_unified_heart_contracts(
             "planned_horizon": lane.get("horizon"),
             "planned_max_hold_minutes": lane.get("max_hold_minutes"),
             "planned_max_leverage": lane.get("max_leverage"),
+            "leverage_policy": leverage_policy,
             "canonical_source": "UNIFIED_EXPLODEX_HEART",
             "heart_version": heart.get("version"),
             "execution_contract_version": contract.get("version"),
@@ -234,7 +303,20 @@ async def execute_unified_heart_contracts(
             "stop_survival": survival,
             "soft_invalidation_stop": survival.get("soft_invalidation_stop") if survival_enabled else original_stop,
             "hard_stop": hard_stop,
+            "initial_hard_stop": hard_stop,
             "stop_survival_enabled": survival_enabled,
+            "profit_lock": {
+                "enabled": True,
+                "stage": "INITIAL",
+                "tp1": _f(lane.get("tp1")),
+                "tp2": _f(lane.get("tp2")),
+                "tp3": _f(lane.get("tp3")),
+                "final_target": target,
+                "after_tp1": "MOVE_STOP_TO_BREAKEVEN_PLUS_COST_BUFFER_ON_NEXT_CANDLE",
+                "after_tp2": "MOVE_STOP_TO_TP1_ON_NEXT_CANDLE",
+                "never_widen_stop": True,
+                "same_candle_sequence_is_not_assumed": True,
+            },
             "stop_was_fixed_before_entry": True,
             "stop_can_widen_after_entry": False,
             "size_calculated_from_hard_stop": True,
@@ -285,6 +367,7 @@ async def execute_unified_heart_contracts(
             "target_name": survival.get("target_name") if survival_enabled else lane.get("target_name"),
             "risk_usdt": sizing["risk_usdt"],
             "leverage": lane_leverage,
+            "leverage_policy": leverage_policy,
             "max_hold_minutes": lane.get("max_hold_minutes"),
             "horizon": lane.get("horizon"),
             "trade_profile": lane.get("trade_profile") or lane_name,
