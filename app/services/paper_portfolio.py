@@ -293,6 +293,10 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
             "tp2": metadata.get("tp2"), "tp3": metadata.get("tp3"), "margin_used": _f(row["margin_used"]),
             "unrealized_pnl": round(raw, 6), "opened_at": row["opened_at"].isoformat(),
             "strategy_mode": metadata.get("strategy_mode"),
+            "trade_profile": metadata.get("trade_profile") or metadata.get("strategy_mode"),
+            "planned_horizon": metadata.get("planned_horizon") or metadata.get("horizon"),
+            "max_hold_minutes": metadata.get("planned_max_hold_minutes") or metadata.get("max_hold_minutes"),
+            "planned_max_leverage": metadata.get("planned_max_leverage"),
             "pattern_score": metadata.get("pattern_score"),
             "phase": metadata.get("phase"),
             "breakout_level": metadata.get("breakout_level"),
@@ -354,6 +358,10 @@ async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, An
         row = dict(raw)
         metadata = _meta(row.pop("metadata", {}))
         row["strategy_mode"] = metadata.get("strategy_mode")
+        row["trade_profile"] = metadata.get("trade_profile") or metadata.get("strategy_mode")
+        row["planned_horizon"] = metadata.get("planned_horizon") or metadata.get("horizon")
+        row["max_hold_minutes"] = metadata.get("planned_max_hold_minutes") or metadata.get("max_hold_minutes")
+        row["planned_max_leverage"] = metadata.get("planned_max_leverage")
         row["pattern_score"] = metadata.get("pattern_score")
         row["phase"] = metadata.get("phase")
         row["soft_invalidation_stop"] = metadata.get("soft_invalidation_stop") or metadata.get("soft_invalidation_level")
