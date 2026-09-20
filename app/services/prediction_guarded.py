@@ -14,7 +14,6 @@ from app.services.prediction_safety import apply_prediction_safety
 from app.services.prediction_stack_v5 import build_prediction_stack_v5
 from app.services.sequential_context import apply_sequential_context
 from app.services.sarpon_knowledge import build_sarpon_classic_context
-from app.services.sarpon_knowledge import build_sarpon_classic_context
 from app.services.verdict_entry_zone_guard import build_guarded_verdict_fusion
 
 
