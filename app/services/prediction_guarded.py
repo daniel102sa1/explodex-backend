@@ -7,6 +7,7 @@ from app.services.context_engine import apply_context_engine
 from app.services.entry_zone_engine import build_entry_zone_engine
 from app.services.exchange_lead_lag import apply_exchange_lead_lag
 from app.services.forced_path_forecast import build_forced_path_forecast
+from app.services.formula_brain import build_formula_brain
 from app.services.liquidation_cascade import apply_liquidation_cascade
 from app.services.premove_fingerprint import build_premove_fingerprint
 from app.services.prediction_engine import build_pre_move_prediction as build_raw_pre_move_prediction
@@ -60,6 +61,7 @@ def build_pre_move_prediction(
     result["premove_fingerprint"] = build_premove_fingerprint(scored, snapshot, result)
     result["prediction_stack_v5"] = build_prediction_stack_v5(scored, snapshot, result, coinglass)
     result["sarpon_classic"] = build_sarpon_classic_context(scored, snapshot, result)
+    result["formula_brain"] = build_formula_brain(scored, snapshot)
 
     symbol = str(snapshot.get("symbol") or scored.get("symbol") or "UNKNOWN")
     result["confidence_progression"] = observe_confidence_progression(symbol, result)
