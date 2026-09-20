@@ -18,6 +18,7 @@ from app.services.quant_brain_persistence import quant_brain_report
 from app.services.paper_range_micro import range_summary, scan_all_eligible_ranges
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.paper_trade_auditor import paper_trade_audit_report, run_paper_trade_audits
+from app.services.sarpon_knowledge import sarpon_knowledge_registry
 from app.services.validation_mode import ensure_validation_schema
 
 router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
@@ -86,6 +87,7 @@ async def summary(db: AsyncSession = Depends(get_db)):
     result["quant_risk_guard"] = await _safe_component(db, "quant_risk_guard", paper_quant_risk_guard)
     result["quant_brain"] = await _safe_component(db, "quant_brain", quant_brain_report)
     result["chati_sarpon_612_monitor"] = await _safe_component(db, "chati_sarpon_612_monitor", open_monitor_report)
+    result["sarpon_knowledge"] = sarpon_knowledge_registry()
     result["trade_audit"] = await _safe_component(db, "trade_audit", paper_trade_audit_report)
     return result
 
@@ -106,6 +108,11 @@ async def paper_loss_autopsy(days: int = Query(default=30, ge=1, le=365), db: As
 async def chati_sarpon_612(db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
     return await open_monitor_report(db)
+
+
+@router.get("/sarpon-knowledge")
+async def sarpon_knowledge():
+    return sarpon_knowledge_registry()
 
 
 @router.get("/quant-brain")
