@@ -11,6 +11,7 @@ from app.services import paper_portfolio as base
 from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
+from app.services.vnext_evaluation import EVALUATION_GENERATION
 
 VERSION = "paper_pre_event_executor_v1"
 MAX_NEW = 1
@@ -93,10 +94,24 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
         if sizing["quantity"] <= 0: reject("position_size_zero"); continue
 
         metadata = {
-            "execution_version": VERSION, "strategy_mode": "PRE_EVENT_PAPER", "canonical_source": "UNIFIED_EXPLODEX_HEART",
+            "execution_version": VERSION, "evaluation_generation": EVALUATION_GENERATION,
+            "strategy_mode": "PRE_EVENT_PAPER", "canonical_source": "UNIFIED_EXPLODEX_HEART",
             "contract_lane": lane, "pre_event_prediction": contract.get("pre_event_prediction"), "event_risk": contract.get("event_risk"),
             "risk_conviction": conviction, "stop_survival": survival, "soft_invalidation_stop": survival.get("soft_invalidation_stop") if survival.get("enabled") else stop,
-            "hard_stop": hard_stop, "max_hold_minutes": lane.get("max_hold_minutes"), "experimental": True,
+            "hard_stop": hard_stop,
+            "profit_lock": {
+                "enabled": True,
+                "stage": "INITIAL",
+                "tp1": _f(lane.get("tp1"), live_target),
+                "tp2": _f(lane.get("tp2")),
+                "tp3": _f(lane.get("tp3")),
+                "final_target": live_target,
+                "after_tp1": "MOVE_STOP_TO_BREAKEVEN_PLUS_COST_BUFFER_ON_NEXT_CANDLE",
+                "after_tp2": "MOVE_STOP_TO_TP1_ON_NEXT_CANDLE",
+                "pre_tp1_protection": "85pct_route_plus_confirmed_rejection",
+                "never_widen_stop": True,
+            },
+            "max_hold_minutes": lane.get("max_hold_minutes"), "experimental": True,
             "portfolio_mode": "DEFENSIVE_LEARNING" if defensive else "NORMAL", "pre_event_risk_cap": 0.25,
             "executor_cannot_change_direction": True, "executor_cannot_create_lane": True,
             "btc_overlay": btc_overlay or {}, "btc_side_risk_multiplier": btc_side_multiplier, "btc_side_reason": btc_side_reason,

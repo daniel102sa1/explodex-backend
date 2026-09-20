@@ -10,9 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import paper_portfolio as base
 from app.services.binance import binance_client
 
-VERSION = "paper_horizon_manager_v2_stop_survival"
+VERSION = "paper_horizon_manager_v4_pre_tp1_protection"
 DEFAULT_MAX_HOLD_MINUTES = 120
 PROFIT_LOCK_COST_BUFFER_RATE = 0.0018
+PRE_TP1_ARM_PROGRESS = 0.85
+PRE_TP1_RETRACE_FRACTION = 0.18
 
 STRATEGY_MAX_HOLD_FALLBACK = {
     "MICRO_SCALP": 35,
@@ -122,6 +124,81 @@ def breakeven_profit_lock_stop(*, side: str, entry: float, tp1: float, current_s
 def tp2_profit_lock_stop(*, side: str, tp1: float, current_stop: float) -> float:
     """After TP2, move the protective stop to TP1, never farther away."""
     return _tighten_only(str(side or "").upper(), current_stop, tp1)
+
+
+def _progress_to_tp1(*, side: str, entry: float, tp1: float, price: float) -> float:
+    distance = abs(tp1 - entry)
+    if distance <= 1e-12 or side not in {"LONG", "SHORT"}:
+        return 0.0
+    directional = (price - entry) if side == "LONG" else (entry - price)
+    return directional / distance
+
+
+def pre_tp1_protection_signal(
+    *,
+    side: str,
+    entry: float,
+    tp1: float,
+    high: float,
+    low: float,
+    close: float,
+) -> dict[str, Any]:
+    """Detect a completed-candle rejection after price almost reached TP1.
+
+    Nearness alone is not enough. Price must reach at least 85% of the route
+    and then give back at least 18% of that TP1 route by candle close.
+    """
+    side = str(side or "").upper()
+    if side not in {"LONG", "SHORT"} or min(entry, tp1, high, low, close) <= 0:
+        return {"triggered": False, "reason": "invalid_geometry"}
+
+    favorable_extreme = high if side == "LONG" else low
+    max_progress = _progress_to_tp1(side=side, entry=entry, tp1=tp1, price=favorable_extreme)
+    close_progress = _progress_to_tp1(side=side, entry=entry, tp1=tp1, price=close)
+    retrace = max_progress - close_progress
+    triggered = max_progress >= PRE_TP1_ARM_PROGRESS and retrace >= PRE_TP1_RETRACE_FRACTION
+    return {
+        "triggered": bool(triggered),
+        "max_progress": round(max_progress, 4),
+        "close_progress": round(close_progress, 4),
+        "retrace_fraction": round(retrace, 4),
+        "arm_progress": PRE_TP1_ARM_PROGRESS,
+        "required_retrace_fraction": PRE_TP1_RETRACE_FRACTION,
+        "reason": "near_tp1_rejection_confirmed" if triggered else "no_confirmed_rejection",
+    }
+
+
+def pre_tp1_protective_stop(
+    *,
+    side: str,
+    entry: float,
+    current_stop: float,
+    close: float,
+) -> float:
+    """Tighten risk after confirmed near-TP1 rejection without widening."""
+    side = str(side or "").upper()
+    if side not in {"LONG", "SHORT"} or min(entry, current_stop, close) <= 0:
+        return current_stop
+    epsilon = entry * 0.00005
+    if side == "LONG":
+        preferred = entry * (1.0 + PROFIT_LOCK_COST_BUFFER_RATE)
+        if close > preferred + epsilon:
+            candidate = preferred
+        elif close > entry + epsilon:
+            candidate = entry
+        else:
+            reduced_loss = current_stop + (entry - current_stop) * 0.75
+            candidate = min(close - epsilon, reduced_loss)
+    else:
+        preferred = entry * (1.0 - PROFIT_LOCK_COST_BUFFER_RATE)
+        if close < preferred - epsilon:
+            candidate = preferred
+        elif close < entry - epsilon:
+            candidate = entry
+        else:
+            reduced_loss = current_stop - (current_stop - entry) * 0.75
+            candidate = max(close + epsilon, reduced_loss)
+    return _tighten_only(side, current_stop, candidate)
 
 
 def evaluate_survival_candle(
@@ -246,7 +323,11 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                 survival_enabled=survival_enabled,
             )
             if exit_price is not None:
-                if lock_stage != "INITIAL" and exit_reason == "HARD_STOP":
+                if lock_stage == "PRE_TP1_PROTECTED" and exit_reason == "HARD_STOP":
+                    exit_reason = "PRE_TP1_PROTECT_STOP"
+                elif lock_stage == "PRE_TP1_PROTECTED" and exit_reason == "AMBIGUOUS_HARD_STOP":
+                    exit_reason = "AMBIGUOUS_PRE_TP1_PROTECT_STOP"
+                elif lock_stage != "INITIAL" and exit_reason == "HARD_STOP":
                     exit_reason = "PROFIT_LOCK_STOP"
                 elif lock_stage != "INITIAL" and exit_reason == "AMBIGUOUS_HARD_STOP":
                     exit_reason = "AMBIGUOUS_PROFIT_LOCK_STOP"
@@ -254,6 +335,38 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
 
             if not profit_lock_enabled:
                 continue
+
+            # Before TP1, protect an almost-completed move only after a completed
+            # candle confirms a meaningful rejection. Nearness alone never moves
+            # the stop. The new stop is active from the NEXT candle.
+            if lock_stage == "INITIAL" and tp1 > 0:
+                pre_tp1 = pre_tp1_protection_signal(
+                    side=side,
+                    entry=entry,
+                    tp1=tp1,
+                    high=high,
+                    low=low,
+                    close=close,
+                )
+                if pre_tp1.get("triggered") and not _touched(side, high, low, tp1):
+                    new_stop = pre_tp1_protective_stop(
+                        side=side,
+                        entry=entry,
+                        current_stop=hard_stop,
+                        close=close,
+                    )
+                    if new_stop != hard_stop:
+                        hard_stop = new_stop
+                        lock_changed = True
+                        lock_stage = "PRE_TP1_PROTECTED"
+                        profit_lock.update({
+                            "stage": lock_stage,
+                            "active_stop": hard_stop,
+                            "rule_active": "NEAR_TP1_REJECTION_PROTECT_RISK",
+                            "pre_tp1_signal": pre_tp1,
+                            "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
+                        })
+                        continue
 
             # Milestone tightening becomes active only for later candles. We do
             # not assume whether TP and the tighter stop happened first inside
@@ -275,7 +388,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
                 })
             elif (
-                lock_stage == "INITIAL"
+                lock_stage in {"INITIAL", "PRE_TP1_PROTECTED"}
                 and _target_beyond(side, tp_value, tp1)
                 and _touched(side, high, low, tp1)
             ):

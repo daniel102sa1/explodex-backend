@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.binance import binance_client
+from app.services.vnext_evaluation import EVALUATION_GENERATION
 
 VERSION = "shadow_forecast_memory_v1"
 HORIZONS = {"15m": 15, "1h": 60, "4h": 240, "6h": 360, "24h": 1440}
@@ -89,6 +90,7 @@ async def capture_shadow_forecasts_for_run(db: AsyncSession, run_id: str) -> dic
         breadth = _d(contract.get("market_breadth")) or _d(heart.get("market_breadth"))
         event = _d(contract.get("event_risk")) or _d(heart.get("event_risk"))
         metadata = {
+            "evaluation_generation": EVALUATION_GENERATION,
             "heart_version": heart.get("version"),
             "matrix_consensus": matrix.get("consensus"),
             "horizon_conflict": matrix.get("horizon_conflict"),

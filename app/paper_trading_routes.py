@@ -20,6 +20,7 @@ from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.paper_trade_auditor import paper_trade_audit_report, run_paper_trade_audits
 from app.services.sarpon_knowledge import sarpon_knowledge_registry
 from app.services.validation_mode import ensure_validation_schema
+from app.services.vnext_evaluation import vnext_evaluation_report
 
 router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
 
@@ -89,7 +90,14 @@ async def summary(db: AsyncSession = Depends(get_db)):
     result["chati_sarpon_612_monitor"] = await _safe_component(db, "chati_sarpon_612_monitor", open_monitor_report)
     result["sarpon_knowledge"] = sarpon_knowledge_registry()
     result["trade_audit"] = await _safe_component(db, "trade_audit", paper_trade_audit_report)
+    result["vnext_evaluation"] = await _safe_component(db, "vnext_evaluation", vnext_evaluation_report)
     return result
+
+
+@router.get("/vnext-evaluation")
+async def vnext_evaluation(db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return await vnext_evaluation_report(db)
 
 
 @router.get("/edge-lab")
