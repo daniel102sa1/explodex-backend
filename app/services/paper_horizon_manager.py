@@ -388,7 +388,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
                 })
             elif (
-                lock_stage == "INITIAL"
+                lock_stage in {"INITIAL", "PRE_TP1_PROTECTED"}
                 and _target_beyond(side, tp_value, tp1)
                 and _touched(side, high, low, tp1)
             ):
