@@ -87,6 +87,11 @@ def test_tactical_enter_has_absolute_priority():
     assert result["single_source_of_truth"] is True
     assert result["permitted_paper_lane"] == "TACTICAL"
     assert result["primary_action"] == "ENTRAR_LONG"
+    tactical = result["lanes"]["tactical"]
+    assert tactical["trade_profile"] == "INTRADAY_TACTICAL"
+    assert tactical["horizon"] == "20-120m"
+    assert tactical["max_hold_minutes"] == 120
+    assert tactical["max_leverage"] == 3
 
 
 def test_waiting_heart_can_authorize_only_one_experimental_lane():
@@ -119,3 +124,18 @@ def test_contract_never_changes_primary_user_action_for_swing():
     assert result["forecast"]["source"] in {"TACTICAL_HEART", "TRAJECTORY_4H_48H"}
     if result["permitted_paper_lane"] == "SWING_PAPER":
         assert result["lanes"]["swing_paper"]["paper_only"] is True
+
+
+
+def test_swing_lane_keeps_8_to_24_hour_horizon():
+    heart = _heart()
+    # Disable aggressive lane so swing can be inspected as the surviving
+    # longer-horizon contract.
+    heart["ignition"]["score"] = 60.0
+    result = build_execution_contract(heart=heart, score=_score(), prediction=_prediction())
+    swing = result["lanes"]["swing_paper"]
+
+    assert swing["trade_profile"] == "SWING_4H_48H"
+    assert swing["horizon"] == "8-24h"
+    assert swing["max_hold_minutes"] == 1440
+    assert swing["max_leverage"] == 2
