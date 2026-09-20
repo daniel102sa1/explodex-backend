@@ -84,8 +84,11 @@ def _tactical_lane(heart: dict[str, Any], score: dict[str, Any]) -> dict[str, An
     decision = _d(heart.get("action_decision"))
     plan = _d(heart.get("plan"))
     should_enter = bool(decision.get("should_enter")) and bool(heart.get("execution_allowed"))
+    min_minutes = int(_f(score.get("expected_duration_min_minutes"), 15))
+    max_minutes = int(_f(score.get("expected_duration_max_minutes"), 120))
     return {
         "lane": "TACTICAL",
+        "trade_profile": "INTRADAY_TACTICAL",
         "paper_only": False,
         "eligible": should_enter,
         "action": decision.get("action"),
@@ -98,7 +101,9 @@ def _tactical_lane(heart: dict[str, Any], score: dict[str, Any]) -> dict[str, An
         "tp1": plan.get("tp1"),
         "tp2": plan.get("tp2"),
         "tp3": plan.get("tp3"),
-        "max_hold_minutes": score.get("expected_duration_max_minutes"),
+        "horizon": f"{min_minutes}-{max_minutes}m",
+        "max_hold_minutes": max_minutes,
+        "max_leverage": 3,
         "risk_budget_pct": 1.0,
         "reason": decision.get("reason"),
         "source": "HEART_ACTION_DECISION",
@@ -159,6 +164,7 @@ def _aggressive_lane(
     blockers = list(dict.fromkeys(blockers))
     return {
         "lane": "AGGRESSIVE_PAPER",
+        "trade_profile": "EARLY_INTRADAY",
         "paper_only": True,
         "experimental": True,
         "eligible": safety_clear and not blockers,
@@ -173,6 +179,7 @@ def _aggressive_lane(
         "ignition_stage": stage,
         "risk_budget_pct": 0.5,
         "max_leverage": 2,
+        "horizon": "0-2h",
         "max_hold_minutes": 120,
         "blockers": blockers,
         "reason": "Entrada temprana PAPER emitida por el mismo Heart; nunca sustituye la recomendación táctica principal.",
@@ -229,6 +236,7 @@ def _swing_lane(
     blockers = list(dict.fromkeys(blockers))
     return {
         "lane": "SWING_PAPER",
+        "trade_profile": "SWING_4H_48H",
         "paper_only": True,
         "experimental": True,
         "eligible": safety_clear and not blockers,
