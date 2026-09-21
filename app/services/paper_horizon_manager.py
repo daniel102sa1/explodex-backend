@@ -424,10 +424,53 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     "stop_active_after_candle_ms": int(candle[0]) if len(candle) else None,
                 })
 
-        if profit_lock_enabled and lock_stage != str(_d(metadata.get("profit_lock")).get("stage") or "INITIAL"):
+        # Mature winners get a volatility/structure trail before TP1 instead
+        # of leaving almost all open profit exposed until the final target.
+        # The proposed stop uses only completed candles and is active next candle.
+        adaptive_changed = False
+        if exit_price is None and profit_lock_enabled and completed:
+            prior_adaptive = _d(profit_lock.get("adaptive_trailing"))
+            initial_hard_stop = _f(
+                metadata.get("initial_hard_stop"),
+                _f(metadata.get("hard_stop"), hard_stop),
+            )
+            adaptive = build_adaptive_profit_trail(
+                side=side,
+                entry=entry,
+                initial_stop=initial_hard_stop,
+                current_stop=hard_stop,
+                tp1=tp1 if tp1 > 0 else tp_value,
+                candles=completed,
+                strategy_mode=str(metadata.get("strategy_mode") or ""),
+                prior_mfe_price=_f(prior_adaptive.get("mfe_price")) or None,
+                cost_buffer_rate=PROFIT_LOCK_COST_BUFFER_RATE,
+            )
+            profit_lock["adaptive_trailing"] = adaptive
+            if adaptive.get("changed"):
+                new_stop = _f(adaptive.get("new_stop"), hard_stop)
+                if new_stop != hard_stop:
+                    hard_stop = new_stop
+                    adaptive_changed = True
+                    lock_changed = True
+                    activation_ms = int(completed[-1][0])
+                    profit_lock["active_stop"] = hard_stop
+                    profit_lock["rule_active"] = "ADAPTIVE_CHANDELIER_ATR_PLUS_PIVOT"
+                    profit_lock["stop_active_after_candle_ms"] = activation_ms
+
+        original_profit_lock = _d(metadata.get("profit_lock"))
+        metadata_needs_update = (
+            profit_lock_enabled
+            and (
+                lock_changed
+                or adaptive_changed
+                or profit_lock != original_profit_lock
+            )
+        )
+        if metadata_needs_update:
             metadata["profit_lock"] = profit_lock
             metadata["hard_stop"] = hard_stop
             metadata["profit_lock_never_widens_stop"] = True
+            metadata["adaptive_profit_trailing_enabled"] = True
             await db.execute(text("""
                 UPDATE paper_positions
                 SET stop_loss=:stop_loss, metadata=CAST(:metadata AS JSONB)
