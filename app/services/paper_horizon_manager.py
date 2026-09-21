@@ -291,7 +291,9 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
             klines = []
 
         start_ms = int(opened_at.timestamp() * 1000)
-        future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
+        now_ms = int(now.timestamp() * 1000)
+        completed = [k for k in klines if len(k) >= 7 and int(k[0]) >= start_ms and int(k[6]) < now_ms]
+        future = list(completed)
         exit_price = None
         exit_reason = None
         hard_stop = _f(row.get("stop_loss"))
@@ -304,12 +306,16 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
         tp1 = _f(profit_lock.get("tp1"))
         tp2 = _f(profit_lock.get("tp2"))
         lock_stage = str(profit_lock.get("stage") or "INITIAL")
-        resume_after_ms = int(_f(profit_lock.get("last_milestone_candle_ms")))
-        if lock_stage != "INITIAL" and resume_after_ms > 0:
-            # The tightened stop did not exist before its milestone candle.
-            # Resume after activation so we never retroactively stop a trade.
+        resume_after_ms = int(max(
+            _f(profit_lock.get("last_milestone_candle_ms")),
+            _f(profit_lock.get("stop_active_after_candle_ms")),
+        ))
+        if resume_after_ms > 0:
+            # A tightened stop becomes active only after the candle that created it.
+            # Never replay the new stop against older candles.
             future = [k for k in future if len(k) >= 5 and int(k[0]) > resume_after_ms]
         lock_changed = False
+        adaptive_before = _d(profit_lock.get("adaptive_trailing"))
 
         for candle in future:
             high, low, close = _f(candle[2]), _f(candle[3]), _f(candle[4])
