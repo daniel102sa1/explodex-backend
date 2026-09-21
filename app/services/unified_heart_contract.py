@@ -7,9 +7,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.execution_math import choose_target_for_min_net_rr
+from app.services.evidence_council import build_evidence_council
 
-VERSION = "unified_heart_contract_v2_quant_brain"
-HEART_VERSION = "explodex_heart_v8_quant_unified"
+VERSION = "unified_heart_contract_v3_evidence_council"
+HEART_VERSION = "explodex_heart_v9_macro_evidence_unified"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -63,8 +64,8 @@ def _hard_safety_clear(heart: dict[str, Any], prediction: dict[str, Any]) -> tup
         blockers.append("entry_already_triggered")
     if bool(quant.get("block_new_entry")):
         blockers.append("quant_brain_block")
-    elif bool(quant.get("strong_conflict")):
-        blockers.append("quant_brain_conflict")
+    # Non-extreme Quant disagreement is intentionally not a hard blocker here.
+    # Its bounded risk multiplier and the Evidence Council handle it downstream.
     return not blockers, blockers
 
 
@@ -214,8 +215,6 @@ def _swing_lane(
         blockers.append("direction_edge_below_12")
     if _f(trajectory.get("trajectory_score")) < 62.0:
         blockers.append("trajectory_score_below_62")
-    if preferred_strategy == "MEAN_REVERSION_RETEST" and _f(quant.get("directional_edge")) < 15.0:
-        blockers.append("quant_range_regime_not_swing")
     if not _inside(current, _f(plan.get("entry_low")), _f(plan.get("entry_high"))):
         blockers.append("price_outside_swing_band")
 
@@ -235,6 +234,22 @@ def _swing_lane(
     if not expected_math.get("accepted"):
         blockers.append("net_rr_below_2_6")
     chosen = _d(expected_math.get("chosen_target"))
+
+    macro = _d(heart.get("macro_cycle"))
+    macro_bias = str(macro.get("bias") or "NEUTRAL").upper()
+    macro_confidence = _f(macro.get("confidence_score"))
+    macro_alignment = (
+        "ALIGNED" if macro_bias == direction and macro_bias in {"LONG", "SHORT"}
+        else "CONFLICT" if macro_bias in {"LONG", "SHORT"} and direction in {"LONG", "SHORT"} and macro_bias != direction
+        else "NEUTRAL"
+    )
+    soft_warnings: list[str] = []
+    if preferred_strategy == "MEAN_REVERSION_RETEST" and _f(quant.get("directional_edge")) < 15.0:
+        soft_warnings.append("quant_range_regime_caution")
+    if macro_alignment == "CONFLICT" and macro_confidence >= 70:
+        soft_warnings.append("strong_macro_cycle_conflict")
+    elif macro_alignment == "ALIGNED" and macro_confidence >= 65:
+        soft_warnings.append("macro_cycle_support")
 
     blockers = list(dict.fromkeys(blockers))
     return {
@@ -265,6 +280,15 @@ def _swing_lane(
         "blockers": blockers,
         "reason": "Trayectoria 4h-48h emitida por el mismo Heart con stop estructural y tamaño reducido.",
         "quant_strategy_fit": preferred_strategy,
+        "macro_cycle": {
+            "state": macro.get("state"),
+            "bias": macro_bias,
+            "confidence_score": macro.get("confidence_score"),
+            "alignment": macro_alignment,
+            "long_base_candidate": bool(macro.get("long_base_candidate")),
+            "suggested_watch_horizon": macro.get("suggested_watch_horizon"),
+        },
+        "soft_warnings": soft_warnings,
         "source": "HEART_TRAJECTORY",
     }
 
@@ -277,6 +301,7 @@ def build_execution_contract(
 ) -> dict[str, Any]:
     safety_clear, safety_blockers = _hard_safety_clear(heart, prediction)
     quant = _d(heart.get("quant_brain"))
+    council = build_evidence_council(score=score, prediction=prediction, heart=heart)
     tactical = _tactical_lane(heart, score)
     aggressive = _aggressive_lane(heart, score, prediction, safety_clear, safety_blockers)
     swing = _swing_lane(heart, score, safety_clear, safety_blockers)
@@ -335,13 +360,16 @@ def build_execution_contract(
         "quant_stance": quant.get("stance") if quant else "UNAVAILABLE",
         "quant_directional_edge": quant.get("directional_edge") if quant else None,
         "quant_strategy_selector": _d(quant.get("strategy_selector")),
+        "macro_cycle": _d(heart.get("macro_cycle")),
+        "evidence_council": council,
+        "council_risk_multiplier": _f(council.get("risk_multiplier_recommendation"), 1.0),
         "forecast": forecast,
         "lanes": {
             "tactical": tactical,
             "aggressive_paper": aggressive,
             "swing_paper": swing,
         },
-        "rule": "Scanner, Quant Brain, coin analysis and PAPER consume this same Heart contract. Quant evidence may reduce/block risk but cannot invent a direction, upgrade WAIT to ENTER, or widen a live stop.",
+        "rule": "One canonical Heart combines independent evidence families without double counting. Hard safety may block; soft conflicts reduce risk. Optional paid data or repeated derived labels cannot manufacture or erase a trade by themselves.",
     }
 
 
@@ -375,6 +403,7 @@ async def finalize_unified_contract_for_run(db: AsyncSession, run_id: str) -> di
             "current_price": _f(row.get("current_price")),
             "expected_duration_min_minutes": row.get("expected_duration_min_minutes"),
             "expected_duration_max_minutes": row.get("expected_duration_max_minutes"),
+            "metrics": _d(reason.get("metrics")),
         }
         contract = build_execution_contract(heart=heart, score=score, prediction=prediction)
         heart["version"] = HEART_VERSION
