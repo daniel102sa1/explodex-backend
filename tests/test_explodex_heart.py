@@ -78,7 +78,7 @@ def test_trade_now_stack_can_promote_preactivation_to_ready():
 
     out = _canonical_gate(_score(state="PREPARING"), prediction)
     assert out["state"] == "READY"
-    assert out["metrics"]["ready_via"] == "ADVANCED_STACK"
+    assert out["metrics"]["ready_via"] == "LEAN_TIMING_GATE"
 
 
 def test_heart_emits_explicit_enter_long_when_trade_now_and_in_zone():
@@ -145,3 +145,25 @@ def test_heart_distinguishes_sweep_rebound():
     assert event["event"] == "LIQUIDITY_SWEEP_REBOUND"
     assert "sweep_low_reclaimed" in event["evidence"]
     assert "seller_absorption" in event["evidence"]
+
+
+def test_lean_gate_does_not_require_duplicate_master_and_timing_labels():
+    prediction = _trade_now_prediction()
+    prediction["prediction_stack_v5"]["master_decision"] = {"state": "WAIT"}
+    prediction["prediction_stack_v5"]["entry_timing"] = {"state": "WATCH"}
+
+    ready, missing = _stack_actionable(prediction)
+
+    assert ready is True
+    assert missing == []
+
+
+def test_lean_gate_still_blocks_real_hard_safety_failures():
+    prediction = _trade_now_prediction()
+    prediction["sequence"]["risk_guard_pass"] = False
+    prediction["sequence"]["risk_guard_blocks"] = ["direction_unstable"]
+
+    ready, missing = _stack_actionable(prediction)
+
+    assert ready is False
+    assert "risk_guard_pass" in missing
