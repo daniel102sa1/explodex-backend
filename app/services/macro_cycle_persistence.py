@@ -125,3 +125,62 @@ async def persist_macro_cycle_for_run(db: AsyncSession, run_id: str) -> dict[str
         "complete_3y_histories": full_3y,
         "can_create_entry": False,
     }
+
+
+async def macro_cycle_report(db: AsyncSession, *, minutes: int = 180, limit: int = 20) -> dict[str, Any]:
+    rows = [dict(row) for row in (await db.execute(text("""
+        SELECT DISTINCT ON (s.symbol_id)
+               sy.symbol, s.direction, s.state, s.setup_score, s.risk_score,
+               s.created_at, s.reason
+        FROM signals s
+        JOIN symbols sy ON sy.id=s.symbol_id
+        WHERE s.created_at >= NOW() - (:minutes * INTERVAL '1 minute')
+        ORDER BY s.symbol_id, s.created_at DESC
+    """), {"minutes": max(30, min(minutes, 1440))})).mappings().all()]
+
+    items: list[dict[str, Any]] = []
+    for raw in rows:
+        reason = _d(raw.get("reason"))
+        heart = _d(reason.get("explodex_heart"))
+        macro = _d(heart.get("macro_cycle")) or _d(reason.get("macro_cycle"))
+        if not macro:
+            continue
+        items.append({
+            "symbol": raw.get("symbol"),
+            "signal_direction": raw.get("direction"),
+            "signal_state": raw.get("state"),
+            "setup_score": raw.get("setup_score"),
+            "risk_score": raw.get("risk_score"),
+            "macro_state": macro.get("state"),
+            "macro_bias": macro.get("bias"),
+            "macro_confidence_score": macro.get("confidence_score"),
+            "history_days": macro.get("history_days"),
+            "history_years_approx": macro.get("history_years_approx"),
+            "complete_3y": bool(macro.get("complete_3y")),
+            "long_base_candidate": bool(macro.get("long_base_candidate")),
+            "suggested_watch_horizon": macro.get("suggested_watch_horizon"),
+            "relative_strength_90d_vs_btc_pct": _d(macro.get("features")).get("relative_strength_90d_vs_btc_pct"),
+            "position_in_180d_range": _d(macro.get("features")).get("position_in_180d_range"),
+            "accumulation_score": macro.get("accumulation_score"),
+            "distribution_score": macro.get("distribution_score"),
+            "source": macro.get("source"),
+        })
+
+    items.sort(
+        key=lambda item: (
+            0 if item.get("long_base_candidate") else 1,
+            -_f(item.get("macro_confidence_score")),
+            -_f(item.get("setup_score")),
+        )
+    )
+    return {
+        "version": VERSION,
+        "macro_version": MACRO_VERSION,
+        "paper_only": True,
+        "window_minutes": minutes,
+        "rows": items[:max(1, min(limit, 100))],
+        "long_base_candidates": sum(1 for item in items if item.get("long_base_candidate")),
+        "score_is_probability": False,
+        "entry_authority": False,
+        "note": "Macro radar discovers slow accumulation/distribution context; lower-timeframe timing still decides entries.",
+    }
