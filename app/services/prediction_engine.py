@@ -3,6 +3,8 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
+from app.services.sarpon_compression import build_sarpon_compression_context
+
 
 def _f(value: Any, default: float = 0.0) -> float:
     try:
@@ -199,6 +201,7 @@ def build_pre_move_prediction(
     change_5m = _f(metrics.get("change_5m_pct"))
     change_15m = _f(metrics.get("change_15m_pct"))
     taker = _f(metrics.get("taker_avg_3"), 1.0)
+    sarpon_compression = build_sarpon_compression_context(klines, metrics)
 
     long_flow_score, long_conf, long_conflicts = _side_alignment(metrics, "LONG", coinglass)
     short_flow_score, short_conf, short_conflicts = _side_alignment(metrics, "SHORT", coinglass)
@@ -211,8 +214,10 @@ def build_pre_move_prediction(
     short_breakdown_conf = list(short_conf)
 
     if compressed or compression_ratio <= 0.62:
-        long_breakout += 14
-        short_breakdown += 14
+        # Legacy squeeze flag remains useful, but the richer SARPON compression
+        # engine below now owns the larger early-detection weight.
+        long_breakout += 8
+        short_breakdown += 8
         long_breakout_conf.append("volatilidad comprimida")
         short_breakdown_conf.append("volatilidad comprimida")
     if higher_lows:
@@ -233,6 +238,34 @@ def build_pre_move_prediction(
     if relative_volume >= 1.5:
         long_breakout += 5
         short_breakdown += 5
+
+    compression_direction = str(sarpon_compression.get("direction") or "NEUTRAL").upper()
+    compression_stage = str(sarpon_compression.get("stage") or "NO_COMPRESSION_EDGE").upper()
+    compression_bonus = _f(sarpon_compression.get("priority_bonus"))
+    compression_early_score = _f(sarpon_compression.get("early_score"))
+    if bool(sarpon_compression.get("available")):
+        if compression_direction == "LONG" and compression_bonus > 0:
+            long_breakout += compression_bonus
+            long_breakout_conf.append(
+                f"compresión SARPON prioritaria {compression_stage.lower()} ({compression_early_score:.0f})"
+            )
+            long_breakout_conf.extend(
+                str(x).replace("_", " ")
+                for x in list(sarpon_compression.get("directional_evidence") or [])[:4]
+            )
+        elif compression_direction == "SHORT" and compression_bonus > 0:
+            short_breakdown += compression_bonus
+            short_breakdown_conf.append(
+                f"compresión SARPON prioritaria {compression_stage.lower()} ({compression_early_score:.0f})"
+            )
+            short_breakdown_conf.extend(
+                str(x).replace("_", " ")
+                for x in list(sarpon_compression.get("directional_evidence") or [])[:4]
+            )
+        elif compression_stage == "SQUEEZE_NEUTRAL":
+            # A neutral squeeze is useful context but must not choose direction.
+            long_breakout += 4
+            short_breakdown += 4
 
     # Exhaustion / reversal scores. Aggressive flow without price progress is
     # interpreted as possible absorption only when it happens at a swept level.
@@ -327,18 +360,24 @@ def build_pre_move_prediction(
     risk_per_unit = max(abs(trigger - stop), current * 0.001)
     # Big continuation candidates are allowed more room for runners; reversal
     # setups use slightly closer objectives until their continuation is proven.
+    compression_armed = (
+        compression_stage == "ARMED_EARLY"
+        and compression_direction == direction
+    )
     strong_sequence = (
         pre_score >= 80
-        and volume_acceleration >= 1.20
-        and relative_volume >= 1.20
+        and (
+            (volume_acceleration >= 1.20 and relative_volume >= 1.20)
+            or compression_armed
+        )
         and len(confirmations) >= 5
         and len(conflicts) <= 1
     )
     if kind.startswith("IMPULSO") and strong_sequence:
         magnitude = "EXPLOSIVO"
         r_targets = (1.5, 2.5, 4.0)
-        duration_min, duration_max = (30, 360)
-        time_stop = 45
+        duration_min, duration_max = (30, 720 if compression_armed else 360)
+        time_stop = 60 if compression_armed else 45
     elif kind.startswith("IMPULSO"):
         magnitude = "NORMAL"
         r_targets = (1.25, 2.0, 3.0)
@@ -381,7 +420,7 @@ def build_pre_move_prediction(
     if pre_score < 55:
         phase = "SIN_SETUP"
     elif pre_score < 70:
-        phase = "VIGILAR"
+        phase = "PREACTIVACION" if compression_armed and pre_score >= 64 else "VIGILAR"
     elif not trigger_hit:
         phase = "PREACTIVACION"
     elif chase_risk:
@@ -392,9 +431,15 @@ def build_pre_move_prediction(
         phase = "VIGILAR_CONFIRMACION"
 
     if kind == "IMPULSO_LONG":
-        title = f"LONG {magnitude} EN PREPARACIÓN"
+        title = (
+            f"COMPRESIÓN SARPON LONG · {magnitude} EN PREPARACIÓN"
+            if compression_armed else f"LONG {magnitude} EN PREPARACIÓN"
+        )
     elif kind == "IMPULSO_SHORT":
-        title = f"SHORT {magnitude} EN PREPARACIÓN"
+        title = (
+            f"COMPRESIÓN SARPON SHORT · {magnitude} EN PREPARACIÓN"
+            if compression_armed else f"SHORT {magnitude} EN PREPARACIÓN"
+        )
     elif kind == "REBOTE_LONG":
         title = "POSIBLE REBOTE LONG"
     else:
@@ -439,8 +484,13 @@ def build_pre_move_prediction(
         },
         "confirmations": confirmations[:12],
         "conflicts": conflicts[:10],
+        "sarpon_compression": sarpon_compression,
         "sequence": {
-            "compressed": compressed,
+            "compressed": compressed or compression_stage in {"ARMED_EARLY", "BUILDING", "SQUEEZE_NEUTRAL"},
+            "compression_priority_stage": compression_stage,
+            "compression_priority_direction": compression_direction,
+            "compression_priority_score": round(compression_early_score, 2),
+            "compression_priority_bonus": round(compression_bonus, 2),
             "higher_lows": higher_lows,
             "lower_highs": lower_highs,
             "sweep_low": sweep_low,
@@ -457,7 +507,7 @@ def build_pre_move_prediction(
             "range_low_48": round(low_48, 12),
         },
         "message": (
-            "Predicción de fase previa basada en secuencia de estructura, volatilidad, volumen, flujo, OI y liquidez. "
-            "No garantiza que aparezca una vela grande."
+            "Predicción de fase previa basada en estructura y compresión prioritaria SARPON, después volumen, flujo, OI y liquidez. "
+            "La compresión puede adelantar la vigilancia, pero no autoriza por sí sola una entrada ni garantiza ruptura."
         ),
     }
