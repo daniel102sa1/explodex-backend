@@ -150,3 +150,21 @@ def test_negative_paper_edge_reduces_quant_risk_after_mature_sample():
     assert metrics["expectancy_kelly"]["full_kelly_fraction"] <= 0
     assert guard["risk_multiplier"] <= 0.25
     assert guard["state"] in {"REDUCE_HARD", "HALT_NEW_ENTRIES"}
+
+
+def test_non_extreme_quant_conflict_is_soft_not_duplicate_hard_block():
+    heart = {
+        "quant_brain": {"block_new_entry": False, "strong_conflict": True},
+        "thesis": {},
+        "entry_latch": {},
+    }
+    prediction = {
+        "prediction_stack_v5": {"risk_veto": {}},
+        "sequence": {"risk_guard_pass": True},
+        "decision_guard": {"risk_guard_pass": True},
+    }
+
+    clear, blockers = _hard_safety_clear(heart, prediction)
+
+    assert clear is True
+    assert "quant_brain_conflict" not in blockers
