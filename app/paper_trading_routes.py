@@ -10,6 +10,7 @@ from app.services.paper_edge_lab import edge_lab_report
 from app.services.chati_sarpon_612_monitor import open_monitor_report
 from app.services.paper_fast_cycle import VERSION as EXECUTION_VERSION, latest_fast_cycle_result, run_fast_paper_cycle
 from app.services.formula_brain import formula_brain_calibration_report, formula_registry
+from app.services.macro_cycle_persistence import macro_cycle_report
 from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
@@ -91,6 +92,7 @@ async def summary(db: AsyncSession = Depends(get_db)):
     result["chati_sarpon_612_monitor"] = await _safe_component(db, "chati_sarpon_612_monitor", open_monitor_report)
     result["sarpon_knowledge"] = sarpon_knowledge_registry()
     result["formula_brain"] = await _safe_component(db, "formula_brain", formula_brain_calibration_report)
+    result["macro_cycle"] = await _safe_component(db, "macro_cycle", macro_cycle_report)
     result["trade_audit"] = await _safe_component(db, "trade_audit", paper_trade_audit_report)
     result["vnext_evaluation"] = await _safe_component(db, "vnext_evaluation", vnext_evaluation_report)
     return result
@@ -123,6 +125,12 @@ async def chati_sarpon_612(db: AsyncSession = Depends(get_db)):
 @router.get("/sarpon-knowledge")
 async def sarpon_knowledge():
     return sarpon_knowledge_registry()
+
+
+@router.get("/macro-cycle")
+async def macro_cycle(minutes: int = Query(default=180, ge=30, le=1440), limit: int = Query(default=20, ge=1, le=100), db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return await macro_cycle_report(db, minutes=minutes, limit=limit)
 
 
 @router.get("/formula-brain")
