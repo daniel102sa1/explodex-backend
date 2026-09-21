@@ -51,6 +51,14 @@ def sarpon_knowledge_registry() -> dict[str, Any]:
             "Pattern rules below are transparent heuristics inspired by the confirmed "
             "frameworks; they are not verbatim reproductions of any book."
         ),
+        "user_observed_rules": [
+            {
+                "rule": "COMPRESSION_PRIORITY",
+                "status": "USER_REPORTED_FROM_SARPON",
+                "meaning": "Clean compression/pressure structure deserves extra weight for early detection, before late breakout confirmation.",
+                "not_attributed_to_book": True,
+            }
+        ],
         "risk_rule": (
             "SARPON evidence may confirm/downgrade an entry before execution. It never "
             "widens a live stop and never creates a trade by itself."
@@ -317,7 +325,23 @@ def build_sarpon_classic_context(
 
     murphy = _murphy_structure(rows, side, prediction)
     nison = _candlestick_context(rows, side)
-    score = _f(murphy.get("score"), 50.0) * 0.62 + _f(nison.get("score"), 50.0) * 0.38
+    compression = prediction.get("sarpon_compression") if isinstance(prediction.get("sarpon_compression"), dict) else {}
+    compression_available = bool(compression.get("available"))
+    compression_stage = str(compression.get("stage") or "NO_COMPRESSION_EDGE").upper()
+    compression_direction = str(compression.get("direction") or "NEUTRAL").upper()
+    compression_aligned = (
+        compression_available
+        and compression_stage in {"ARMED_EARLY", "BUILDING"}
+        and compression_direction == side
+    )
+    if compression_available:
+        score = (
+            _f(murphy.get("score"), 50.0) * 0.48
+            + _f(nison.get("score"), 50.0) * 0.27
+            + _f(compression.get("early_score"), 50.0) * 0.25
+        )
+    else:
+        score = _f(murphy.get("score"), 50.0) * 0.62 + _f(nison.get("score"), 50.0) * 0.38
 
     murphy_aligned = bool(murphy.get("aligned"))
     retest = bool(murphy.get("retest"))
@@ -328,10 +352,10 @@ def build_sarpon_classic_context(
     if invalidated or (opposite_candle and not murphy_aligned):
         stage = "RED_INVALIDATED"
         entry_gate = "BLOCK"
-    elif murphy_aligned and retest and candle_confirmed:
+    elif (murphy_aligned or compression_aligned) and retest and candle_confirmed:
         stage = "GREEN_CONFIRMATION"
         entry_gate = "ALLOW_SUPPORT"
-    elif murphy_aligned or retest or candle_confirmed:
+    elif murphy_aligned or compression_aligned or retest or candle_confirmed:
         stage = "YELLOW_FORMING"
         entry_gate = "WAIT"
     else:
@@ -348,6 +372,10 @@ def build_sarpon_classic_context(
         "score_is_probability": False,
         "murphy": murphy,
         "nison": nison,
+        "compression_priority": compression if compression_available else {
+            "available": False,
+            "stage": "NO_DATA",
+        },
         "plan_geometry": {
             "entry_low": prediction.get("entry_low"),
             "entry_high": prediction.get("entry_high"),
@@ -360,6 +388,9 @@ def build_sarpon_classic_context(
         },
         "rules": {
             "structure_before_candle": True,
+            "compression_priority_for_early_detection": True,
+            "compression_can_form_setup_before_breakout": True,
+            "compression_cannot_authorize_entry_alone": True,
             "retest_before_entry": True,
             "candle_confirmation_required_when_available": True,
             "preactivation_is_not_entry": True,
@@ -370,7 +401,9 @@ def build_sarpon_classic_context(
         },
         "knowledge": sarpon_knowledge_registry(),
         "note": (
-            "SARPON Classic combines Murphy-style structure with Nison-style candle "
-            "confirmation. Additional books/authors remain pending until directly evidenced."
+            "SARPON Classic combines Murphy-style structure with Nison-style candle confirmation. "
+            "Compression receives extra EARLY-detection weight from the user-reported SARPON rule, "
+            "without claiming it comes from Murphy/Nison or from any undisclosed private method. "
+            "Additional books/authors remain pending until directly evidenced."
         ),
     }
