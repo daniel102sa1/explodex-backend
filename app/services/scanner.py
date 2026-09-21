@@ -165,20 +165,18 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 except Exception as exc:
                     cg_errors.append(f"{symbol}: {str(exc)[:400]}")
                     fallback = dict(local_score)
+                    metrics = dict(fallback.get("metrics") or {})
+                    warnings = list(metrics.get("data_quality_warnings") or [])
+                    if "coinglass_unavailable_optional" not in warnings:
+                        warnings.append("coinglass_unavailable_optional")
+                    metrics["data_quality_warnings"] = warnings
+                    metrics["coinglass_available"] = False
+                    fallback["metrics"] = metrics
                     fallback["coinglass"] = {
                         "available": False,
                         "configured": True,
                         "errors": [str(exc)[:400]],
                     }
-                    if settings.coinglass_require_for_ready and fallback.get("state") == "READY":
-                        fallback["state"] = "PREPARING"
-                        metrics = dict(fallback.get("metrics") or {})
-                        rejects = list(metrics.get("reject_reasons") or [])
-                        if "coinglass_unavailable_for_ready" not in rejects:
-                            rejects.append("coinglass_unavailable_for_ready")
-                        metrics["reject_reasons"] = rejects
-                        metrics["coinglass_available"] = False
-                        fallback["metrics"] = metrics
                     cg_scores[symbol] = fallback
 
             await asyncio.gather(*(confirm(item) for item in cg_targets))
@@ -194,14 +192,15 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             score = cg_scores.get(symbol, local_score)
             if symbol in cg_scores:
                 coinglass_enriched += 1
-            elif settings.coinglass_require_for_ready and score.get("state") == "READY":
+            elif score.get("state") == "READY":
+                # The paid confirmation layer is optional. Not checking it is a
+                # data-quality note, not a reason to erase a local READY setup.
                 score = dict(score)
-                score["state"] = "PREPARING"
                 metrics = dict(score.get("metrics") or {})
-                rejects = list(metrics.get("reject_reasons") or [])
-                if "coinglass_not_checked" not in rejects:
-                    rejects.append("coinglass_not_checked")
-                metrics["reject_reasons"] = rejects
+                warnings = list(metrics.get("data_quality_warnings") or [])
+                if "coinglass_not_checked_optional" not in warnings:
+                    warnings.append("coinglass_not_checked_optional")
+                metrics["data_quality_warnings"] = warnings
                 metrics["coinglass_available"] = False
                 score["metrics"] = metrics
 
