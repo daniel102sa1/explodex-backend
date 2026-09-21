@@ -11,7 +11,7 @@ from app.services.binance import binance_client
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
 VERSION = "shadow_forecast_memory_v1"
-HORIZONS = {"15m": 15, "1h": 60, "4h": 240, "6h": 360, "24h": 1440}
+HORIZONS = {"15m": 15, "1h": 60, "4h": 240, "6h": 360, "24h": 1440, "3d": 4320, "7d": 10080}
 MIN_SAMPLE = 30
 
 
@@ -91,10 +91,12 @@ async def capture_shadow_forecasts_for_run(db: AsyncSession, run_id: str) -> dic
         event = _d(contract.get("event_risk")) or _d(heart.get("event_risk"))
         formula_brain = _d(prediction.get("formula_brain"))
         murphy_patterns = _d(prediction.get("murphy_patterns"))
+        macro_cycle = _d(heart.get("macro_cycle")) or _d(prediction.get("macro_cycle"))
         metadata = {
             "evaluation_generation": EVALUATION_GENERATION,
             "formula_brain": formula_brain,
             "murphy_patterns": murphy_patterns,
+            "macro_cycle": macro_cycle,
             "heart_version": heart.get("version"),
             "matrix_consensus": matrix.get("consensus"),
             "horizon_conflict": matrix.get("horizon_conflict"),

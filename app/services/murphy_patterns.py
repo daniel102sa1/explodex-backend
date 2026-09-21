@@ -246,10 +246,13 @@ def build_murphy_pattern_context(
             "evidence": evidence,
         })
 
-    recent_resistance = max(highs[-24:])
-    recent_support = min(lows[-24:])
-    breakout_up = current > recent_resistance - scale * 0.10
-    breakout_down = current < recent_support + scale * 0.10
+    # Confirmation must break a level that existed *before* the current bar.
+    # Including the current high/low in the boundary made "near the high" look
+    # like a confirmed breakout. Keep FORMING separate from real close-through.
+    prior_resistance = max(highs[-25:-1])
+    prior_support = min(lows[-25:-1])
+    breakout_up = current > prior_resistance + scale * 0.08
+    breakout_down = current < prior_support - scale * 0.08
 
     if resistance_flat and rising_lows and contracting:
         score = 60 + min(18, low_slope_atr * 80) + (8 if volume_dry else 0)
@@ -259,7 +262,7 @@ def build_murphy_pattern_context(
             confidence=score,
             state="BREAKOUT_CONFIRMED" if breakout_up else "FORMING",
             confirmed=breakout_up and recent_volume_ratio >= 1.15,
-            level=max(wh),
+            level=prior_resistance,
             evidence=[
                 "flat_resistance",
                 "rising_lows",
@@ -277,7 +280,7 @@ def build_murphy_pattern_context(
             confidence=score,
             state="BREAKDOWN_CONFIRMED" if breakout_down else "FORMING",
             confirmed=breakout_down and recent_volume_ratio >= 1.15,
-            level=min(wl),
+            level=prior_support,
             evidence=[
                 "flat_support",
                 "falling_highs",

@@ -332,6 +332,79 @@ class BinancePublicClient:
             loader=load,
         )
 
+    async def historical_daily_klines(self, symbol: str, days: int = 1095) -> dict[str, Any]:
+        """Fetch long daily history for macro-cycle analysis.
+
+        Prefer Binance spot history because a multi-year base is a spot/market
+        structure question and spot klines are available even when Futures egress
+        is regionally restricted. If spot history is unavailable, fall back to
+        the derivative daily series we already use, clearly marking the shorter
+        history instead of fabricating missing years.
+        """
+        symbol = symbol.upper()
+        wanted = max(90, min(int(days), 1460))
+
+        async def load() -> dict[str, Any]:
+            try:
+                rows: list[list[Any]] = []
+                end_time: int | None = None
+                remaining = wanted
+                while remaining > 0:
+                    batch_limit = min(1000, remaining)
+                    params: dict[str, Any] = {
+                        "symbol": symbol,
+                        "interval": "1d",
+                        "limit": batch_limit,
+                    }
+                    if end_time is not None:
+                        params["endTime"] = end_time
+                    batch = await self._binance_spot_get("/api/v3/klines", params)
+                    if not isinstance(batch, list) or not batch:
+                        break
+                    rows = list(batch) + rows
+                    first_ts = int(batch[0][0])
+                    end_time = first_ts - 1
+                    remaining = wanted - len(rows)
+                    if len(batch) < batch_limit:
+                        break
+                    await asyncio.sleep(0)
+                dedup: dict[int, list[Any]] = {}
+                for row in rows:
+                    if isinstance(row, list) and len(row) >= 8:
+                        dedup[int(row[0])] = row
+                ordered = [dedup[key] for key in sorted(dedup)][-wanted:]
+                if len(ordered) >= 90:
+                    return {
+                        "symbol": symbol,
+                        "source": "BINANCE_SPOT_HISTORY",
+                        "rows": ordered,
+                        "days_requested": wanted,
+                        "days_available": len(ordered),
+                        "complete_3y": len(ordered) >= 1000,
+                    }
+            except Exception as exc:
+                spot_error = f"{type(exc).__name__}:{str(exc)[:240]}"
+            else:
+                spot_error = "insufficient_spot_history"
+
+            fallback = await self.klines(symbol, "1d", min(wanted, 300))
+            return {
+                "symbol": symbol,
+                "source": self.active_source,
+                "rows": fallback,
+                "days_requested": wanted,
+                "days_available": len(fallback),
+                "complete_3y": False,
+                "warning": f"long_spot_history_unavailable:{spot_error}",
+            }
+
+        return await self._cached_call(
+            key=f"macro_daily:{symbol}:{wanted}",
+            ttl_seconds=1800.0,
+            stale_seconds=21600.0,
+            loader=load,
+        )
+
     async def order_book(self, symbol: str, limit: int = 20) -> dict[str, Any]:
         if self._binance_available():
             try:

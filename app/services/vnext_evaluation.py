@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 EVALUATION_GENERATION = "EXPLODEX_VNEXT_2026_09_20"
 VERSION = "explodex_vnext_evaluation_v1"
-SHADOW_HORIZONS = ("15m", "1h", "4h", "6h", "24h")
+SHADOW_HORIZONS = ("15m", "1h", "4h", "6h", "24h", "3d", "7d")
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -31,7 +31,8 @@ async def vnext_evaluation_report(db: AsyncSession) -> dict[str, Any]:
             COUNT(*) FILTER (WHERE exit_reason='PRE_TP1_PROTECT_STOP') AS pre_tp1_protect_stops,
             COUNT(*) FILTER (WHERE exit_reason IN ('PROFIT_LOCK_STOP','AMBIGUOUS_PROFIT_LOCK_STOP')) AS post_tp_profit_lock_stops,
             COUNT(*) FILTER (WHERE exit_reason='TP1') AS tp1_exits,
-            COUNT(*) FILTER (WHERE exit_reason='TIME_EXIT') AS time_exits
+            COUNT(*) FILTER (WHERE exit_reason='TIME_EXIT') AS time_exits,
+            COUNT(*) FILTER (WHERE COALESCE(metadata->>'validation_probation','false')='true') AS probation_trades
         FROM paper_positions
         WHERE metadata->>'evaluation_generation'=:generation
     """), {"generation": EVALUATION_GENERATION})).mappings().one())
@@ -54,6 +55,7 @@ async def vnext_evaluation_report(db: AsyncSession) -> dict[str, Any]:
         "post_tp_profit_lock_stops": int(paper.get("post_tp_profit_lock_stops") or 0),
         "tp1_exits": int(paper.get("tp1_exits") or 0),
         "time_exits": int(paper.get("time_exits") or 0),
+        "probation_trades": int(paper.get("probation_trades") or 0),
         "status": "USABLE" if closed >= 30 else "CALIBRATING",
         "minimum_comparable_closed_trades": 30,
     }
@@ -114,14 +116,15 @@ async def vnext_evaluation_report(db: AsyncSession) -> dict[str, Any]:
         "shadow": {
             "captured_signals": shadow_total,
             "horizons": horizons,
-            "continues_while_paper_kill_switch_is_active": True,
+            "continues_while_main_quant_guard_is_halted": True,
         },
         "evaluation_rules": {
             "do_not_compare_new_logic_to_all_legacy_trades_as_one_sample": True,
             "minimum_comparable_sample": 30,
             "pre_tp1_protection_is_experimental": True,
             "shadow_scores_are_not_next_trade_probabilities": True,
-            "paper_kill_switch_is_not_bypassed": True,
+            "main_quant_guard_is_not_reset_or_falsified": True,
+            "separate_probation_lane_may_collect_tiny_paper_outcomes": True,
         },
-        "note": "VNext is evaluated as its own cohort. Shadow forecasts keep learning even when the visible PAPER risk guard halts new positions.",
+        "note": "VNext is evaluated as its own cohort. Shadow forecasts always learn; a separate tiny-risk probation lane may collect actual PAPER outcomes while the main legacy quant guard remains HALT.",
     }

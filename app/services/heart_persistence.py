@@ -12,8 +12,9 @@ from app.services.higher_timeframe_context import alignment, batch_higher_timefr
 from app.services.ignition_engine import build_ignition_signal
 from app.services.liquidity_target_engine import build_liquidity_targets
 from app.services.trade_thesis import apply_trade_thesis, apply_thesis_to_score
+from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-HEART_PERSISTENCE_VERSION = "heart_persistence_v5_adaptive_expectancy"
+HEART_PERSISTENCE_VERSION = "heart_persistence_v6_lean_vnext_expectancy"
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -38,26 +39,29 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 
 def _stack_checks(prediction: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Canonical lean timing gate.
+
+    Several older labels were derived from the same price/flow evidence and then
+    required simultaneously. That double-counted confirmation and delayed valid
+    setups. The canonical gate now needs one real timing trigger plus independent
+    hard safety: no chase, no invalidation/veto and Risk Guard clear.
+    """
     fingerprint = _json(prediction.get("premove_fingerprint"))
     stack = _json(prediction.get("prediction_stack_v5"))
-    master = _json(stack.get("master_decision"))
     risk_veto = _json(stack.get("risk_veto"))
-    timing = _json(stack.get("entry_timing"))
     sequence = _json(prediction.get("sequence"))
     decision_guard = _json(prediction.get("decision_guard"))
 
-    trade_now = bool(fingerprint.get("trade_now_ready")) or str(fingerprint.get("trade_class") or "").upper() == "TRADE_NOW"
-    master_yes = str(master.get("state") or "").upper() == "YES"
-    timing_enter = str(timing.get("state") or "").upper() in {"ENTER_NOW", "TRADE_NOW"} or trade_now
+    fingerprint_now = bool(fingerprint.get("trade_now_ready")) or str(fingerprint.get("trade_class") or "").upper() == "TRADE_NOW"
+    phase_activated = str(prediction.get("phase") or "").upper() == "ACTIVADO"
+    timing_ready = fingerprint_now or phase_activated
     veto_clear = not bool(risk_veto.get("blocked"))
     not_chasing = not bool(sequence.get("chase_risk")) and not bool(risk_veto.get("chase"))
     not_invalidated = not bool(risk_veto.get("invalidated")) and not bool(risk_veto.get("hard_block"))
     risk_guard_pass = bool(sequence.get("risk_guard_pass", decision_guard.get("risk_guard_pass", True)))
 
     checks = {
-        "fingerprint_trade_now": trade_now,
-        "master_yes": master_yes,
-        "timing_enter": timing_enter,
+        "timing_ready": timing_ready,
         "veto_clear": veto_clear,
         "not_chasing": not_chasing,
         "not_invalidated": not_invalidated,
@@ -102,11 +106,12 @@ def _apply_timing_memory(ignition: dict[str, Any], timing_model: dict[str, Any])
 
 
 async def _adaptive_expectancy_threshold(db: AsyncSession) -> dict[str, Any]:
-    """Convert recent PAPER hit-rate into the minimum net R/R required.
+    """Use only the current VNext PAPER generation for adaptive expectancy.
 
-    We use Bayesian shrinkage toward 40% while the sample is small so a short
-    lucky/unlucky streak cannot swing the threshold wildly. With enough trades,
-    the threshold approaches the break-even R/R implied by the observed win rate.
+    Legacy trades came from materially different entry/stop/management logic.
+    They remain visible for audit, but they must not silently raise the R/R hurdle
+    for a reconstructed strategy. Until 30 comparable VNext closes exist, use a
+    fixed conservative net R/R floor rather than adapting to old history.
     """
     try:
         row = (await db.execute(text("""
@@ -115,39 +120,47 @@ async def _adaptive_expectancy_threshold(db: AsyncSession) -> dict[str, Any]:
             FROM (
                 SELECT net_pnl
                 FROM paper_positions
-                WHERE status='CLOSED' AND net_pnl IS NOT NULL
+                WHERE status='CLOSED'
+                  AND net_pnl IS NOT NULL
+                  AND COALESCE(metadata->>'evaluation_generation','') = :generation
                 ORDER BY closed_at DESC
                 LIMIT 120
             ) recent
-        """))).mappings().one()
+        """), {"generation": EVALUATION_GENERATION})).mappings().one()
         sample = int(row.get("sample") or 0)
         winners = int(row.get("winners") or 0)
     except Exception:
+        sample = 0
+        winners = 0
+
+    if sample < 30:
         return {
-            "sample": 0,
-            "winners": 0,
-            "raw_win_rate_pct": None,
-            "shrunk_win_rate_pct": 40.0,
-            "min_net_rr": 1.6,
-            "status": "DEFAULT_NO_HISTORY",
+            "generation": EVALUATION_GENERATION,
+            "sample": sample,
+            "winners": winners,
+            "raw_win_rate_pct": round(winners / sample * 100.0, 2) if sample else None,
+            "shrunk_win_rate_pct": None,
+            "min_net_rr": 1.60,
+            "status": "CALIBRATING_VNEXT",
+            "legacy_history_can_raise_threshold": False,
         }
 
     prior_n = 20.0
     prior_p = 0.40
-    shrunk_p = (winners + prior_n * prior_p) / (sample + prior_n) if sample >= 0 else prior_p
+    shrunk_p = (winners + prior_n * prior_p) / (sample + prior_n)
     shrunk_p = max(0.22, min(0.65, shrunk_p))
     break_even_rr = (1.0 - shrunk_p) / shrunk_p
-    # Add a small safety margin because realized exits include time exits and
-    # because our cost model is an estimate rather than exact Binance billing.
     min_net_rr = max(1.60, min(3.20, break_even_rr * 1.07))
     return {
+        "generation": EVALUATION_GENERATION,
         "sample": sample,
         "winners": winners,
-        "raw_win_rate_pct": round(winners / sample * 100.0, 2) if sample else None,
+        "raw_win_rate_pct": round(winners / sample * 100.0, 2),
         "shrunk_win_rate_pct": round(shrunk_p * 100.0, 2),
         "break_even_net_rr": round(break_even_rr, 3),
         "min_net_rr": round(min_net_rr, 3),
-        "status": "ADAPTIVE" if sample >= 30 else "CALIBRATING",
+        "status": "ADAPTIVE_VNEXT",
+        "legacy_history_can_raise_threshold": False,
     }
 
 
@@ -210,9 +223,9 @@ def _canonical_action(
 
     if allowed:
         action = "ENTRAR_LONG" if direction == "LONG" else "ENTRAR_SHORT"
-        via = "IGNITION_FAST_PATH" if ignition_ready and not stack_ready else "ADVANCED_STACK"
+        via = "IGNITION_FAST_PATH" if ignition_ready and not stack_ready else "LEAN_TIMING_GATE"
         if ignition_ready and bool(_json(ignition.get("timing_memory")).get("can_influence_entry")):
-            via = "LEARNED_IGNITION_FAST_PATH" if not stack_ready else "ADVANCED_STACK_PLUS_MEMORY"
+            via = "LEARNED_IGNITION_FAST_PATH" if not stack_ready else "LEAN_TIMING_PLUS_MEMORY"
         chosen = _json(target_choice.get("chosen_target"))
         reason = (
             f"Entrada autorizada con R/R neto {chosen.get('net_rr')} hacia {chosen.get('name')}; supera mínimo adaptativo {min_net_rr:.2f}."
@@ -383,7 +396,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             blocked += 1
 
         heart = {
-            "version": "explodex_heart_v6_adaptive_expectancy",
+            "version": "explodex_heart_v7_lean_vnext_expectancy",
             "persistence_version": HEART_PERSISTENCE_VERSION,
             "symbol": row["symbol"],
             "direction": score.get("direction"),
@@ -393,6 +406,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             "ignition": ignition,
             "liquidity_intelligence": liquidity,
             "higher_timeframe": htf,
+            "higher_timeframe_context": htf,
             "higher_timeframe_alignment": htf_alignment,
             "prediction_phase": prediction.get("phase"),
             "prediction_type": prediction.get("type"),

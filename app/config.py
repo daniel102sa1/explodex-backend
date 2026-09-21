@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     coinglass_rate_limit_per_minute: int = 24
     coinglass_cache_ttl_seconds: int = 45
     coinglass_max_scanner_candidates: int = 5
-    coinglass_require_for_ready: bool = True
+    coinglass_require_for_ready: bool = False
 
     # Optional contextual enrichment. News is deliberately secondary and capped.
     news_enabled: bool = True

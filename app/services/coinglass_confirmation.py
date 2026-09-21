@@ -13,11 +13,11 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 
 def apply_coinglass_confirmation(score: dict[str, Any], cg: dict[str, Any]) -> dict[str, Any]:
-    """Apply a bounded multi-exchange confirmation layer.
+    """Apply a bounded optional multi-exchange confirmation layer.
 
-    CoinGlass cannot create a trade by itself. It can confirm, downgrade or veto a
-    locally detected setup. Adjustments are deliberately small compared with the
-    local structure/order-flow model to reduce overfitting.
+    CoinGlass cannot create a trade by itself. Missing paid-plan fields are treated
+    as unavailable evidence, never as negative evidence. Observed contradictory
+    data may still reduce/downgrade a locally detected setup.
     """
     result = dict(score)
     metrics = dict(result.get("metrics") or {})
@@ -142,19 +142,19 @@ def apply_coinglass_confirmation(score: dict[str, Any], cg: dict[str, Any]) -> d
         x for x in confirmations if x.startswith("cg_oi_") or x.startswith("cg_taker_")
     ])
 
-    # CoinGlass is not allowed to upgrade WATCH/NO_TRADE into READY. It may only
-    # validate an already strong local PREPARING/READY setup.
+    # CoinGlass is optional corroboration. Missing/plan-limited paid data is not
+    # bearish evidence and must not demote an otherwise valid local setup.
+    # Only *observed contradictory data* may downgrade/veto.
     state = base_state
     if hard_conflict:
         state = "NO_TRADE"
         reasons.append("coinglass_hard_conflict")
     elif base_state == "READY":
-        if settings.coinglass_require_for_ready and (not critical_complete or cg_directional_confirmations < 2):
-            state = "PREPARING"
-            reasons.append("coinglass_confirmation_required")
-        elif adjusted_score < 86 or adjusted_risk > 32:
+        if available and (adjusted_score < 86 or adjusted_risk > 32):
             state = "PREPARING" if adjusted_score >= 75 and adjusted_risk <= 48 else "NO_TRADE"
-            reasons.append("coinglass_downgrade")
+            reasons.append("coinglass_observed_conflict_downgrade")
+        elif settings.coinglass_require_for_ready and (not critical_complete or cg_directional_confirmations < 2):
+            reasons.append("coinglass_incomplete_optional_warning")
     elif base_state == "PREPARING":
         if (
             critical_complete
@@ -165,13 +165,12 @@ def apply_coinglass_confirmation(score: dict[str, Any], cg: dict[str, Any]) -> d
         ):
             state = "READY"
             reasons.append("coinglass_confirmed_ready")
-        elif adjusted_score < 75 or adjusted_risk > 48:
+        elif available and (adjusted_score < 75 or adjusted_risk > 48):
             state = "WATCH" if adjusted_score >= 64 and adjusted_risk <= 65 else "NO_TRADE"
-            reasons.append("coinglass_downgrade")
+            reasons.append("coinglass_observed_conflict_downgrade")
 
     if settings.coinglass_require_for_ready and state == "READY" and not available:
-        state = "PREPARING"
-        reasons.append("coinglass_unavailable_for_ready")
+        reasons.append("coinglass_unavailable_optional_warning")
 
     metrics.update({
         "coinglass_available": available,
