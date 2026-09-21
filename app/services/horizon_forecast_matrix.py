@@ -193,5 +193,5 @@ def build_horizon_forecast_matrix(
             "confidence_score": macro.get("confidence_score"),
             "long_base_candidate": bool(macro.get("long_base_candidate")),
         },
-        "use": "Context for the single canonical Heart. 3d/7d are descriptive macro horizons and never authorize a trade by themselves.",
+        "use": "Context for the single canonical Heart. This matrix never authorizes a trade by itself; 3d/7d are descriptive macro horizons.",
     }
