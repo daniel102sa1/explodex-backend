@@ -52,3 +52,12 @@ def test_macro_cycle_reports_short_history_as_unavailable():
     assert result["available"] is False
     assert result["reason"] == "insufficient_daily_history"
     assert result["can_create_entry"] is False
+
+
+def test_macro_radar_liquidity_filter_accepts_real_usdt_universe_symbols():
+    from app.services.macro_cycle_persistence import _eligible_macro_ticker
+
+    assert _eligible_macro_ticker({"symbol": "ZECUSDT", "quoteVolume": 50_000_000}) is True
+    assert _eligible_macro_ticker({"symbol": "ZEC_USDT", "quoteVolume": 50_000_000}) is False
+    assert _eligible_macro_ticker({"symbol": "ZECBTC", "quoteVolume": 50_000_000}) is False
+    assert _eligible_macro_ticker({"symbol": "ZECUSDT", "quoteVolume": 1}) is False
