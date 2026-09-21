@@ -8,9 +8,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.adaptive_profit_trail import build_adaptive_profit_trail
 from app.services.binance import binance_client
 
-VERSION = "paper_horizon_manager_v4_pre_tp1_protection"
+VERSION = "paper_horizon_manager_v5_adaptive_profit_trailing"
 DEFAULT_MAX_HOLD_MINUTES = 120
 PROFIT_LOCK_COST_BUFFER_RATE = 0.0018
 PRE_TP1_ARM_PROGRESS = 0.85
