@@ -278,9 +278,12 @@ def build_sarpon_compression_context(
     priority_bonus = 0.0
     if direction in {"LONG", "SHORT"}:
         if stage == "ARMED_EARLY":
-            priority_bonus = min(28.0, 14.0 + (early_score - 70.0) * 0.55)
+            # User-observed SARPON rule: a clean directional compression should
+            # be visible BEFORE volume/flow fully expand. Give it enough weight
+            # to reach PREACTIVACION, but never enough to bypass entry safety.
+            priority_bonus = min(38.0, 22.0 + max(0.0, early_score - 70.0) * 0.70)
         elif stage == "BUILDING":
-            priority_bonus = min(18.0, 8.0 + max(0.0, early_score - 55.0) * 0.35)
+            priority_bonus = min(22.0, 10.0 + max(0.0, early_score - 55.0) * 0.45)
 
     return {
         "version": VERSION,
