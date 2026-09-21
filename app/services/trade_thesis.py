@@ -277,7 +277,7 @@ async def apply_trade_thesis(
         str(compression.get("stage") or "").upper() == "ARMED_EARLY"
         and str(compression.get("direction") or "").upper() == candidate_direction
     )
-    create_score_floor = 68.0 if compression_armed else MIN_CREATE_SCORE
+    create_score_floor = 64.0 if compression_armed else MIN_CREATE_SCORE
     create_allowed = (
         direction_match
         and candidate_score >= create_score_floor
