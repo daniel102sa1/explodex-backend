@@ -66,37 +66,66 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         or bool(btc_overlay.get("force_defensive"))
         or live_red > 0
     )
-    risk_multiplier = float(loss_brake.get("trend_risk_multiplier") or 1.0)
-    risk_multiplier *= float(((policy.get("trend_premove") or {}).get("risk_multiplier")) or 0.0)
-    risk_multiplier *= float(quant_guard.get("risk_multiplier") or 0.0)
-    risk_multiplier *= float(live_monitor.get("portfolio_new_entry_risk_multiplier") or 1.0)
+    # Keep market/regime/live-monitor brakes independent from the historical
+    # portfolio quant guard. A bad legacy cohort must not erase new signals.
+    base_risk_multiplier = float(loss_brake.get("trend_risk_multiplier") or 1.0)
+    base_risk_multiplier *= float(((policy.get("trend_premove") or {}).get("risk_multiplier")) or 0.0)
+    base_risk_multiplier *= float(live_monitor.get("portfolio_new_entry_risk_multiplier") or 1.0)
+    risk_multiplier = base_risk_multiplier * float(quant_guard.get("risk_multiplier") or 0.0)
 
     btc_blocks_new_entries = bool(btc_overlay.get("block_new_entries"))
-    if quant_guard.get("halt_new_entries") or btc_blocks_new_entries:
+    validation_probation = False
+    probation_risk_multiplier = 0.0
+
+    if btc_blocks_new_entries:
+        # A live market shock is not legacy history; keep this as a real hard stop.
         execution = {
-            "version": "paper_unified_heart_executor_blocked_by_quant_guard",
+            "version": "paper_unified_heart_executor_blocked_by_btc_shock",
             "opened": 0,
             "trades": [],
-            "reason": "quant_kill_switch" if quant_guard.get("halt_new_entries") else "btc_shock_block",
+            "reason": "btc_shock_block",
             "signals_checked": 0,
             "candidates": 0,
-            "rejected": {"quant_kill_switch": 1} if quant_guard.get("halt_new_entries") else {"btc_shock_block": 1},
+            "rejected": {"btc_shock_block": 1},
             "defensive": defensive,
             "defensive_learning_enabled": defensive,
-            "risk_policy": {"quant_guard_multiplier": 0.0},
+            "validation_probation": False,
+            "risk_policy": {"btc_block": True},
         }
-        pre_event_execution = {
-            "opened": 0,
-            "trades": [],
-            "reason": "quant_kill_switch" if quant_guard.get("halt_new_entries") else "btc_shock_block",
-            "rejected": {"quant_kill_switch": 1} if quant_guard.get("halt_new_entries") else {"btc_shock_block": 1},
-        }
-        structure_retest_execution = {
-            "opened": 0,
-            "trades": [],
-            "reason": "quant_kill_switch" if quant_guard.get("halt_new_entries") else "btc_shock_block",
-            "rejected": {"quant_kill_switch": 1} if quant_guard.get("halt_new_entries") else {"btc_shock_block": 1},
-        }
+        pre_event_execution = {"opened": 0, "trades": [], "reason": "btc_shock_block", "rejected": {"btc_shock_block": 1}}
+        structure_retest_execution = {"opened": 0, "trades": [], "reason": "btc_shock_block", "rejected": {"btc_shock_block": 1}}
+    elif quant_guard.get("halt_new_entries"):
+        # VNext probation: continue gathering *actual PAPER execution* evidence at
+        # tiny risk instead of letting 206 legacy trades permanently deadlock the
+        # new generation. One position max, 1x, no aggressive lane. This does not
+        # reset or falsify the quant guard; the main portfolio remains HALT.
+        validation_probation = base_risk_multiplier > 0
+        probation_risk_multiplier = min(0.10, max(0.0, base_risk_multiplier) * 0.10)
+        if validation_probation and probation_risk_multiplier > 0:
+            execution = await execute_unified_heart_contracts(
+                db,
+                defensive=True,
+                risk_multiplier=probation_risk_multiplier,
+                btc_overlay=btc_overlay,
+                validation_probation=True,
+            )
+        else:
+            execution = {
+                "version": "paper_unified_heart_executor_vnext_probation",
+                "opened": 0,
+                "trades": [],
+                "reason": "probation_blocked_by_non_quant_risk",
+                "signals_checked": 0,
+                "candidates": 0,
+                "rejected": {"non_quant_risk_multiplier_zero": 1},
+                "defensive": True,
+                "defensive_learning_enabled": True,
+                "validation_probation": True,
+            }
+        # During probation keep the system simple: only the canonical unified
+        # Heart may open. Secondary experimental executors stay off.
+        pre_event_execution = {"opened": 0, "trades": [], "reason": "disabled_during_vnext_probation", "rejected": {}}
+        structure_retest_execution = {"opened": 0, "trades": [], "reason": "disabled_during_vnext_probation", "rejected": {}}
     else:
         execution = await execute_unified_heart_contracts(
             db,
@@ -149,10 +178,14 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
 
     summary = await base.paper_summary(db)
 
-    if quant_guard.get("halt_new_entries"):
-        cycle_reason = "quant_kill_switch"
-    elif btc_blocks_new_entries:
+    if btc_blocks_new_entries:
         cycle_reason = "btc_shock_block"
+    elif quant_guard.get("halt_new_entries"):
+        cycle_reason = (
+            "opened_vnext_probation"
+            if int(execution.get("opened") or 0) > 0
+            else str(execution.get("reason") or "vnext_probation_no_candidate")
+        )
     elif int(pre_event_execution.get("opened") or 0):
         cycle_reason = pre_event_execution.get("reason")
     elif int(structure_retest_execution.get("opened") or 0):
@@ -182,6 +215,15 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         "trade_audit": trade_audit,
         "chati_sarpon_612_live_monitor": live_monitor,
         "effective_new_entry_risk_multiplier": round(max(0.0, risk_multiplier), 4),
+        "base_non_quant_risk_multiplier": round(max(0.0, base_risk_multiplier), 4),
+        "validation_probation": {
+            "active": validation_probation,
+            "risk_multiplier": round(max(0.0, probation_risk_multiplier), 4),
+            "main_quant_guard_still_halted": bool(quant_guard.get("halt_new_entries")),
+            "one_position_max": True,
+            "forces_1x_leverage": True,
+            "aggressive_lane_disabled": True,
+        },
         "equity": summary.get("equity"),
         "open_positions": len(summary.get("open_positions") or []),
         "single_paper_authority": True,
