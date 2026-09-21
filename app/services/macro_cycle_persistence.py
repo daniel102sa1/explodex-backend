@@ -15,6 +15,15 @@ MAX_SYMBOLS = 12
 CONCURRENCY = 3
 
 
+def _f(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _d(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
