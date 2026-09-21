@@ -24,32 +24,35 @@ def _dict(value: Any) -> dict[str, Any]:
 
 
 def _stack_actionable(prediction: dict[str, Any]) -> tuple[bool, list[str]]:
-    """Return whether the advanced stack itself already authorizes an entry.
+    """Lean entry gate: one timing signal plus independent hard safety.
 
-    This deliberately does not require the legacy phase label ACTIVADO. The
-    fingerprint and Prediction Stack can reach TRADE_NOW/YES slightly earlier;
-    requiring both systems to flip at the same instant caused false negatives.
+    Older versions required fingerprint TRADE_NOW + Stack master YES + timing
+    ENTER simultaneously even though those labels were derived from much of the
+    same evidence. That duplicated confirmation and produced late false
+    negatives. The lean gate keeps only independent requirements:
+      - a real timing trigger (fingerprint TRADE_NOW or phase ACTIVADO),
+      - no chase,
+      - no invalidation/hard veto,
+      - structural Risk Guard clear.
+    Soft warnings may reduce conviction/horizon/size downstream but do not erase
+    the setup.
     """
     fingerprint = _dict(prediction.get("premove_fingerprint"))
     stack = _dict(prediction.get("prediction_stack_v5"))
-    master = _dict(stack.get("master_decision"))
     risk_veto = _dict(stack.get("risk_veto"))
-    timing = _dict(stack.get("entry_timing"))
     sequence = _dict(prediction.get("sequence"))
     decision_guard = _dict(prediction.get("decision_guard"))
 
-    trade_now = bool(fingerprint.get("trade_now_ready")) or str(fingerprint.get("trade_class") or "").upper() == "TRADE_NOW"
-    master_yes = str(master.get("state") or "").upper() == "YES"
-    timing_enter = str(timing.get("state") or "").upper() in {"ENTER_NOW", "TRADE_NOW"} or trade_now
+    fingerprint_now = bool(fingerprint.get("trade_now_ready")) or str(fingerprint.get("trade_class") or "").upper() == "TRADE_NOW"
+    phase_activated = str(prediction.get("phase") or "").upper() == "ACTIVADO"
+    timing_ready = fingerprint_now or phase_activated
     veto_clear = not bool(risk_veto.get("blocked"))
     chase_clear = not bool(sequence.get("chase_risk")) and not bool(risk_veto.get("chase"))
     invalidation_clear = not bool(risk_veto.get("invalidated")) and not bool(risk_veto.get("hard_block"))
     risk_guard_pass = bool(sequence.get("risk_guard_pass", decision_guard.get("risk_guard_pass", True)))
 
     checks = {
-        "fingerprint_trade_now": trade_now,
-        "master_yes": master_yes,
-        "timing_enter": timing_enter,
+        "timing_ready": timing_ready,
         "veto_clear": veto_clear,
         "not_chasing": chase_clear,
         "not_invalidated": invalidation_clear,
@@ -70,6 +73,7 @@ def _canonical_gate(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[
     chase_risk = bool(sequence.get("chase_risk"))
     risk_guard_pass = bool(sequence.get("risk_guard_pass", decision_guard.get("risk_guard_pass", True)))
     risk_guard_blocks = list(sequence.get("risk_guard_blocks") or decision_guard.get("risk_guard_blocks") or [])
+    risk_guard_warnings = list(sequence.get("risk_guard_warnings") or decision_guard.get("risk_guard_warnings") or [])
     stack_actionable, stack_missing = _stack_actionable(prediction)
     risk_score = _f(out.get("risk_score"), 100.0)
 
@@ -140,9 +144,10 @@ def _canonical_gate(scored: dict[str, Any], prediction: dict[str, Any]) -> dict[
     metrics["pre_move_chase_risk"] = chase_risk
     metrics["risk_guard_pass"] = risk_guard_pass
     metrics["risk_guard_blocks"] = risk_guard_blocks
+    metrics["risk_guard_warnings"] = risk_guard_warnings
     metrics["advanced_stack_actionable"] = stack_actionable
     metrics["advanced_stack_missing"] = stack_missing
-    metrics["ready_via"] = "ADVANCED_STACK" if advanced_ready and not legacy_ready else "LEGACY_TRIGGER" if legacy_ready else None
+    metrics["ready_via"] = "LEAN_TIMING_GATE" if advanced_ready and not legacy_ready else "LEGACY_TRIGGER" if legacy_ready else None
     out["metrics"] = metrics
     out["prediction"] = prediction
     return out
@@ -319,7 +324,7 @@ def _action_decision(*, canonical: dict[str, Any], prediction: dict[str, Any], t
 
     if execution_allowed:
         action = "ENTRAR_LONG" if direction == "LONG" else "ENTRAR_SHORT"
-        reason = "Stack avanzado en TRADE_NOW/YES, sin veto ni chase y precio dentro de la zona."
+        reason = "Timing real confirmado, sin veto duro ni chase y precio dentro de la zona."
     elif terminal or cooldown or hard_block:
         action = "NO_ENTRAR"
         reason = "Hay invalidación, veto o cooldown activo."
@@ -328,7 +333,7 @@ def _action_decision(*, canonical: dict[str, Any], prediction: dict[str, Any], t
         reason = "La oportunidad puede existir, pero el precio ya salió de la zona; no perseguir."
     else:
         action = "ESPERAR"
-        reason = "Todavía falta autorización completa o que el precio llegue a la zona."
+        reason = "Todavía falta timing real o que el precio llegue a la zona; advertencias blandas no bloquean por sí solas."
 
     return {
         "action": action,
