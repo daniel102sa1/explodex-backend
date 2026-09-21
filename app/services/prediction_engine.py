@@ -420,7 +420,7 @@ def build_pre_move_prediction(
     if pre_score < 55:
         phase = "SIN_SETUP"
     elif pre_score < 70:
-        phase = "PREACTIVACION" if compression_armed and pre_score >= 64 else "VIGILAR"
+        phase = "PREACTIVACION" if compression_armed and pre_score >= 60 else "VIGILAR"
     elif not trigger_hit:
         phase = "PREACTIVACION"
     elif chase_risk:
