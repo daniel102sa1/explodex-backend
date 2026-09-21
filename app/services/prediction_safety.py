@@ -114,9 +114,12 @@ def apply_prediction_safety(scored: dict[str, Any], prediction: dict[str, Any]) 
     rr1 = _f(target_info.get("tp1", {}).get("reward_risk"))
     rr2 = _f(target_info.get("tp2", {}).get("reward_risk"))
 
-    # Hard risk checks. These are deliberately conservative while the model is
-    # still being calibrated in PAPER.
+    # Split structural safety from opportunity-quality warnings.
+    # A merely distant TP1 or a wider structural stop can describe a valid
+    # swing/slow setup; they should not erase the signal. Extreme stop geometry
+    # remains a hard block, and the executor still sizes from the structural stop.
     stop_too_wide = stop_distance_atr > 2.4 or stop_distance_pct > max(2.5, atr_pct * 2.8)
+    stop_extreme = stop_distance_atr > 4.5 or stop_distance_pct > max(6.0, atr_pct * 5.5)
     rr_poor = rr1 < 1.15 or rr2 < 1.80
     entry_zone_too_wide = entry_zone_width_atr > 0.50
     mtf_against = mtf_votes == 0 and ema_known and not ema_aligned
@@ -136,12 +139,15 @@ def apply_prediction_safety(scored: dict[str, Any], prediction: dict[str, Any]) 
     )
 
     hard_blocks: list[str] = []
+    warnings: list[str] = []
     if stability in {"CONFLICTO", "INESTABLE"}:
         hard_blocks.append("direction_unstable")
+    if stop_extreme:
+        hard_blocks.append("stop_extreme")
+    elif stop_too_wide:
+        warnings.append("stop_wide_structural")
     if tp1_far:
-        hard_blocks.append("tp1_too_far")
-    if stop_too_wide:
-        hard_blocks.append("stop_too_wide")
+        warnings.append("tp1_far_requires_longer_horizon")
     if rr_poor:
         hard_blocks.append("reward_risk_poor")
     if entry_zone_too_wide:
@@ -151,14 +157,21 @@ def apply_prediction_safety(scored: dict[str, Any], prediction: dict[str, Any]) 
 
     human_blocks = {
         "direction_unstable": "dirección inestable; LONG y SHORT todavía no están suficientemente separados",
-        "tp1_too_far": "TP1 demasiado lejano para la volatilidad actual",
-        "stop_too_wide": "stop demasiado amplio respecto al ATR/precio actual",
+        "stop_extreme": "stop estructural extremo; la geometría no compensa el riesgo",
         "reward_risk_poor": "relación beneficio/riesgo insuficiente para TP1/TP2",
         "entry_zone_too_wide": "zona de entrada demasiado amplia respecto al ATR",
         "ema_mtf_conflict": "EMA y marcos 15m/1h no acompañan la dirección",
     }
+    human_warnings = {
+        "tp1_far_requires_longer_horizon": "TP1 lejano: tratar como horizonte mayor, no como descarte automático",
+        "stop_wide_structural": "stop estructural amplio: reducir tamaño; no borrar una estructura válida",
+    }
     for key in hard_blocks:
         marker = human_blocks[key]
+        if marker not in conflicts:
+            conflicts.append(marker)
+    for key in warnings:
+        marker = human_warnings[key]
         if marker not in conflicts:
             conflicts.append(marker)
 
@@ -181,6 +194,7 @@ def apply_prediction_safety(scored: dict[str, Any], prediction: dict[str, Any]) 
             "reward_risk_tp1": round(rr1, 2),
             "reward_risk_tp2": round(rr2, 2),
             "risk_guard_blocks": hard_blocks,
+            "risk_guard_warnings": warnings,
             "risk_guard_pass": not hard_blocks,
         }
     )
@@ -202,9 +216,10 @@ def apply_prediction_safety(scored: dict[str, Any], prediction: dict[str, Any]) 
         "reward_risk_tp2": round(rr2, 2),
         "risk_guard_pass": not hard_blocks,
         "risk_guard_blocks": hard_blocks,
+        "risk_guard_warnings": warnings,
         "suggested_max_leverage_10pct_margin_loss": round(leverage_for_10pct_stop_loss, 1),
         "suggested_max_leverage_5pct_margin_loss": round(leverage_for_5pct_stop_loss, 1),
-        "entry_rule": "Solo considerar entrada con dirección ESTABLE, fase ACTIVADO, sin chase, precio dentro de zona y Risk Guard aprobado.",
+        "entry_rule": "Solo considerar entrada con dirección estable, timing activado, sin chase, precio dentro de zona y sin bloqueos estructurales duros. TP lejano o stop amplio se tratan como horizonte/tamaño, no como veto automático.",
         "hold_rule": "Tras entrar, mantener mientras la estructura siga válida, no se rompa el stop y no aparezca conflicto fuerte; TP1 protege, TP2 es objetivo principal y el time-stop limita operaciones sin seguimiento.",
         "certainty_note": "Risk Guard reduce exposiciones malas; no convierte una señal en segura ni garantiza beneficio.",
     }

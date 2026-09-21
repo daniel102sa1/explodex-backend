@@ -24,6 +24,15 @@ DEFENSIVE_SWING_MAX_RISK_SCORE = 60.0
 DEFENSIVE_SWING_MIN_SCORE = 68.0
 DEFENSIVE_SWING_MIN_EDGE = 16.0
 
+# VNext probation exists only so a bad legacy cohort cannot permanently prevent
+# the new PAPER generation from collecting any real execution outcomes. It is
+# intentionally tiny, one-position-at-a-time, and 1x leverage.
+PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP = 0.10
+PROBATION_MAX_NEW_POSITIONS = 1
+PROBATION_MAX_RISK_SCORE = 48.0
+PROBATION_SWING_MIN_SCORE = 70.0
+PROBATION_SWING_MIN_EDGE = 18.0
+
 
 def _d(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
@@ -114,6 +123,24 @@ def _sarpon_leverage_policy(
     }
 
 
+def _probation_lane_check(*, lane_name: str, lane: dict[str, Any], row: dict[str, Any]) -> tuple[bool, str | None]:
+    """Very small PAPER-only validation lane used while legacy history is halted."""
+    risk_score = _f(row.get("risk_score"), 100.0)
+    if lane_name == "AGGRESSIVE_PAPER":
+        return False, "probation_aggressive_disabled"
+    if risk_score > PROBATION_MAX_RISK_SCORE:
+        return False, "probation_risk_above_48"
+    if lane_name == "TACTICAL":
+        return True, None
+    if lane_name == "SWING_PAPER":
+        if _f(lane.get("trajectory_score")) < PROBATION_SWING_MIN_SCORE:
+            return False, "probation_swing_score_below_70"
+        if _f(lane.get("direction_edge")) < PROBATION_SWING_MIN_EDGE:
+            return False, "probation_swing_edge_below_18"
+        return True, None
+    return False, "probation_unknown_lane"
+
+
 def _defensive_lane_check(*, lane_name: str, lane: dict[str, Any], row: dict[str, Any]) -> tuple[bool, str | None]:
     risk_score = _f(row.get("risk_score"), 100.0)
     if lane_name == "AGGRESSIVE_PAPER":
@@ -139,6 +166,7 @@ async def execute_unified_heart_contracts(
     defensive: bool = False,
     risk_multiplier: float = 1.0,
     btc_overlay: dict[str, Any] | None = None,
+    validation_probation: bool = False,
 ) -> dict[str, Any]:
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
@@ -146,6 +174,8 @@ async def execute_unified_heart_contracts(
     slots = max(0, base.MAX_OPEN_POSITIONS - open_count)
     if defensive:
         slots = min(slots, DEFENSIVE_MAX_NEW_POSITIONS)
+    if validation_probation:
+        slots = min(slots, PROBATION_MAX_NEW_POSITIONS)
     if slots <= 0:
         return {"version": VERSION, "opened": 0, "reason": "max_open_positions", "rejected": {}, "defensive": defensive, "defensive_learning_enabled": defensive}
 
@@ -188,7 +218,12 @@ async def execute_unified_heart_contracts(
         if not lane.get("eligible"):
             reject(f"{lane_name.lower()}_not_eligible")
             continue
-        if defensive:
+        if validation_probation:
+            allowed, probation_reason = _probation_lane_check(lane_name=lane_name, lane=lane, row=row)
+            if not allowed:
+                reject(probation_reason or "probation_rejected")
+                continue
+        elif defensive:
             allowed, defensive_reason = _defensive_lane_check(lane_name=lane_name, lane=lane, row=row)
             if not allowed:
                 reject(defensive_reason or "defensive_rejected")
@@ -264,10 +299,12 @@ async def execute_unified_heart_contracts(
             defensive=defensive,
             btc_overlay=btc_overlay,
         )
-        lane_leverage = int(leverage_policy["selected_leverage"])
+        lane_leverage = 1 if validation_probation else int(leverage_policy["selected_leverage"])
         sizing = base.size_position(balance, fill, hard_stop, lane_leverage)
         portfolio_multiplier = max(0.0, min(1.0, risk_multiplier))
-        if defensive:
+        if validation_probation:
+            portfolio_multiplier = min(portfolio_multiplier, PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP)
+        elif defensive:
             portfolio_multiplier = min(portfolio_multiplier, DEFENSIVE_RISK_CAP)
         scale = conviction_multiplier * portfolio_multiplier * btc_side_multiplier * quant_multiplier
         for key in ("quantity", "notional", "margin", "risk_usdt"):
@@ -326,8 +363,11 @@ async def execute_unified_heart_contracts(
             "horizon_policy_fixed_before_entry": True,
             "leverage_is_margin_tool_not_profit_target": True,
             "experimental": bool(lane.get("paper_only")),
-            "portfolio_mode": "DEFENSIVE_LEARNING" if defensive else "NORMAL",
+            "portfolio_mode": "VNEXT_PROBATION" if validation_probation else "DEFENSIVE_LEARNING" if defensive else "NORMAL",
             "defensive_learning": defensive,
+            "validation_probation": validation_probation,
+            "probation_risk_multiplier_cap": PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP if validation_probation else None,
+            "probation_forces_1x_leverage": validation_probation,
             "executor_cannot_change_direction": True,
             "executor_cannot_upgrade_wait": True,
         }
@@ -374,6 +414,7 @@ async def execute_unified_heart_contracts(
             "horizon": lane.get("horizon"),
             "trade_profile": lane.get("trade_profile") or lane_name,
             "defensive_learning": defensive,
+            "validation_probation": validation_probation,
             "conviction_score": conviction.get("conviction_score"),
             "conviction_tier": conviction.get("tier"),
             "conviction_risk_multiplier": conviction_multiplier,
@@ -389,9 +430,9 @@ async def execute_unified_heart_contracts(
 
     await db.commit()
     if opened_items:
-        reason = "opened_defensive_learning" if defensive else "opened_from_unified_heart"
+        reason = "opened_vnext_probation" if validation_probation else "opened_defensive_learning" if defensive else "opened_from_unified_heart"
     else:
-        reason = "no_defensive_learning_candidate" if defensive else "no_executable_heart_contract"
+        reason = "no_vnext_probation_candidate" if validation_probation else "no_defensive_learning_candidate" if defensive else "no_executable_heart_contract"
     return {
         "version": VERSION,
         "opened": len(opened_items),
@@ -402,12 +443,16 @@ async def execute_unified_heart_contracts(
         "rejected": rejected,
         "defensive": defensive,
         "defensive_learning_enabled": defensive,
+        "validation_probation": validation_probation,
         "risk_policy": {
             "base_account_risk_pct": 1.0,
             "min_conviction_multiplier": 0.25,
             "max_conviction_multiplier": 1.50,
             "max_target_account_risk_pct": 1.50,
             "defensive_cap_multiplier": DEFENSIVE_RISK_CAP,
+            "probation_cap_multiplier": PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP,
+            "probation_max_new_positions": PROBATION_MAX_NEW_POSITIONS,
+            "probation_forces_1x_leverage": True,
             "aggressive_max_multiplier": 0.50,
             "swing_max_multiplier": 1.25,
             "elliott_is_bounded_evidence": True,
