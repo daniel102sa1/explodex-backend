@@ -272,9 +272,15 @@ async def apply_trade_thesis(
 
     plan = _candidate_plan(score, prediction)
     direction_match = candidate_direction == str(score.get("direction") or "").upper()
+    compression = prediction.get("sarpon_compression") if isinstance(prediction.get("sarpon_compression"), dict) else {}
+    compression_armed = (
+        str(compression.get("stage") or "").upper() == "ARMED_EARLY"
+        and str(compression.get("direction") or "").upper() == candidate_direction
+    )
+    create_score_floor = 64.0 if compression_armed else MIN_CREATE_SCORE
     create_allowed = (
         direction_match
-        and candidate_score >= MIN_CREATE_SCORE
+        and candidate_score >= create_score_floor
         and risk_score <= MAX_CREATE_RISK
         and candidate_phase in {"PREACTIVACION", "VIGILAR_CONFIRMACION", "ACTIVADO", "ESPERAR_RETEST"}
         and _valid_plan(plan)
@@ -309,6 +315,11 @@ async def apply_trade_thesis(
         "atr_abs_at_creation": plan["atr_abs"],
         "score_direction_at_creation": score.get("direction"),
         "prediction_direction_at_creation": candidate_direction,
+        "sarpon_compression_stage": compression.get("stage"),
+        "sarpon_compression_direction": compression.get("direction"),
+        "sarpon_compression_score": compression.get("early_score"),
+        "sarpon_compression_priority": bool(compression_armed),
+        "create_score_floor": create_score_floor,
         "paper_only": True,
     }
     row = (await db.execute(text("""
