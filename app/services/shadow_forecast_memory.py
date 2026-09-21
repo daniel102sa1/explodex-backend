@@ -90,9 +90,11 @@ async def capture_shadow_forecasts_for_run(db: AsyncSession, run_id: str) -> dic
         breadth = _d(contract.get("market_breadth")) or _d(heart.get("market_breadth"))
         event = _d(contract.get("event_risk")) or _d(heart.get("event_risk"))
         formula_brain = _d(prediction.get("formula_brain"))
+        murphy_patterns = _d(prediction.get("murphy_patterns"))
         metadata = {
             "evaluation_generation": EVALUATION_GENERATION,
             "formula_brain": formula_brain,
+            "murphy_patterns": murphy_patterns,
             "heart_version": heart.get("version"),
             "matrix_consensus": matrix.get("consensus"),
             "horizon_conflict": matrix.get("horizon_conflict"),

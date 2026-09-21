@@ -9,6 +9,7 @@ from app.services.exchange_lead_lag import apply_exchange_lead_lag
 from app.services.forced_path_forecast import build_forced_path_forecast
 from app.services.formula_brain import build_formula_brain
 from app.services.liquidation_cascade import apply_liquidation_cascade
+from app.services.murphy_patterns import build_murphy_pattern_context
 from app.services.premove_fingerprint import build_premove_fingerprint
 from app.services.prediction_engine import build_pre_move_prediction as build_raw_pre_move_prediction
 from app.services.prediction_safety import apply_prediction_safety
@@ -60,6 +61,7 @@ def build_pre_move_prediction(
     result["path_forecast"] = build_forced_path_forecast(scored, snapshot, _path_forecast_input(result))
     result["premove_fingerprint"] = build_premove_fingerprint(scored, snapshot, result)
     result["prediction_stack_v5"] = build_prediction_stack_v5(scored, snapshot, result, coinglass)
+    result["murphy_patterns"] = build_murphy_pattern_context(scored, snapshot, result)
     result["sarpon_classic"] = build_sarpon_classic_context(scored, snapshot, result)
     result["formula_brain"] = build_formula_brain(scored, snapshot)
 
