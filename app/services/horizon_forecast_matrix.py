@@ -57,6 +57,7 @@ def build_horizon_forecast_matrix(
     htf = _d(heart.get("higher_timeframe_context"))
     frames = _d(htf.get("frames"))
     liquidity = _d(heart.get("liquidity_intelligence"))
+    macro = _d(heart.get("macro_cycle"))
 
     direction = str(heart.get("direction") or prediction.get("direction") or score.get("direction") or "").upper()
     sign_long = 1.0 if direction == "LONG" else 0.0
@@ -140,6 +141,30 @@ def build_horizon_forecast_matrix(
     horizons["6h"] = long_horizon("6h", "6h", 0.46, 24.0)
     horizons["24h"] = long_horizon("24h", "1d", 0.50, 26.0)
 
+    # Multi-day horizons are descriptive context for long bases/accumulations.
+    # They do not create a position lane by themselves.
+    macro_bias = str(macro.get("bias") or "NEUTRAL").upper()
+    macro_strength = _f(macro.get("confidence_score"), 50.0)
+    macro_available = bool(macro.get("available"))
+    macro_long = max(0.0, macro_strength - 50.0) if macro_bias == "LONG" else 0.0
+    macro_short = max(0.0, macro_strength - 50.0) if macro_bias == "SHORT" else 0.0
+    day_frame = _d(frames.get("1d"))
+    day_long, day_short = _trend_vote(str(day_frame.get("trend") or ""), 16.0)
+
+    base3_long = 20.0 + trajectory_long * 0.34 + day_long + macro_long * 0.70
+    base3_short = 20.0 + trajectory_short * 0.34 + day_short + macro_short * 0.70
+    base7_long = 18.0 + trajectory_long * 0.28 + day_long + macro_long * 0.95
+    base7_short = 18.0 + trajectory_short * 0.28 + day_short + macro_short * 0.95
+    if bool(macro.get("long_base_candidate")) and macro_bias == "LONG":
+        base3_long += 8.0
+        base7_long += 12.0
+    if str(macro.get("state") or "") == "DISTRIBUTION_LATE" and macro_bias == "SHORT":
+        base3_short += 8.0
+        base7_short += 12.0
+
+    horizons["3d"] = _entry("3d", base3_long, base3_short)
+    horizons["7d"] = _entry("7d", base7_long, base7_short)
+
     directional = [h for h in horizons.values() if h["direction"] in {"LONG", "SHORT"}]
     long_count = sum(1 for h in directional if h["direction"] == "LONG")
     short_count = sum(1 for h in directional if h["direction"] == "SHORT")
@@ -151,7 +176,7 @@ def build_horizon_forecast_matrix(
         consensus = "MIXED"
 
     short_term = horizons["15m"]["direction"]
-    long_term = horizons["24h"]["direction"]
+    long_term = horizons["7d"]["direction"] if macro_available else horizons["24h"]["direction"]
     horizon_conflict = short_term in {"LONG", "SHORT"} and long_term in {"LONG", "SHORT"} and short_term != long_term
 
     return {
@@ -161,5 +186,12 @@ def build_horizon_forecast_matrix(
         "horizon_conflict": horizon_conflict,
         "short_term_direction": short_term,
         "long_term_direction": long_term,
-        "use": "Context for the single canonical Heart. This matrix never authorizes a trade by itself.",
+        "macro_cycle": {
+            "available": macro_available,
+            "state": macro.get("state"),
+            "bias": macro_bias,
+            "confidence_score": macro.get("confidence_score"),
+            "long_base_candidate": bool(macro.get("long_base_candidate")),
+        },
+        "use": "Context for the single canonical Heart. 3d/7d are descriptive macro horizons and never authorize a trade by themselves.",
     }
