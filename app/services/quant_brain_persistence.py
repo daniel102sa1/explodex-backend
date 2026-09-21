@@ -151,19 +151,19 @@ async def persist_quant_brain_for_run(db: AsyncSession, run_id: str) -> dict[str
             decision["action"] = "NO_ENTRAR"
             decision["via"] = "QUANT_BRAIN_BLOCK"
             decision["reason"] = (
-                "El setup técnico estaba listo, pero la capa cuantitativa detectó conflicto/riesgo estadístico fuerte. "
+                "El setup técnico estaba listo, pero la capa cuantitativa detectó un bloqueo extremo observado. "
                 "No se abre una entrada nueva."
             )
             downgraded = True
         elif originally_entering and bool(quant.get("strong_conflict")):
-            decision["should_enter"] = False
-            decision["action"] = "ESPERAR"
-            decision["via"] = "QUANT_BRAIN_CONFLICT"
-            decision["reason"] = (
-                "La señal técnica existe, pero la evidencia cuantitativa no acompaña con suficiente consistencia. "
-                "Se espera confirmación; el Quant Brain no cambia de lado por sí solo."
+            # A non-extreme quantitative disagreement is not an independent hard
+            # veto: many quant inputs reuse the same price/flow information seen
+            # by the setup engines. Keep the entry decision and let the quant risk
+            # multiplier reduce size downstream.
+            decision["quant_soft_conflict"] = True
+            decision["quant_soft_conflict_note"] = (
+                "Conflicto cuantitativo no extremo: no borra el gatillo; reduce riesgo mediante el multiplicador cuantitativo."
             )
-            downgraded = True
 
         decision["quant_brain_stance"] = quant.get("stance")
         decision["quant_directional_edge"] = quant.get("directional_edge")
@@ -220,6 +220,7 @@ async def persist_quant_brain_for_run(db: AsyncSession, run_id: str) -> dict[str
         "can_flip_direction": False,
         "can_upgrade_wait_to_entry": False,
         "can_reduce_or_block": True,
+        "strong_conflict_is_soft_risk_only": True,
     }
 
 
