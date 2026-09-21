@@ -6,6 +6,7 @@ VERSION = "adaptive_profit_trail_v1"
 
 ATR_PERIOD = 14
 PIVOT_LOOKBACK = 24
+CHANDELIER_LOOKBACK = 22
 PIVOT_BUFFER_ATR = 0.25
 MIN_HEADROOM_ATR = 1.50
 ARM_MFE_R = 1.50
@@ -168,6 +169,9 @@ def build_adaptive_profit_trail(
         prior = _f(prior_mfe_price, observed_mfe)
         mfe_price = min(observed_mfe, prior) if prior > 0 else observed_mfe
 
+    trail_rows = rows[-min(CHANDELIER_LOOKBACK, len(rows)) :]
+    trail_high = max(_f(row[2]) for row in trail_rows)
+    trail_low = min(_f(row[3]) for row in trail_rows)
     atr = _atr(rows)
     mfe_r = _mfe_r(side=side, entry=entry, initial_stop=initial_stop, mfe_price=mfe_price)
     tp_progress = _tp_progress(side=side, entry=entry, tp1=tp1, mfe_price=mfe_price) if tp1 > 0 else 0.0
@@ -191,7 +195,7 @@ def build_adaptive_profit_trail(
     pivot = _recent_pivot(rows, side)
 
     if side == "LONG":
-        chandelier = mfe_price - atr_multiplier * atr
+        chandelier = trail_high - atr_multiplier * atr
         pivot_stop = (pivot - PIVOT_BUFFER_ATR * atr) if pivot else None
         structure_stop = min(chandelier, pivot_stop) if pivot_stop and pivot_stop > 0 else chandelier
         # Never crowd price closer than 1.5 ATR on the first structure trail.
@@ -203,7 +207,7 @@ def build_adaptive_profit_trail(
         epsilon = max(entry * 0.00005, atr * 0.02)
         candidate = min(candidate, last_close - epsilon)
     else:
-        chandelier = mfe_price + atr_multiplier * atr
+        chandelier = trail_low + atr_multiplier * atr
         pivot_stop = (pivot + PIVOT_BUFFER_ATR * atr) if pivot else None
         structure_stop = max(chandelier, pivot_stop) if pivot_stop and pivot_stop > 0 else chandelier
         headroom_cap = last_close + MIN_HEADROOM_ATR * atr
@@ -229,6 +233,8 @@ def build_adaptive_profit_trail(
         "atr": round(atr, 12),
         "atr_multiplier": atr_multiplier,
         "pivot": round(pivot, 12) if pivot else None,
+        "chandelier_lookback": CHANDELIER_LOOKBACK,
+        "chandelier_extreme": round(trail_high if side == "LONG" else trail_low, 12),
         "chandelier_stop": round(chandelier, 12),
         "pivot_stop": round(pivot_stop, 12) if pivot_stop else None,
         "minimum_profit_floor": round(r_floor, 12),
