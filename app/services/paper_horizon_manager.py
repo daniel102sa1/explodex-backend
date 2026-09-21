@@ -330,6 +330,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                 survival_enabled=survival_enabled,
             )
             if exit_price is not None:
+                adaptive_active = bool(adaptive_before.get("armed"))
                 if lock_stage == "PRE_TP1_PROTECTED" and exit_reason == "HARD_STOP":
                     exit_reason = "PRE_TP1_PROTECT_STOP"
                 elif lock_stage == "PRE_TP1_PROTECTED" and exit_reason == "AMBIGUOUS_HARD_STOP":
@@ -338,6 +339,10 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     exit_reason = "PROFIT_LOCK_STOP"
                 elif lock_stage != "INITIAL" and exit_reason == "AMBIGUOUS_HARD_STOP":
                     exit_reason = "AMBIGUOUS_PROFIT_LOCK_STOP"
+                elif adaptive_active and exit_reason == "HARD_STOP":
+                    exit_reason = "ADAPTIVE_TRAIL_STOP"
+                elif adaptive_active and exit_reason == "AMBIGUOUS_HARD_STOP":
+                    exit_reason = "AMBIGUOUS_ADAPTIVE_TRAIL_STOP"
                 break
 
             if not profit_lock_enabled:
@@ -372,6 +377,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                             "rule_active": "NEAR_TP1_REJECTION_PROTECT_RISK",
                             "pre_tp1_signal": pre_tp1,
                             "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
+                            "stop_active_after_candle_ms": int(candle[0]) if len(candle) else None,
                         })
                         continue
 
@@ -393,6 +399,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     "active_stop": hard_stop,
                     "rule_active": "TP2_REACHED_STOP_AT_TP1",
                     "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
+                    "stop_active_after_candle_ms": int(candle[0]) if len(candle) else None,
                 })
             elif (
                 lock_stage in {"INITIAL", "PRE_TP1_PROTECTED"}
@@ -414,6 +421,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     "active_stop": hard_stop,
                     "rule_active": "TP1_REACHED_BREAKEVEN_PLUS_COST_BUFFER",
                     "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
+                    "stop_active_after_candle_ms": int(candle[0]) if len(candle) else None,
                 })
 
         if profit_lock_enabled and lock_stage != str(_d(metadata.get("profit_lock")).get("stage") or "INITIAL"):
