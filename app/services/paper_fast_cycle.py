@@ -15,13 +15,24 @@ from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.paper_structure_retest_executor import execute_structure_retest_contracts
 from app.services.paper_trade_auditor import run_paper_trade_audits
 from app.services.paper_sizing_patch import install_corrected_paper_sizing
-from app.services.paper_unified_heart_executor import execute_unified_heart_contracts
+from app.services.paper_unified_heart_executor import (
+    PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP,
+    execute_unified_heart_contracts,
+)
 from app.services.validation_mode import ensure_validation_schema
 
 VERSION = "paper_fast_cycle_v12_chati_live_monitor"
 _LAST_FAST_CYCLE_RESULT: dict[str, Any] | None = None
 
 install_corrected_paper_sizing()
+
+
+def _probation_risk_multiplier(base_non_quant_multiplier: float) -> float:
+    """Tiny PAPER risk used only to validate VNext while legacy history is HALT."""
+    base = max(0.0, float(base_non_quant_multiplier or 0.0))
+    if base <= 0:
+        return 0.0
+    return min(PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP, base * 0.10)
 
 
 def latest_fast_cycle_result() -> dict[str, Any] | None:
@@ -100,7 +111,7 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         # new generation. One position max, 1x, no aggressive lane. This does not
         # reset or falsify the quant guard; the main portfolio remains HALT.
         validation_probation = base_risk_multiplier > 0
-        probation_risk_multiplier = min(0.10, max(0.0, base_risk_multiplier) * 0.10)
+        probation_risk_multiplier = _probation_risk_multiplier(base_risk_multiplier)
         if validation_probation and probation_risk_multiplier > 0:
             execution = await execute_unified_heart_contracts(
                 db,
