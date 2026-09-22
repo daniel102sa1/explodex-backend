@@ -29,6 +29,28 @@ def _is_candidate_ticker(t: dict[str, Any]) -> bool:
     return quote_volume >= settings.scanner_min_quote_volume_usdt
 
 
+
+def _merge_open_position_tickers(
+    selected: list[dict[str, Any]],
+    tickers: list[dict[str, Any]],
+    open_symbols: set[str],
+) -> list[dict[str, Any]]:
+    """Keep every open PAPER symbol in the deep scan without duplicating rows."""
+    merged = list(selected)
+    selected_symbols = {str(t.get("symbol") or "") for t in merged}
+    ticker_by_symbol = {
+        str(t.get("symbol") or ""): t
+        for t in tickers
+        if str(t.get("symbol") or "").endswith("USDT") and "_" not in str(t.get("symbol") or "")
+    }
+    for symbol in sorted(open_symbols):
+        ticker = ticker_by_symbol.get(symbol)
+        if ticker is not None and symbol not in selected_symbols:
+            merged.append(ticker)
+            selected_symbols.add(symbol)
+    return merged
+
+
 async def _ensure_symbol(db: AsyncSession, symbol: str) -> str:
     result = await db.execute(
         text("SELECT id::text FROM symbols WHERE symbol = :symbol"),
@@ -126,13 +148,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             )).all()
             if row and row[0]
         }
-        selected_symbols = {str(t.get("symbol") or "") for t in selected}
-        ticker_by_symbol = {str(t.get("symbol") or ""): t for t in universe}
-        for symbol in sorted(open_symbols):
-            ticker = ticker_by_symbol.get(symbol)
-            if ticker is not None and symbol not in selected_symbols:
-                selected.append(ticker)
-                selected_symbols.add(symbol)
+        selected = _merge_open_position_tickers(selected, tickers, open_symbols)
 
         scanner_progress.set_universe(
             len(universe),
