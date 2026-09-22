@@ -268,9 +268,63 @@ async def shadow_calibration_report(db: AsyncSession, horizon: str = "1h") -> di
     return {"version": VERSION, "horizon": horizon, "minimum_sample": MIN_SAMPLE, "rows": rows, "score_is_probability": False}
 
 
+def _select_risk_calibration(
+    direction: str,
+    report_1h: dict[str, Any],
+    report_15m: dict[str, Any],
+) -> dict[str, Any]:
+    """Prefer mature 1h history; use mature 15m only as a downside brake.
+
+    Short-horizon history is useful for detecting bad timing, but it is too
+    noisy to justify raising risk. Therefore a usable 15m fallback may only
+    preserve or reduce conviction/risk until 1h has enough observations.
+    """
+    direction = str(direction or "").upper()
+
+    def by_direction(report: dict[str, Any]) -> dict[str, Any]:
+        for row in list(report.get("rows") or []):
+            if str(row.get("direction") or "").upper() == direction:
+                return dict(row)
+        return {
+            "direction": direction,
+            "sample": 0,
+            "correct": 0,
+            "accuracy_pct": None,
+            "avg_directional_return_pct": None,
+            "status": "CALIBRATING",
+            "bounded_conviction_adjustment": 0.0,
+        }
+
+    one_hour = by_direction(report_1h)
+    fifteen = by_direction(report_15m)
+
+    if str(one_hour.get("status") or "") == "USABLE":
+        selected = dict(one_hour)
+        selected["source_horizon"] = "1h"
+        selected["short_horizon_can_only_reduce_risk"] = False
+        return selected
+
+    if str(fifteen.get("status") or "") == "USABLE":
+        selected = dict(fifteen)
+        selected["bounded_conviction_adjustment"] = min(
+            0.0,
+            _f(selected.get("bounded_conviction_adjustment")),
+        )
+        selected["source_horizon"] = "15m"
+        selected["short_horizon_can_only_reduce_risk"] = True
+        return selected
+
+    selected = dict(one_hour if int(_f(one_hour.get("sample"))) >= int(_f(fifteen.get("sample"))) else fifteen)
+    selected["status"] = "CALIBRATING"
+    selected["bounded_conviction_adjustment"] = 0.0
+    selected["source_horizon"] = "1h" if selected is not fifteen else "15m"
+    selected["short_horizon_can_only_reduce_risk"] = True
+    return selected
+
+
 async def persist_shadow_calibration_for_run(db: AsyncSession, run_id: str) -> dict[str, Any]:
-    report = await shadow_calibration_report(db, horizon="1h")
-    by_direction = {str(r.get("direction")): r for r in report.get("rows", [])}
+    report_1h = await shadow_calibration_report(db, horizon="1h")
+    report_15m = await shadow_calibration_report(db, horizon="15m")
     rows = (await db.execute(text("""
         SELECT s.id::text AS signal_id, s.direction, s.reason
         FROM signals s WHERE s.scanner_run_id=CAST(:run_id AS UUID)
@@ -281,18 +335,26 @@ async def persist_shadow_calibration_for_run(db: AsyncSession, run_id: str) -> d
         if not heart:
             continue
         contract = _d(heart.get("execution_contract")); direction = str(contract.get("primary_direction") or raw.get("direction") or "").upper()
-        calibration = by_direction.get(direction, {"direction": direction, "sample": 0, "status": "CALIBRATING", "bounded_conviction_adjustment": 0.0})
+        calibration = _select_risk_calibration(direction, report_1h, report_15m)
         contract["shadow_calibration"] = calibration; heart["shadow_calibration"] = calibration
         lanes = _d(contract.get("lanes"))
         for lane in lanes.values():
             if isinstance(lane, dict):
                 lane["shadow_calibration_status"] = calibration.get("status")
                 lane["shadow_calibration_sample"] = calibration.get("sample")
+                lane["shadow_calibration_horizon"] = calibration.get("source_horizon")
                 lane["shadow_conviction_adjustment"] = calibration.get("bounded_conviction_adjustment", 0.0)
+                lane["shadow_short_horizon_only_reduces_risk"] = calibration.get("short_horizon_can_only_reduce_risk")
         contract["lanes"] = lanes; heart["execution_contract"] = contract; reason["explodex_heart"] = heart
         if prediction:
             prediction["explodex_heart"] = heart; reason["prediction"] = prediction
         await db.execute(text("UPDATE signals SET reason=CAST(:reason AS JSONB), updated_at=NOW() WHERE id=CAST(:id AS UUID)"), {"id": raw["signal_id"], "reason": json.dumps(reason)})
         updated += 1
     await db.commit()
-    return {"version": VERSION, "updated": updated, "calibration": report}
+    return {
+        "version": VERSION,
+        "updated": updated,
+        "calibration_policy": "PREFER_1H_ELSE_15M_DOWNSIDE_ONLY",
+        "calibration_1h": report_1h,
+        "calibration_15m": report_15m,
+    }
