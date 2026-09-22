@@ -236,6 +236,31 @@ async def evaluate_shadow_forecasts(db: AsyncSession, limit: int = 80) -> dict[s
     return {"version": VERSION, "rows_checked": len(rows), "rows_updated": evaluated, "horizons_matured": matured, "queue_policy": "FAIR_PER_HORIZON"}
 
 
+def _bounded_calibration_adjustment(
+    *,
+    sample: int,
+    accuracy_pct: float | None,
+    avg_directional_return_pct: float,
+) -> float:
+    """Require hit-rate and average directional return to agree before adjusting.
+
+    A low binary hit rate can coexist with positive skew, while a high hit rate
+    can coexist with tiny/negative average returns. Risk calibration therefore
+    needs both signals to point the same way.
+    """
+    if sample < MIN_SAMPLE or accuracy_pct is None:
+        return 0.0
+    if accuracy_pct >= 62.0 and avg_directional_return_pct > 0.0:
+        return 5.0
+    if accuracy_pct >= 56.0 and avg_directional_return_pct > 0.0:
+        return 2.5
+    if accuracy_pct <= 38.0 and avg_directional_return_pct <= 0.0:
+        return -5.0
+    if accuracy_pct <= 44.0 and avg_directional_return_pct < 0.0:
+        return -2.5
+    return 0.0
+
+
 async def shadow_calibration_report(db: AsyncSession, horizon: str = "1h") -> dict[str, Any]:
     await ensure_shadow_schema(db)
     if horizon not in HORIZONS:
@@ -265,16 +290,16 @@ async def shadow_calibration_report(db: AsyncSession, horizon: str = "1h") -> di
     for raw in result.mappings().all():
         item = dict(raw); n = int(item.get("sample") or 0); wins = int(item.get("correct") or 0)
         rate = wins / n * 100.0 if n else None
-        adjustment = 0.0
-        if n >= MIN_SAMPLE and rate is not None:
-            if rate >= 62: adjustment = 5.0
-            elif rate >= 56: adjustment = 2.5
-            elif rate <= 38: adjustment = -5.0
-            elif rate <= 44: adjustment = -2.5
+        avg_directional_return = _f(item.get("avg_directional_return"))
+        adjustment = _bounded_calibration_adjustment(
+            sample=n,
+            accuracy_pct=rate,
+            avg_directional_return_pct=avg_directional_return,
+        )
         rows.append({
             "direction": item.get("direction"), "sample": n, "correct": wins,
             "accuracy_pct": round(rate, 2) if rate is not None else None,
-            "avg_directional_return_pct": round(_f(item.get("avg_directional_return")), 4),
+            "avg_directional_return_pct": round(avg_directional_return, 4),
             "status": "USABLE" if n >= MIN_SAMPLE else "CALIBRATING",
             "bounded_conviction_adjustment": adjustment,
         })
@@ -336,9 +361,48 @@ def _select_risk_calibration(
     return selected
 
 
+def _select_lane_risk_calibration(
+    lane_name: str,
+    direction: str,
+    report_15m: dict[str, Any],
+    report_1h: dict[str, Any],
+    report_4h: dict[str, Any],
+) -> dict[str, Any]:
+    lane_name = str(lane_name or "").upper()
+    direction = str(direction or "").upper()
+
+    def find(report: dict[str, Any]) -> dict[str, Any] | None:
+        for row in list(report.get("rows") or []):
+            if str(row.get("direction") or "").upper() == direction:
+                return dict(row)
+        return None
+
+    if lane_name == "SWING_PAPER":
+        four_hour = find(report_4h)
+        if four_hour and str(four_hour.get("status") or "") == "USABLE":
+            four_hour["source_horizon"] = "4h"
+            four_hour["short_horizon_can_only_reduce_risk"] = False
+            return four_hour
+        return _select_risk_calibration(direction, report_1h, report_15m)
+
+    if lane_name == "AGGRESSIVE_PAPER":
+        fifteen = find(report_15m)
+        if fifteen and str(fifteen.get("status") or "") == "USABLE":
+            fifteen["bounded_conviction_adjustment"] = min(
+                0.0,
+                _f(fifteen.get("bounded_conviction_adjustment")),
+            )
+            fifteen["source_horizon"] = "15m"
+            fifteen["short_horizon_can_only_reduce_risk"] = True
+            return fifteen
+
+    return _select_risk_calibration(direction, report_1h, report_15m)
+
+
 async def persist_shadow_calibration_for_run(db: AsyncSession, run_id: str) -> dict[str, Any]:
-    report_1h = await shadow_calibration_report(db, horizon="1h")
     report_15m = await shadow_calibration_report(db, horizon="15m")
+    report_1h = await shadow_calibration_report(db, horizon="1h")
+    report_4h = await shadow_calibration_report(db, horizon="4h")
     rows = (await db.execute(text("""
         SELECT s.id::text AS signal_id, s.direction, s.reason
         FROM signals s WHERE s.scanner_run_id=CAST(:run_id AS UUID)
@@ -352,13 +416,22 @@ async def persist_shadow_calibration_for_run(db: AsyncSession, run_id: str) -> d
         calibration = _select_risk_calibration(direction, report_1h, report_15m)
         contract["shadow_calibration"] = calibration; heart["shadow_calibration"] = calibration
         lanes = _d(contract.get("lanes"))
-        for lane in lanes.values():
+        for lane_key, lane in lanes.items():
             if isinstance(lane, dict):
-                lane["shadow_calibration_status"] = calibration.get("status")
-                lane["shadow_calibration_sample"] = calibration.get("sample")
-                lane["shadow_calibration_horizon"] = calibration.get("source_horizon")
-                lane["shadow_conviction_adjustment"] = calibration.get("bounded_conviction_adjustment", 0.0)
-                lane["shadow_short_horizon_only_reduces_risk"] = calibration.get("short_horizon_can_only_reduce_risk")
+                lane_name = str(lane.get("lane") or lane_key or "").upper()
+                lane_direction = str(lane.get("direction") or direction).upper()
+                lane_calibration = _select_lane_risk_calibration(
+                    lane_name,
+                    lane_direction,
+                    report_15m,
+                    report_1h,
+                    report_4h,
+                )
+                lane["shadow_calibration_status"] = lane_calibration.get("status")
+                lane["shadow_calibration_sample"] = lane_calibration.get("sample")
+                lane["shadow_calibration_horizon"] = lane_calibration.get("source_horizon")
+                lane["shadow_conviction_adjustment"] = lane_calibration.get("bounded_conviction_adjustment", 0.0)
+                lane["shadow_short_horizon_only_reduces_risk"] = lane_calibration.get("short_horizon_can_only_reduce_risk")
         contract["lanes"] = lanes; heart["execution_contract"] = contract; reason["explodex_heart"] = heart
         if prediction:
             prediction["explodex_heart"] = heart; reason["prediction"] = prediction
@@ -368,7 +441,8 @@ async def persist_shadow_calibration_for_run(db: AsyncSession, run_id: str) -> d
     return {
         "version": VERSION,
         "updated": updated,
-        "calibration_policy": "PREFER_1H_ELSE_15M_DOWNSIDE_ONLY",
-        "calibration_1h": report_1h,
+        "calibration_policy": "LANE_AWARE_15M_1H_4H",
         "calibration_15m": report_15m,
+        "calibration_1h": report_1h,
+        "calibration_4h": report_4h,
     }
