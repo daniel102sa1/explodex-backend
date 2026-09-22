@@ -131,6 +131,14 @@ async def capture_shadow_forecasts_for_run(db: AsyncSession, run_id: str) -> dic
     return {"version": VERSION, "seen": len(rows), "inserted": inserted, "captures_no_trade": True}
 
 
+def _due_horizons(age_min: float, outcomes: dict[str, Any]) -> list[str]:
+    return [
+        label
+        for label, mins in HORIZONS.items()
+        if age_min >= mins and not _d(outcomes.get(label)).get("mature")
+    ]
+
+
 def _interval_for_minutes(minutes: int) -> str:
     if minutes <= 60:
         return "5m"
@@ -167,8 +175,16 @@ async def evaluate_shadow_forecasts(db: AsyncSession, limit: int = 80) -> dict[s
     rows = [dict(r) for r in (await db.execute(text("""
         SELECT id::text, symbol, observed_at, entry_price, forecast, outcomes
         FROM heart_shadow_forecasts
-        WHERE observed_at <= NOW() - INTERVAL '15 minutes'
-          AND observed_at >= NOW() - INTERVAL '8 days'
+        WHERE observed_at >= NOW() - INTERVAL '8 days'
+          AND (
+            (observed_at <= NOW() - INTERVAL '15 minutes' AND NOT COALESCE((outcomes->'15m'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '1 hour' AND NOT COALESCE((outcomes->'1h'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '4 hours' AND NOT COALESCE((outcomes->'4h'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '6 hours' AND NOT COALESCE((outcomes->'6h'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '24 hours' AND NOT COALESCE((outcomes->'24h'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '3 days' AND NOT COALESCE((outcomes->'3d'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '7 days' AND NOT COALESCE((outcomes->'7d'->>'mature')::boolean,FALSE))
+          )
         ORDER BY observed_at ASC
         LIMIT :limit
     """), {"limit": limit})).mappings().all()]
@@ -178,7 +194,7 @@ async def evaluate_shadow_forecasts(db: AsyncSession, limit: int = 80) -> dict[s
     for row in rows:
         age_min = (now - row["observed_at"]).total_seconds() / 60.0
         forecast = _d(row.get("forecast")); outcomes = _d(row.get("outcomes")); changed = False
-        due = [label for label, mins in HORIZONS.items() if age_min >= mins and not _d(outcomes.get(label)).get("mature")]
+        due = _due_horizons(age_min, outcomes)
         if not due:
             continue
         max_minutes = max(HORIZONS[label] for label in due)
