@@ -3,7 +3,7 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
-VERSION = "technical_arsenal_shadow_v1"
+VERSION = "technical_arsenal_shadow_v2_heikin_renko_divergence"
 MIN_SHADOW_SAMPLE = 30
 
 
@@ -509,6 +509,257 @@ def _approx_volume_profile(rows: list[list[Any]], bins: int = 24) -> dict[str, A
     }
 
 
+
+def _rsi_series(closes: list[float], period: int = 14) -> list[float | None]:
+    if not closes:
+        return []
+    out: list[float | None] = [None] * len(closes)
+    if len(closes) < period + 1:
+        return out
+    gains: list[float] = []
+    losses: list[float] = []
+    for a, b in zip(closes, closes[1:]):
+        delta = b - a
+        gains.append(max(0.0, delta))
+        losses.append(max(0.0, -delta))
+    avg_gain = mean(gains[:period])
+    avg_loss = mean(losses[:period])
+    def rsi_value(g: float, l: float) -> float:
+        if l <= 1e-12:
+            return 100.0 if g > 0 else 50.0
+        rs = g / l
+        return 100.0 - 100.0 / (1.0 + rs)
+    out[period] = rsi_value(avg_gain, avg_loss)
+    for i in range(period, len(gains)):
+        avg_gain = ((period - 1.0) * avg_gain + gains[i]) / period
+        avg_loss = ((period - 1.0) * avg_loss + losses[i]) / period
+        out[i + 1] = rsi_value(avg_gain, avg_loss)
+    return out
+
+
+def _macd_line_series(closes: list[float]) -> list[float | None]:
+    if not closes:
+        return []
+    e12 = _ema(closes, 12)
+    e26 = _ema(closes, 26)
+    out: list[float | None] = []
+    for i in range(len(closes)):
+        if i < 25:
+            out.append(None)
+        else:
+            out.append(e12[i] - e26[i])
+    return out
+
+
+def _stochastic_k_series(rows: list[list[Any]], period: int = 14) -> list[float | None]:
+    out: list[float | None] = [None] * len(rows)
+    for i in range(period - 1, len(rows)):
+        window = rows[i - period + 1:i + 1]
+        high = max(_f(r[2]) for r in window)
+        low = min(_f(r[3]) for r in window)
+        close = _f(rows[i][4])
+        out[i] = (close - low) / (high - low) * 100.0 if high > low else 50.0
+    return out
+
+
+def _divergence_context(rows: list[list[Any]]) -> dict[str, Any]:
+    work = rows[-120:]
+    closes = [_f(r[4]) for r in work]
+    highs = [_f(r[2]) for r in work]
+    lows = [_f(r[3]) for r in work]
+    rsi = _rsi_series(closes)
+    macd = _macd_line_series(closes)
+    stoch = _stochastic_k_series(work)
+    piv_high = _pivot_points(highs, mode="high")
+    piv_low = _pivot_points(lows, mode="low")
+    findings: list[dict[str, Any]] = []
+
+    def compare(points: list[tuple[int, float]], series: list[float | None], name: str, kind: str) -> None:
+        if len(points) < 2:
+            return
+        (i1, p1), (i2, p2) = points[-2], points[-1]
+        if i1 >= len(series) or i2 >= len(series):
+            return
+        v1, v2 = series[i1], series[i2]
+        if v1 is None or v2 is None:
+            return
+        if kind == "HIGH" and p2 > p1 and float(v2) < float(v1):
+            findings.append({
+                "indicator": name,
+                "type": "BEARISH_DIVERGENCE",
+                "bias": "SHORT",
+                "price_first": round(p1, 12),
+                "price_second": round(p2, 12),
+                "indicator_first": round(float(v1), 6),
+                "indicator_second": round(float(v2), 6),
+            })
+        elif kind == "LOW" and p2 < p1 and float(v2) > float(v1):
+            findings.append({
+                "indicator": name,
+                "type": "BULLISH_DIVERGENCE",
+                "bias": "LONG",
+                "price_first": round(p1, 12),
+                "price_second": round(p2, 12),
+                "indicator_first": round(float(v1), 6),
+                "indicator_second": round(float(v2), 6),
+            })
+
+    for name, series in (("RSI", rsi), ("MACD", macd), ("STOCHASTIC", stoch)):
+        compare(piv_high, series, name, "HIGH")
+        compare(piv_low, series, name, "LOW")
+
+    long_count = sum(1 for x in findings if x["bias"] == "LONG")
+    short_count = sum(1 for x in findings if x["bias"] == "SHORT")
+    bias = "LONG" if long_count > short_count else "SHORT" if short_count > long_count else "NEUTRAL"
+    return {
+        "available": True,
+        "findings": findings[-6:],
+        "aggregate_bias": bias,
+        "long_count": long_count,
+        "short_count": short_count,
+        "note": "Classical price-vs-indicator divergence is treated as an early warning, not a standalone reversal trigger.",
+    }
+
+
+def _dynamic_support_resistance(rows: list[list[Any]], current: float, atr: float) -> dict[str, Any]:
+    closes = [_f(r[4]) for r in rows]
+    ema20 = _ema(closes, 20)[-1]
+    ema50 = _ema(closes, 50)[-1]
+    scale = max(atr, current * 0.001)
+    def relation(value: float) -> str:
+        if current > value:
+            return "PRICE_ABOVE"
+        if current < value:
+            return "PRICE_BELOW"
+        return "AT_LEVEL"
+    return {
+        "ema20": round(ema20, 12),
+        "ema50": round(ema50, 12),
+        "ema20_relation": relation(ema20),
+        "ema50_relation": relation(ema50),
+        "distance_to_ema20_atr": round(abs(current - ema20) / scale, 4),
+        "distance_to_ema50_atr": round(abs(current - ema50) / scale, 4),
+        "trend_bias": "LONG" if ema20 > ema50 and current > ema20 else "SHORT" if ema20 < ema50 and current < ema20 else "MIXED",
+        "near_dynamic_level": min(abs(current - ema20), abs(current - ema50)) <= scale * 0.35,
+    }
+
+
+def _heikin_ashi_context(rows: list[list[Any]]) -> dict[str, Any]:
+    work = rows[-80:]
+    if len(work) < 3:
+        return {"available": False}
+    ha: list[dict[str, float]] = []
+    prev_open = (_f(work[0][1]) + _f(work[0][4])) / 2.0
+    prev_close = (_f(work[0][1]) + _f(work[0][2]) + _f(work[0][3]) + _f(work[0][4])) / 4.0
+    for row in work:
+        o, h, l, c = _f(row[1]), _f(row[2]), _f(row[3]), _f(row[4])
+        close = (o + h + l + c) / 4.0
+        open_ = (prev_open + prev_close) / 2.0
+        high = max(h, open_, close)
+        low = min(l, open_, close)
+        body = abs(close - open_)
+        rng = max(high - low, 1e-12)
+        ha.append({"open": open_, "high": high, "low": low, "close": close, "body_ratio": body / rng})
+        prev_open, prev_close = open_, close
+
+    last = ha[-1]
+    direction = "LONG" if last["close"] > last["open"] else "SHORT" if last["close"] < last["open"] else "NEUTRAL"
+    run = 0
+    for row in reversed(ha):
+        row_dir = "LONG" if row["close"] > row["open"] else "SHORT" if row["close"] < row["open"] else "NEUTRAL"
+        if row_dir != direction:
+            break
+        run += 1
+    avg_body = mean(x["body_ratio"] for x in ha[-5:])
+    return {
+        "available": True,
+        "bias": direction,
+        "same_color_run": run,
+        "last_body_ratio": round(last["body_ratio"], 4),
+        "avg_body_ratio_5": round(avg_body, 4),
+        "trend_strength": "STRONG" if run >= 4 and avg_body >= 0.55 else "MODERATE" if run >= 2 else "WEAK",
+        "analysis_only_not_execution_price": True,
+    }
+
+
+def _renko_context(rows: list[list[Any]], brick_pct: float = 1.0) -> dict[str, Any]:
+    closes = [_f(r[4]) for r in rows[-180:] if _f(r[4]) > 0]
+    if len(closes) < 2:
+        return {"available": False}
+    brick_rate = max(0.001, brick_pct / 100.0)
+    anchor = closes[0]
+    bricks: list[str] = []
+    for close in closes[1:]:
+        while close >= anchor * (1.0 + brick_rate):
+            anchor *= 1.0 + brick_rate
+            bricks.append("UP")
+        while close <= anchor * (1.0 - brick_rate):
+            anchor *= 1.0 - brick_rate
+            bricks.append("DOWN")
+    if not bricks:
+        return {
+            "available": True,
+            "brick_pct": brick_pct,
+            "brick_count": 0,
+            "bias": "NEUTRAL",
+            "current_run": 0,
+            "approximation": True,
+        }
+    last_dir = bricks[-1]
+    run = 0
+    for direction in reversed(bricks):
+        if direction != last_dir:
+            break
+        run += 1
+    return {
+        "available": True,
+        "brick_pct": brick_pct,
+        "brick_count": len(bricks),
+        "bias": "LONG" if last_dir == "UP" else "SHORT",
+        "current_run": run,
+        "approximation": True,
+        "method": "CLOSE_BASED_PERCENT_RENKO_NOT_NATIVE_TICK_RENKO",
+        "analysis_only_not_execution_price": True,
+    }
+
+
+def _harmonic_source_constraints(rows: list[list[Any]]) -> dict[str, Any]:
+    highs = [_f(r[2]) for r in rows[-120:]]
+    lows = [_f(r[3]) for r in rows[-120:]]
+    pivots = sorted(
+        [{"i": i, "type": "H", "price": v} for i, v in _pivot_points(highs, mode="high")]
+        + [{"i": i, "type": "L", "price": v} for i, v in _pivot_points(lows, mode="low")],
+        key=lambda x: x["i"],
+    )
+    return {
+        "available": len(pivots) >= 5,
+        "recent_pivots": pivots[-7:],
+        "source_rules_captured": {
+            "named_patterns": ["BAT", "BUTTERFLY", "CRAB"],
+            "bat_xb_range_stated": [0.382, 0.5],
+            "ac_range_stated": [0.382, 0.886],
+        },
+        "confirmation_status": "INCOMPLETE_SOURCE_RULESET",
+        "can_confirm_harmonic_pattern": False,
+        "reason": "The shared transcript names additional point-ratio requirements but does not provide the full XA/AB/BC/CD/D completion ratios. ExplodeX will not invent them.",
+    }
+
+
+def _gann_source_context() -> dict[str, Any]:
+    return {
+        "available": False,
+        "research_only": True,
+        "reason": "A 45-degree Gann Fan depends on chart price/time scaling (bar ratio). Raw OHLC alone does not preserve the visual chart ratio described in the source.",
+        "can_create_entry": False,
+    }
+
+
+def _lunar_phase_policy() -> dict[str, Any]:
+    return {
+        "implemented_as_signal": False,
+        "reason": "The shared source presents lunar phases as an optional confirmation idea, but no market-tested rule or causal evidence was supplied. ExplodeX will not use it as trading evidence.",
+    }
+
 def technical_arsenal_registry() -> dict[str, Any]:
     return {
         "version": VERSION,
@@ -527,6 +778,10 @@ def technical_arsenal_registry() -> dict[str, Any]:
             "change_of_character",
             "approx_supply_demand_order_blocks",
             "fair_value_gaps",
+            "price_indicator_divergence_rsi_macd_stochastic",
+            "dynamic_support_resistance_ema20_ema50",
+            "heikin_ashi_trend_context",
+            "renko_1pct_close_based_approximation",
         ],
         "already_covered_elsewhere": [
             "macd",
@@ -538,7 +793,9 @@ def technical_arsenal_registry() -> dict[str, Any]:
             "reversal_chart_patterns",
             "elliott_wave_structure",
         ],
-        "mentioned_but_not_rule_defined_in_source": ["harmonic_patterns"],
+        "partially_defined_in_source": ["harmonic_patterns_bat_butterfly_crab"],
+        "not_directly_translated": ["gann_fan_chart_scale_dependent"],
+        "excluded_from_signal_logic": ["lunar_phases"],
         "policy": {
             "research_only": True,
             "can_create_entry": False,
@@ -578,6 +835,13 @@ def build_technical_arsenal_context(
     psar = _parabolic_sar(rows)
     supertrend = _supertrend(rows)
     volume_profile = _approx_volume_profile(rows)
+    divergence = _divergence_context(rows)
+    dynamic_sr = _dynamic_support_resistance(rows, current, atr)
+    heikin_ashi = _heikin_ashi_context(rows)
+    renko = _renko_context(rows, brick_pct=1.0)
+    harmonics = _harmonic_source_constraints(rows)
+    gann = _gann_source_context()
+    lunar = _lunar_phase_policy()
 
     long_points = 0.0
     short_points = 0.0
@@ -619,6 +883,23 @@ def build_technical_arsenal_context(
         long_points += 0.75
     elif supertrend.get("bias") == "SHORT":
         short_points += 0.75
+
+    if divergence.get("aggregate_bias") == "LONG":
+        long_points += 0.60; evidence.append("bullish_indicator_divergence")
+    elif divergence.get("aggregate_bias") == "SHORT":
+        short_points += 0.60; evidence.append("bearish_indicator_divergence")
+    if dynamic_sr.get("trend_bias") == "LONG":
+        long_points += 0.45
+    elif dynamic_sr.get("trend_bias") == "SHORT":
+        short_points += 0.45
+    if heikin_ashi.get("bias") == "LONG" and heikin_ashi.get("trend_strength") in {"MODERATE", "STRONG"}:
+        long_points += 0.55
+    elif heikin_ashi.get("bias") == "SHORT" and heikin_ashi.get("trend_strength") in {"MODERATE", "STRONG"}:
+        short_points += 0.55
+    if renko.get("bias") == "LONG" and int(renko.get("current_run") or 0) >= 2:
+        long_points += 0.45
+    elif renko.get("bias") == "SHORT" and int(renko.get("current_run") or 0) >= 2:
+        short_points += 0.45
 
     for gap in fvg.get("nearest_open_gaps") or []:
         if gap.get("distance_atr", 99) <= 0.50:
@@ -664,6 +945,13 @@ def build_technical_arsenal_context(
         "parabolic_sar": psar,
         "supertrend": supertrend,
         "volume_profile": volume_profile,
+        "divergence": divergence,
+        "dynamic_support_resistance": dynamic_sr,
+        "heikin_ashi": heikin_ashi,
+        "renko": renko,
+        "harmonics": harmonics,
+        "gann_fan": gann,
+        "lunar_phases": lunar,
         "registry": technical_arsenal_registry(),
         "policy": technical_arsenal_registry()["policy"],
         "note": (
