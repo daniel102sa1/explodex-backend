@@ -793,6 +793,7 @@ def technical_arsenal_registry() -> dict[str, Any]:
             "reversal_chart_patterns",
             "elliott_wave_structure",
         ],
+        "mentioned_but_not_rule_defined_in_source": ["harmonic_patterns"],
         "partially_defined_in_source": ["harmonic_patterns_bat_butterfly_crab"],
         "not_directly_translated": ["gann_fan_chart_scale_dependent"],
         "excluded_from_signal_logic": ["lunar_phases"],
