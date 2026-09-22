@@ -123,3 +123,11 @@ def test_aggressive_uses_15m_as_downside_only():
     selected = _select_lane_risk_calibration("AGGRESSIVE_PAPER", "SHORT", report_15m, {"rows": []}, {"rows": []})
     assert selected["source_horizon"] == "15m"
     assert selected["bounded_conviction_adjustment"] == 0.0
+
+
+
+def test_shadow_calibration_isolated_to_current_vnext_generation():
+    from app.services.shadow_forecast_memory import shadow_calibration_report
+    source = inspect.getsource(shadow_calibration_report)
+    assert "metadata->>'evaluation_generation'=:generation" in source
+    assert '"generation": EVALUATION_GENERATION' in source
