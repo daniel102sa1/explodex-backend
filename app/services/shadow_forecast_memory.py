@@ -167,8 +167,16 @@ async def evaluate_shadow_forecasts(db: AsyncSession, limit: int = 80) -> dict[s
     rows = [dict(r) for r in (await db.execute(text("""
         SELECT id::text, symbol, observed_at, entry_price, forecast, outcomes
         FROM heart_shadow_forecasts
-        WHERE observed_at <= NOW() - INTERVAL '15 minutes'
-          AND observed_at >= NOW() - INTERVAL '8 days'
+        WHERE observed_at >= NOW() - INTERVAL '8 days'
+          AND (
+            (observed_at <= NOW() - INTERVAL '15 minutes' AND NOT COALESCE((outcomes->'15m'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '1 hour' AND NOT COALESCE((outcomes->'1h'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '4 hours' AND NOT COALESCE((outcomes->'4h'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '6 hours' AND NOT COALESCE((outcomes->'6h'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '24 hours' AND NOT COALESCE((outcomes->'24h'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '3 days' AND NOT COALESCE((outcomes->'3d'->>'mature')::boolean,FALSE))
+            OR (observed_at <= NOW() - INTERVAL '7 days' AND NOT COALESCE((outcomes->'7d'->>'mature')::boolean,FALSE))
+          )
         ORDER BY observed_at ASC
         LIMIT :limit
     """), {"limit": limit})).mappings().all()]
