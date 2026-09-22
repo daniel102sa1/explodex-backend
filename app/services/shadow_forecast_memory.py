@@ -185,7 +185,12 @@ async def evaluate_shadow_forecasts(db: AsyncSession, limit: int = 80) -> dict[s
             OR (observed_at <= NOW() - INTERVAL '3 days' AND NOT COALESCE((outcomes->'3d'->>'mature')::boolean,FALSE))
             OR (observed_at <= NOW() - INTERVAL '7 days' AND NOT COALESCE((outcomes->'7d'->>'mature')::boolean,FALSE))
           )
-        ORDER BY observed_at ASC
+        -- Prefer the newest due forecasts first. Recent 5m/15m windows are
+        -- still available from the normal market-data cache/fallback, so they
+        -- can actually mature. An oldest-first queue can get permanently
+        -- clogged by stale short-horizon rows whose candle window is no longer
+        -- retrievable with the bounded recent-kline request.
+        ORDER BY observed_at DESC
         LIMIT :limit
     """), {"limit": limit})).mappings().all()]
     evaluated = 0
