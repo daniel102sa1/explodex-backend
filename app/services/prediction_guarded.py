@@ -16,6 +16,7 @@ from app.services.prediction_safety import apply_prediction_safety
 from app.services.prediction_stack_v5 import build_prediction_stack_v5
 from app.services.sequential_context import apply_sequential_context
 from app.services.sarpon_knowledge import build_sarpon_classic_context
+from app.services.technical_arsenal import build_technical_arsenal_context
 from app.services.verdict_entry_zone_guard import build_guarded_verdict_fusion
 
 
@@ -64,6 +65,7 @@ def build_pre_move_prediction(
     result["murphy_patterns"] = build_murphy_pattern_context(scored, snapshot, result)
     result["sarpon_classic"] = build_sarpon_classic_context(scored, snapshot, result)
     result["formula_brain"] = build_formula_brain(scored, snapshot)
+    result["technical_arsenal"] = build_technical_arsenal_context(scored, snapshot, result)
 
     symbol = str(snapshot.get("symbol") or scored.get("symbol") or "UNKNOWN")
     result["confidence_progression"] = observe_confidence_progression(symbol, result)
