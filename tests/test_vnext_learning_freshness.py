@@ -82,3 +82,11 @@ def test_shadow_calibration_groups_by_horizon_forecast_direction():
     from app.services.shadow_forecast_memory import shadow_calibration_report
     source = inspect.getsource(shadow_calibration_report)
     assert "forecast #>> ARRAY[:h,'direction']" in source
+
+
+
+def test_shadow_evaluator_allocates_fair_horizon_quota():
+    source = inspect.getsource(evaluate_shadow_forecasts)
+    assert "per_horizon" in source
+    assert "FAIR_PER_HORIZON" in source
+    assert "sorted(HORIZONS.items()" in source
