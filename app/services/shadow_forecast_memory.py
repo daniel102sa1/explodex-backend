@@ -276,7 +276,8 @@ async def shadow_calibration_report(db: AsyncSession, horizon: str = "1h") -> di
                COUNT(*) FILTER (WHERE (outcomes #>> ARRAY[:h,'correct'])::boolean IS TRUE) AS correct,
                AVG((outcomes #>> ARRAY[:h,'directional_return_pct'])::double precision) AS avg_directional_return
         FROM heart_shadow_forecasts
-        WHERE COALESCE(
+        WHERE metadata->>'evaluation_generation'=:generation
+          AND COALESCE(
                   NULLIF(UPPER(forecast #>> ARRAY[:h,'direction']), ''),
                   primary_direction
               ) IN ('LONG','SHORT')
@@ -285,7 +286,7 @@ async def shadow_calibration_report(db: AsyncSession, horizon: str = "1h") -> di
                      NULLIF(UPPER(forecast #>> ARRAY[:h,'direction']), ''),
                      primary_direction
                  )
-    """), {"h": horizon})
+    """), {"h": horizon, "generation": EVALUATION_GENERATION})
     rows = []
     for raw in result.mappings().all():
         item = dict(raw); n = int(item.get("sample") or 0); wins = int(item.get("correct") or 0)
