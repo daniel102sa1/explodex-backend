@@ -131,6 +131,14 @@ async def capture_shadow_forecasts_for_run(db: AsyncSession, run_id: str) -> dic
     return {"version": VERSION, "seen": len(rows), "inserted": inserted, "captures_no_trade": True}
 
 
+def _due_horizons(age_min: float, outcomes: dict[str, Any]) -> list[str]:
+    return [
+        label
+        for label, mins in HORIZONS.items()
+        if age_min >= mins and not _d(outcomes.get(label)).get("mature")
+    ]
+
+
 def _interval_for_minutes(minutes: int) -> str:
     if minutes <= 60:
         return "5m"
@@ -186,7 +194,7 @@ async def evaluate_shadow_forecasts(db: AsyncSession, limit: int = 80) -> dict[s
     for row in rows:
         age_min = (now - row["observed_at"]).total_seconds() / 60.0
         forecast = _d(row.get("forecast")); outcomes = _d(row.get("outcomes")); changed = False
-        due = [label for label, mins in HORIZONS.items() if age_min >= mins and not _d(outcomes.get(label)).get("mature")]
+        due = _due_horizons(age_min, outcomes)
         if not due:
             continue
         max_minutes = max(HORIZONS[label] for label in due)
