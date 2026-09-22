@@ -3,6 +3,7 @@ from app.services.paper_unified_heart_executor import (
     PROBATION_MAX_NEW_POSITIONS,
     PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP,
     _probation_lane_check,
+    _shadow_calibration_risk_multiplier,
 )
 
 
@@ -58,3 +59,31 @@ def test_probation_requires_stronger_swing_quality():
     )
     assert allowed is False
     assert reason == "probation_swing_score_below_70"
+
+
+
+def test_shadow_calibration_can_only_reduce_risk_during_probation():
+    lane = {
+        "shadow_calibration_status": "USABLE",
+        "shadow_conviction_adjustment": 5.0,
+        "shadow_short_horizon_only_reduces_risk": False,
+    }
+    assert _shadow_calibration_risk_multiplier(lane, validation_probation=True) == 1.0
+
+
+def test_bad_mature_shadow_calibration_reduces_position_size():
+    lane = {
+        "shadow_calibration_status": "USABLE",
+        "shadow_conviction_adjustment": -5.0,
+        "shadow_short_horizon_only_reduces_risk": False,
+    }
+    assert _shadow_calibration_risk_multiplier(lane, validation_probation=True) == 0.55
+    assert _shadow_calibration_risk_multiplier(lane, validation_probation=False) == 0.55
+
+
+def test_calibrating_shadow_data_cannot_change_risk():
+    lane = {
+        "shadow_calibration_status": "CALIBRATING",
+        "shadow_conviction_adjustment": -5.0,
+    }
+    assert _shadow_calibration_risk_multiplier(lane, validation_probation=False) == 1.0

@@ -123,6 +123,35 @@ def _sarpon_leverage_policy(
     }
 
 
+def _shadow_calibration_risk_multiplier(
+    lane: dict[str, Any],
+    *,
+    validation_probation: bool,
+) -> float:
+    """Turn mature shadow calibration into bounded sizing only.
+
+    Shadow learning never creates an entry, flips direction, or bypasses safety.
+    During probation it may only reduce risk; positive shadow evidence cannot
+    increase size until the real VNext execution cohort is mature.
+    """
+    status = str(lane.get("shadow_calibration_status") or "").upper()
+    if status != "USABLE":
+        return 1.0
+    adjustment = _f(lane.get("shadow_conviction_adjustment"))
+    downside_only = bool(lane.get("shadow_short_horizon_only_reduces_risk"))
+    if adjustment <= -5.0:
+        return 0.55
+    if adjustment <= -2.5:
+        return 0.75
+    if validation_probation or downside_only:
+        return 1.0
+    if adjustment >= 5.0:
+        return 1.10
+    if adjustment >= 2.5:
+        return 1.05
+    return 1.0
+
+
 def _probation_lane_check(*, lane_name: str, lane: dict[str, Any], row: dict[str, Any]) -> tuple[bool, str | None]:
     """Very small PAPER-only validation lane used while legacy history is halted."""
     risk_score = _f(row.get("risk_score"), 100.0)
@@ -308,7 +337,18 @@ async def execute_unified_heart_contracts(
             portfolio_multiplier = min(portfolio_multiplier, PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP)
         elif defensive:
             portfolio_multiplier = min(portfolio_multiplier, DEFENSIVE_RISK_CAP)
-        scale = conviction_multiplier * portfolio_multiplier * btc_side_multiplier * quant_multiplier * council_multiplier
+        shadow_risk_multiplier = _shadow_calibration_risk_multiplier(
+            lane,
+            validation_probation=validation_probation,
+        )
+        scale = (
+            conviction_multiplier
+            * portfolio_multiplier
+            * btc_side_multiplier
+            * quant_multiplier
+            * council_multiplier
+            * shadow_risk_multiplier
+        )
         for key in ("quantity", "notional", "margin", "risk_usdt"):
             sizing[key] = round(_f(sizing.get(key)) * scale, 10)
         if sizing["quantity"] <= 0 or sizing["margin"] <= 0:
@@ -341,6 +381,11 @@ async def execute_unified_heart_contracts(
             "quant_risk_multiplier": quant_multiplier,
             "evidence_council": council,
             "council_risk_multiplier": council_multiplier,
+            "shadow_calibration_status": lane.get("shadow_calibration_status"),
+            "shadow_calibration_sample": lane.get("shadow_calibration_sample"),
+            "shadow_calibration_horizon": lane.get("shadow_calibration_horizon"),
+            "shadow_conviction_adjustment": lane.get("shadow_conviction_adjustment"),
+            "shadow_risk_multiplier": shadow_risk_multiplier,
             "target_account_risk_pct_before_portfolio_brakes": conviction.get("target_account_risk_pct_before_portfolio_brakes"),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
             "stop_survival": survival,
@@ -428,6 +473,11 @@ async def execute_unified_heart_contracts(
             "btc_direction": (btc_overlay or {}).get("direction"),
             "quant_risk_multiplier": quant_multiplier,
             "council_risk_multiplier": council_multiplier,
+            "shadow_risk_multiplier": shadow_risk_multiplier,
+            "shadow_calibration_status": lane.get("shadow_calibration_status"),
+            "shadow_calibration_horizon": lane.get("shadow_calibration_horizon"),
+            "shadow_calibration_sample": lane.get("shadow_calibration_sample"),
+            "shadow_conviction_adjustment": lane.get("shadow_conviction_adjustment"),
             "council_support_count": council.get("independent_support_count"),
             "council_conflict_count": council.get("independent_conflict_count"),
             "quant_stance": quant.get("stance"),
@@ -468,5 +518,7 @@ async def execute_unified_heart_contracts(
             "btc_adaptive_risk": True,
             "quant_brain_risk": True,
             "independent_evidence_council_risk": True,
+            "shadow_calibration_adjusts_size_only": True,
+            "shadow_calibration_cannot_raise_probation_risk": True,
         },
     }
