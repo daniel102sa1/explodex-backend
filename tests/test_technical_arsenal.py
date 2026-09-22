@@ -78,3 +78,52 @@ def test_volume_profile_is_explicitly_approximate():
     assert profile["available"] is True
     assert profile["approximation"] is True
     assert "NOT_TICK_VOLUME_PROFILE" in profile["method"]
+
+
+
+def test_heikin_ashi_and_renko_are_analysis_only_contexts():
+    result = build_technical_arsenal_context(
+        {"metrics": {}},
+        {"klines": trending_rows()},
+        {},
+    )
+    assert result["heikin_ashi"]["available"] is True
+    assert result["heikin_ashi"]["analysis_only_not_execution_price"] is True
+    assert result["renko"]["available"] is True
+    assert result["renko"]["approximation"] is True
+    assert result["renko"]["analysis_only_not_execution_price"] is True
+
+
+def test_harmonics_remain_unconfirmed_until_full_source_ratios_arrive():
+    result = build_technical_arsenal_context(
+        {"metrics": {}},
+        {"klines": trending_rows()},
+        {},
+    )
+    harmonics = result["harmonics"]
+    assert harmonics["can_confirm_harmonic_pattern"] is False
+    assert harmonics["confirmation_status"] == "INCOMPLETE_SOURCE_RULESET"
+    assert harmonics["source_rules_captured"]["bat_xb_range_stated"] == [0.382, 0.5]
+    assert harmonics["source_rules_captured"]["ac_range_stated"] == [0.382, 0.886]
+
+
+def test_gann_and_lunar_are_not_promoted_to_signal_logic():
+    result = build_technical_arsenal_context(
+        {"metrics": {}},
+        {"klines": trending_rows()},
+        {},
+    )
+    assert result["gann_fan"]["available"] is False
+    assert result["gann_fan"]["can_create_entry"] is False
+    assert result["lunar_phases"]["implemented_as_signal"] is False
+
+
+def test_divergence_and_dynamic_levels_are_exposed():
+    result = build_technical_arsenal_context(
+        {"metrics": {}},
+        {"klines": trending_rows()},
+        {},
+    )
+    assert result["divergence"]["available"] is True
+    assert "ema20" in result["dynamic_support_resistance"]
+    assert "ema50" in result["dynamic_support_resistance"]
