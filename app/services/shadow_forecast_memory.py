@@ -172,27 +172,30 @@ def _label(direction: str, entry: float, final_price: float, max_high: float, mi
 
 async def evaluate_shadow_forecasts(db: AsyncSession, limit: int = 80) -> dict[str, Any]:
     await ensure_shadow_schema(db)
-    rows = [dict(r) for r in (await db.execute(text("""
-        SELECT id::text, symbol, observed_at, entry_price, forecast, outcomes
-        FROM heart_shadow_forecasts
-        WHERE observed_at >= NOW() - INTERVAL '8 days'
-          AND (
-            (observed_at <= NOW() - INTERVAL '15 minutes' AND NOT COALESCE((outcomes->'15m'->>'mature')::boolean,FALSE))
-            OR (observed_at <= NOW() - INTERVAL '1 hour' AND NOT COALESCE((outcomes->'1h'->>'mature')::boolean,FALSE))
-            OR (observed_at <= NOW() - INTERVAL '4 hours' AND NOT COALESCE((outcomes->'4h'->>'mature')::boolean,FALSE))
-            OR (observed_at <= NOW() - INTERVAL '6 hours' AND NOT COALESCE((outcomes->'6h'->>'mature')::boolean,FALSE))
-            OR (observed_at <= NOW() - INTERVAL '24 hours' AND NOT COALESCE((outcomes->'24h'->>'mature')::boolean,FALSE))
-            OR (observed_at <= NOW() - INTERVAL '3 days' AND NOT COALESCE((outcomes->'3d'->>'mature')::boolean,FALSE))
-            OR (observed_at <= NOW() - INTERVAL '7 days' AND NOT COALESCE((outcomes->'7d'->>'mature')::boolean,FALSE))
-          )
-        -- Prefer the newest due forecasts first. Recent 5m/15m windows are
-        -- still available from the normal market-data cache/fallback, so they
-        -- can actually mature. An oldest-first queue can get permanently
-        -- clogged by stale short-horizon rows whose candle window is no longer
-        -- retrievable with the bounded recent-kline request.
-        ORDER BY observed_at DESC
-        LIMIT :limit
-    """), {"limit": limit})).mappings().all()]
+    # Give every horizon a small quota. A single newest-first queue fixes the
+    # stale backlog problem but can starve 1h/4h/24h forever because every minute
+    # creates far more newly-due 15m rows than the batch limit. Per-horizon
+    # sampling lets short and long forecast memories mature together.
+    per_horizon = max(2, (max(1, limit) + len(HORIZONS) - 1) // len(HORIZONS))
+    selected_by_id: dict[str, dict[str, Any]] = {}
+    for horizon_label, horizon_minutes in sorted(HORIZONS.items(), key=lambda item: item[1], reverse=True):
+        horizon_rows = (await db.execute(text("""
+            SELECT id::text, symbol, observed_at, entry_price, forecast, outcomes
+            FROM heart_shadow_forecasts
+            WHERE observed_at >= NOW() - INTERVAL '8 days'
+              AND observed_at <= NOW() - (:minutes || ' minutes')::interval
+              AND NOT COALESCE((outcomes -> :h ->> 'mature')::boolean,FALSE)
+            ORDER BY observed_at DESC
+            LIMIT :per_horizon
+        """), {
+            "minutes": str(horizon_minutes),
+            "h": horizon_label,
+            "per_horizon": per_horizon,
+        })).mappings().all()
+        for raw in horizon_rows:
+            item = dict(raw)
+            selected_by_id.setdefault(str(item["id"]), item)
+    rows = list(selected_by_id.values())[: max(1, limit)]
     evaluated = 0
     matured = 0
     now = datetime.now(timezone.utc)
@@ -230,7 +233,7 @@ async def evaluate_shadow_forecasts(db: AsyncSession, limit: int = 80) -> dict[s
             })
             evaluated += 1
     await db.commit()
-    return {"version": VERSION, "rows_checked": len(rows), "rows_updated": evaluated, "horizons_matured": matured}
+    return {"version": VERSION, "rows_checked": len(rows), "rows_updated": evaluated, "horizons_matured": matured, "queue_policy": "FAIR_PER_HORIZON"}
 
 
 async def shadow_calibration_report(db: AsyncSession, horizon: str = "1h") -> dict[str, Any]:
