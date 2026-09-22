@@ -91,11 +91,13 @@ async def capture_shadow_forecasts_for_run(db: AsyncSession, run_id: str) -> dic
         event = _d(contract.get("event_risk")) or _d(heart.get("event_risk"))
         formula_brain = _d(prediction.get("formula_brain"))
         murphy_patterns = _d(prediction.get("murphy_patterns"))
+        technical_arsenal = _d(prediction.get("technical_arsenal"))
         macro_cycle = _d(heart.get("macro_cycle")) or _d(prediction.get("macro_cycle"))
         metadata = {
             "evaluation_generation": EVALUATION_GENERATION,
             "formula_brain": formula_brain,
             "murphy_patterns": murphy_patterns,
+            "technical_arsenal": technical_arsenal,
             "macro_cycle": macro_cycle,
             "heart_version": heart.get("version"),
             "matrix_consensus": matrix.get("consensus"),
