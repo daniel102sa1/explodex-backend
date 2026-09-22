@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 EVALUATION_GENERATION = "EXPLODEX_VNEXT_2026_09_20"
-VERSION = "explodex_vnext_evaluation_v1"
+VERSION = "explodex_vnext_evaluation_v2_normalized_risk"
 SHADOW_HORIZONS = ("15m", "1h", "4h", "6h", "24h", "3d", "7d")
 
 
@@ -15,6 +15,62 @@ def _f(value: Any, default: float = 0.0) -> float:
         return float(value) if value not in (None, "") else default
     except (TypeError, ValueError):
         return default
+
+
+def _normalized_risk_report(
+    rows: list[dict[str, Any]],
+    *,
+    starting_balance: float,
+) -> dict[str, Any]:
+    scenarios = {
+        "risk_0_25_pct": 0.0025,
+        "risk_0_50_pct": 0.0050,
+        "risk_1_00_pct": 0.0100,
+    }
+    totals = {key: 0.0 for key in scenarios}
+    usable = 0
+    details: list[dict[str, Any]] = []
+    for row in rows:
+        actual_risk = _f(row.get("risk_usdt"))
+        net_pnl = _f(row.get("net_pnl"))
+        if actual_risk <= 1e-12:
+            continue
+        usable += 1
+        item = {
+            "id": row.get("id"),
+            "symbol": row.get("symbol"),
+            "side": row.get("side"),
+            "actual_risk_usdt": round(actual_risk, 6),
+            "actual_net_pnl": round(net_pnl, 6),
+            "realized_r_multiple_net": round(net_pnl / actual_risk, 4),
+            "scenarios": {},
+        }
+        for key, pct in scenarios.items():
+            target_risk = max(0.0, starting_balance * pct)
+            scale = target_risk / actual_risk
+            normalized = net_pnl * scale
+            totals[key] += normalized
+            item["scenarios"][key] = {
+                "target_risk_usdt": round(target_risk, 6),
+                "normalized_net_pnl": round(normalized, 6),
+                "scale_vs_actual": round(scale, 4),
+            }
+        details.append(item)
+    return {
+        "method": "LINEAR_RESCALE_FROM_ACTUAL_NET_PNL_BY_STOP_RISK",
+        "paper_only": True,
+        "starting_balance": round(starting_balance, 6),
+        "usable_closed_trades": usable,
+        "scenarios": {
+            key: {
+                "risk_pct_of_starting_balance": pct * 100.0,
+                "aggregate_normalized_net_pnl": round(totals[key], 6),
+            }
+            for key, pct in scenarios.items()
+        },
+        "recent_trades": details[-20:],
+        "note": "Counterfactual evaluation only. It rescales actual PAPER net PnL by stop-risk budget; it does not change execution or assume extra directional edge.",
+    }
 
 
 async def vnext_evaluation_report(db: AsyncSession) -> dict[str, Any]:
@@ -59,6 +115,25 @@ async def vnext_evaluation_report(db: AsyncSession) -> dict[str, Any]:
         "status": "USABLE" if closed >= 30 else "CALIBRATING",
         "minimum_comparable_closed_trades": 30,
     }
+
+    account = dict((await db.execute(text("""
+        SELECT starting_balance FROM paper_accounts WHERE id=1
+    """))).mappings().first() or {})
+    starting_balance = _f(account.get("starting_balance"), 1000.0)
+    closed_rows = [
+        dict(row)
+        for row in (await db.execute(text("""
+            SELECT id, symbol, side, risk_usdt, net_pnl, closed_at
+            FROM paper_positions
+            WHERE status='CLOSED'
+              AND metadata->>'evaluation_generation'=:generation
+            ORDER BY closed_at ASC
+        """), {"generation": EVALUATION_GENERATION})).mappings().all()
+    ]
+    paper_report["normalized_risk"] = _normalized_risk_report(
+        closed_rows,
+        starting_balance=starting_balance,
+    )
 
     shadow_table_exists = bool((await db.execute(text("SELECT to_regclass('public.heart_shadow_forecasts')"))).scalar_one())
     shadow_total = 0
