@@ -115,6 +115,25 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 "No symbols passed the +/-6% early filter; using least-expanded liquid symbols as diagnostic fallback"
             )
 
+        # Open PAPER positions must keep receiving fresh market/flow snapshots even
+        # when they fall outside the current top intraday ranking. Otherwise the
+        # live position monitor can keep evaluating a trade with stale CHATI/OI/
+        # structure data for hours.
+        open_symbols = {
+            str(row[0])
+            for row in (await db.execute(
+                text("SELECT DISTINCT symbol FROM paper_positions WHERE status='OPEN'")
+            )).all()
+            if row and row[0]
+        }
+        selected_symbols = {str(t.get("symbol") or "") for t in selected}
+        ticker_by_symbol = {str(t.get("symbol") or ""): t for t in universe}
+        for symbol in sorted(open_symbols):
+            ticker = ticker_by_symbol.get(symbol)
+            if ticker is not None and symbol not in selected_symbols:
+                selected.append(ticker)
+                selected_symbols.add(symbol)
+
         scanner_progress.set_universe(
             len(universe),
             len(early),
