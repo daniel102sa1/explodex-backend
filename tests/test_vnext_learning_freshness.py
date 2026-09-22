@@ -1,7 +1,7 @@
 import inspect
 
 from app.services.scanner import _merge_open_position_tickers
-from app.services.shadow_forecast_memory import _due_horizons, _select_risk_calibration, evaluate_shadow_forecasts
+from app.services.shadow_forecast_memory import _bounded_calibration_adjustment, _due_horizons, _select_lane_risk_calibration, _select_risk_calibration, evaluate_shadow_forecasts
 
 
 def test_open_paper_symbols_are_forced_into_deep_scan():
@@ -90,3 +90,36 @@ def test_shadow_evaluator_allocates_fair_horizon_quota():
     assert "per_horizon" in source
     assert "FAIR_PER_HORIZON" in source
     assert "sorted(HORIZONS.items()" in source
+
+
+
+def test_calibration_does_not_punish_low_hit_rate_with_positive_average_return():
+    assert _bounded_calibration_adjustment(
+        sample=40,
+        accuracy_pct=25.0,
+        avg_directional_return_pct=0.35,
+    ) == 0.0
+
+
+def test_calibration_brakes_when_hit_rate_and_average_return_are_both_bad():
+    assert _bounded_calibration_adjustment(
+        sample=40,
+        accuracy_pct=31.0,
+        avg_directional_return_pct=-0.08,
+    ) == -5.0
+
+
+def test_swing_prefers_usable_four_hour_calibration():
+    report_15m = {"rows": [{"direction": "LONG", "sample": 100, "status": "USABLE", "bounded_conviction_adjustment": -5.0}]}
+    report_1h = {"rows": [{"direction": "LONG", "sample": 50, "status": "USABLE", "bounded_conviction_adjustment": -5.0}]}
+    report_4h = {"rows": [{"direction": "LONG", "sample": 36, "status": "USABLE", "bounded_conviction_adjustment": 0.0}]}
+    selected = _select_lane_risk_calibration("SWING_PAPER", "LONG", report_15m, report_1h, report_4h)
+    assert selected["source_horizon"] == "4h"
+    assert selected["sample"] == 36
+
+
+def test_aggressive_uses_15m_as_downside_only():
+    report_15m = {"rows": [{"direction": "SHORT", "sample": 90, "status": "USABLE", "bounded_conviction_adjustment": 5.0}]}
+    selected = _select_lane_risk_calibration("AGGRESSIVE_PAPER", "SHORT", report_15m, {"rows": []}, {"rows": []})
+    assert selected["source_horizon"] == "15m"
+    assert selected["bounded_conviction_adjustment"] == 0.0
