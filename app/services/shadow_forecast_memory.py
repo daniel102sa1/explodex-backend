@@ -239,14 +239,24 @@ async def shadow_calibration_report(db: AsyncSession, horizon: str = "1h") -> di
         horizon = "1h"
     path = f"$.{horizon}"
     result = await db.execute(text("""
-        SELECT primary_direction,
+        SELECT
+               COALESCE(
+                   NULLIF(UPPER(forecast #>> ARRAY[:h,'direction']), ''),
+                   primary_direction
+               ) AS direction,
                COUNT(*) FILTER (WHERE (outcomes #> ARRAY[:h]) ? 'correct') AS sample,
                COUNT(*) FILTER (WHERE (outcomes #>> ARRAY[:h,'correct'])::boolean IS TRUE) AS correct,
                AVG((outcomes #>> ARRAY[:h,'directional_return_pct'])::double precision) AS avg_directional_return
         FROM heart_shadow_forecasts
-        WHERE primary_direction IN ('LONG','SHORT')
+        WHERE COALESCE(
+                  NULLIF(UPPER(forecast #>> ARRAY[:h,'direction']), ''),
+                  primary_direction
+              ) IN ('LONG','SHORT')
           AND (outcomes #>> ARRAY[:h,'mature'])::boolean IS TRUE
-        GROUP BY primary_direction
+        GROUP BY COALESCE(
+                     NULLIF(UPPER(forecast #>> ARRAY[:h,'direction']), ''),
+                     primary_direction
+                 )
     """), {"h": horizon})
     rows = []
     for raw in result.mappings().all():
@@ -259,7 +269,7 @@ async def shadow_calibration_report(db: AsyncSession, horizon: str = "1h") -> di
             elif rate <= 38: adjustment = -5.0
             elif rate <= 44: adjustment = -2.5
         rows.append({
-            "direction": item.get("primary_direction"), "sample": n, "correct": wins,
+            "direction": item.get("direction"), "sample": n, "correct": wins,
             "accuracy_pct": round(rate, 2) if rate is not None else None,
             "avg_directional_return_pct": round(_f(item.get("avg_directional_return")), 4),
             "status": "USABLE" if n >= MIN_SAMPLE else "CALIBRATING",
@@ -314,11 +324,12 @@ def _select_risk_calibration(
         selected["short_horizon_can_only_reduce_risk"] = True
         return selected
 
-    selected = dict(one_hour if int(_f(one_hour.get("sample"))) >= int(_f(fifteen.get("sample"))) else fifteen)
+    use_one_hour = int(_f(one_hour.get("sample"))) >= int(_f(fifteen.get("sample")))
+    selected = dict(one_hour if use_one_hour else fifteen)
     selected["status"] = "CALIBRATING"
     selected["bounded_conviction_adjustment"] = 0.0
-    selected["source_horizon"] = "1h" if selected is not fifteen else "15m"
-    selected["short_horizon_can_only_reduce_risk"] = True
+    selected["source_horizon"] = "1h" if use_one_hour else "15m"
+    selected["short_horizon_can_only_reduce_risk"] = not use_one_hour
     return selected
 
 
