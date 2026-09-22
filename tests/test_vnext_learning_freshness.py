@@ -67,3 +67,18 @@ def test_usable_15m_fallback_preserves_negative_brake():
     selected = _select_risk_calibration("SHORT", one_hour, fifteen)
     assert selected["source_horizon"] == "15m"
     assert selected["bounded_conviction_adjustment"] == -5.0
+
+
+
+def test_calibrating_fallback_reports_actual_selected_horizon():
+    one_hour = {"rows": [{"direction": "LONG", "sample": 2, "status": "CALIBRATING", "bounded_conviction_adjustment": 0.0}]}
+    fifteen = {"rows": [{"direction": "LONG", "sample": 20, "status": "CALIBRATING", "bounded_conviction_adjustment": 0.0}]}
+    selected = _select_risk_calibration("LONG", one_hour, fifteen)
+    assert selected["source_horizon"] == "15m"
+    assert selected["short_horizon_can_only_reduce_risk"] is True
+
+
+def test_shadow_calibration_groups_by_horizon_forecast_direction():
+    from app.services.shadow_forecast_memory import shadow_calibration_report
+    source = inspect.getsource(shadow_calibration_report)
+    assert "forecast #>> ARRAY[:h,'direction']" in source
