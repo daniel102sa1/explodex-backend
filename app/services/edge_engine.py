@@ -272,7 +272,11 @@ async def label_due_observations(db: AsyncSession, limit: int = 40) -> dict[str,
             FROM edge_observations eo
             JOIN symbols sy ON sy.id = eo.symbol_id
             WHERE eo.status = 'PENDING' AND eo.due_at <= NOW()
-            ORDER BY eo.due_at ASC
+            -- Recent due observations still have their forward candle window
+            -- inside the bounded market-data request. Oldest-first can clog the
+            -- queue forever with rows whose 1m future window is no longer
+            -- retrievable, yielding repeated "no future candles" and zero labels.
+            ORDER BY eo.due_at DESC
             LIMIT :limit
             """
         ),
