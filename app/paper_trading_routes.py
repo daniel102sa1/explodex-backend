@@ -172,6 +172,18 @@ async def run_trade_audit(db: AsyncSession = Depends(get_db)):
     }
 
 
+@router.get("/equity-curve")
+async def equity_curve(limit: int = Query(default=500, ge=1, le=5000), db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return await paper_equity_curve(db, limit=limit)
+
+
+@router.get("/signal-history")
+async def signal_history(limit: int = Query(default=200, ge=1, le=1000), db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return {"version": "paper_signal_history_v1", "paper_only": True, "rows": await paper_signal_history(db, limit=limit)}
+
+
 @router.get("/history")
 async def history(limit: int = Query(default=100, ge=1, le=500), db: AsyncSession = Depends(get_db)):
     await _ensure_paper_dependencies(db)
