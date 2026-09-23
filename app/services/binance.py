@@ -574,7 +574,7 @@ class BinancePublicClient:
         symbol = symbol.upper()
 
         klines, oi, oi_hist, taker, premium, long_short = await asyncio.gather(
-            self.klines(symbol, "5m", 120),
+            self.klines(symbol, "5m", 240),
             self.open_interest(symbol),
             self.open_interest_history(symbol, "5m", 12),
             self.taker_ratio(symbol, "5m", 8),

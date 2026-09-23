@@ -719,6 +719,9 @@ def _approx_volume_profile(rows: list[list[Any]], bins: int = 24) -> dict[str, A
         acc += vols[idx]
         if acc / total >= 0.70:
             break
+    positive = [i for i, volume in enumerate(vols) if volume > 0]
+    hvn_idx = sorted(positive, key=lambda i: vols[i], reverse=True)[:3]
+    lvn_idx = sorted(positive, key=lambda i: vols[i])[:3]
     return {
         "available": True,
         "approximation": True,
@@ -726,6 +729,14 @@ def _approx_volume_profile(rows: list[list[Any]], bins: int = 24) -> dict[str, A
         "poc": round(centers[poc_idx], 12),
         "value_area_low": round(min(centers[i] for i in va_indices), 12),
         "value_area_high": round(max(centers[i] for i in va_indices), 12),
+        "high_volume_nodes": [
+            {"price": round(centers[i], 12), "volume_share_pct": round(vols[i] / total * 100.0, 4)}
+            for i in hvn_idx
+        ],
+        "low_volume_nodes": [
+            {"price": round(centers[i], 12), "volume_share_pct": round(vols[i] / total * 100.0, 4)}
+            for i in lvn_idx
+        ],
         "bins": bins,
     }
 
@@ -995,7 +1006,7 @@ def technical_arsenal_registry() -> dict[str, Any]:
             "stochastic",
             "parabolic_sar",
             "supertrend",
-            "approx_volume_profile",
+            "approx_volume_profile_poc_value_area_hvn_lvn",
             "fibonacci_retracements",
             "market_structure_hh_hl_lh_ll",
             "break_of_structure",
@@ -1011,7 +1022,7 @@ def technical_arsenal_registry() -> dict[str, Any]:
             "macd",
             "moving_averages",
             "rsi",
-            "vwap",
+            "professional_confluence_vwap_rvol_cvd_adx_mfi_stochrsi_bollinger_basis",
             "volume",
             "breakout_chart_patterns",
             "reversal_chart_patterns",
