@@ -16,7 +16,8 @@ def test_choose_leverage_scales_with_quality():
 
 def test_position_sizing_caps_margin():
     sized = size_position(1000.0, 100.0, 99.0, 4)
-    assert sized["risk_usdt"] == 10.0
+    assert sized["target_risk_usdt"] == 30.0
+    assert sized["risk_usdt"] == 12.0
     assert sized["margin"] <= 300.0
     assert sized["notional"] <= 1200.0
 
