@@ -17,6 +17,7 @@ from app.services.prediction_engine import build_pre_move_prediction
 from app.services.scanner_progress import scanner_progress
 from app.services.scoring import build_btc_context, score_snapshot
 from app.services.signal_alerts import create_signal_alert
+from app.services.wide_market_radar import score_radar_candidate
 
 
 def _is_candidate_ticker(t: dict[str, Any]) -> bool:
@@ -122,20 +123,68 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 f"Provider returned {len(tickers)} tickers but none passed liquidity/filter rules"
             )
 
-        early = [
-            t
-            for t in universe
-            if abs(float(t.get("priceChangePercent", 0) or 0)) <= 6.0
-        ]
-        selected = early[: max(1, min(deep_limit, 40))]
+        # Wide radar: cheaply inspect the full liquid universe with only 5m OHLCV
+        # before spending the expensive deep snapshot budget. This mirrors how
+        # professional scanners screen many symbols and then deeply inspect a few.
+        radar_sem = asyncio.Semaphore(max(2, binance_client.recommended_concurrency()))
+
+        async def radar_one(ticker: dict[str, Any]):
+            symbol = str(ticker.get("symbol") or "")
+            try:
+                async with radar_sem:
+                    rows = await binance_client.klines(symbol, "5m", 36)
+                return ticker, score_radar_candidate(ticker, rows)
+            except Exception as exc:
+                return ticker, {
+                    "version": "wide_market_radar_v1",
+                    "symbol": symbol,
+                    "available": False,
+                    "priority_score": 0.0,
+                    "bias": "NEUTRAL",
+                    "state": "ERROR",
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                    "can_create_entry": False,
+                    "score_is_probability": False,
+                }
+
+        radar_results = await asyncio.gather(*(radar_one(t) for t in universe))
+        radar_by_symbol = {
+            str(t.get("symbol") or ""): radar
+            for t, radar in radar_results
+        }
+        ranked_radar = sorted(
+            radar_results,
+            key=lambda item: (
+                float((item[1] or {}).get("priority_score", 0) or 0),
+                float(item[0].get("quoteVolume", 0) or 0),
+            ),
+            reverse=True,
+        )
+
+        max_deep = max(1, min(deep_limit, 40))
+        # Keep a few major-liquidity anchors, but let the wide radar choose most
+        # deep-scan slots so a lower-ranked liquid coin with early RVOL/OI-style
+        # preparation is not ignored merely because BTC/ETH dominate 24h volume.
+        anchor_count = min(4, max(1, max_deep // 5))
+        anchor_symbols = {str(t.get("symbol") or "") for t in universe[:anchor_count]}
+        selected: list[dict[str, Any]] = list(universe[:anchor_count])
+        selected_symbols = set(anchor_symbols)
+        for ticker, radar in ranked_radar:
+            symbol = str(ticker.get("symbol") or "")
+            if symbol in selected_symbols:
+                continue
+            if len(selected) >= max_deep:
+                break
+            selected.append(ticker)
+            selected_symbols.add(symbol)
+
+        radar_watch_count = sum(
+            1 for _ticker, radar in radar_results
+            if str((radar or {}).get("state") or "") in {"WATCH", "ARMED", "HOT"}
+        )
         if not selected:
-            selected = sorted(
-                universe,
-                key=lambda t: abs(float(t.get("priceChangePercent", 0) or 0)),
-            )[: max(1, min(deep_limit, 40))]
-            startup_errors.append(
-                "No symbols passed the +/-6% early filter; using least-expanded liquid symbols as diagnostic fallback"
-            )
+            selected = universe[:max_deep]
+            startup_errors.append("Wide radar returned no selectable symbols; using liquid-universe fallback")
 
         # Open PAPER positions must keep receiving fresh market/flow snapshots even
         # when they fall outside the current top intraday ranking. Otherwise the
@@ -152,7 +201,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
 
         scanner_progress.set_universe(
             len(universe),
-            len(early),
+            radar_watch_count,
             len(selected),
             data_source=binance_client.active_source,
         )
@@ -168,6 +217,10 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
                 async with semaphore:
                     snapshot = await binance_client.deep_snapshot(symbol)
                     score = score_snapshot(snapshot, btc_context=btc_context)
+                    score = dict(score)
+                    metrics = dict(score.get("metrics") or {})
+                    metrics["wide_radar"] = radar_by_symbol.get(symbol)
+                    score["metrics"] = metrics
                 return ticker, snapshot, score
             except Exception as exc:
                 scanner_progress.symbol_finished(symbol, error=str(exc)[:500])
@@ -508,6 +561,19 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             "market_data_source": binance_client.active_source,
             "coinglass": coinglass_client.status(),
             "coinglass_enriched": coinglass_enriched,
+            "wide_radar": {
+                "version": "wide_market_radar_v1",
+                "universe_screened": len(radar_results),
+                "watch_or_better": radar_watch_count,
+                "deep_slots": len(selected),
+                "top": [
+                    {
+                        "symbol": str(t.get("symbol") or ""),
+                        **dict(radar or {}),
+                    }
+                    for t, radar in ranked_radar[:12]
+                ],
+            },
             "symbols_scanned": len(selected),
             "successful_analyses": len(ranked),
             "candidates_found": len(candidates),
