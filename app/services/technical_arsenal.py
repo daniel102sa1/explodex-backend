@@ -3,7 +3,7 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
-VERSION = "technical_arsenal_shadow_v2_heikin_renko_divergence"
+VERSION = "technical_arsenal_shadow_v3_strat_amd_market_story"
 MIN_SHADOW_SAMPLE = 30
 
 
@@ -150,6 +150,227 @@ def _candlestick_context(rows: list[list[Any]], atr: float) -> dict[str, Any]:
         "current_body_ratio": round(cur["body_ratio"], 4),
         "current_upper_wick_atr": round(cur["upper_wick"] / scale, 4),
         "current_lower_wick_atr": round(cur["lower_wick"] / scale, 4),
+    }
+
+
+def _strat_bar(prev: list[Any], cur: list[Any]) -> dict[str, Any]:
+    """Classify one candle with the 1/2/3 price-action taxonomy.
+
+    1 = inside candle, 2 = directional break of one side, 3 = outside candle.
+    The directional suffix for a 2 candle is derived from the side that broke.
+    """
+    ph, pl = _f(prev[2]), _f(prev[3])
+    ch, cl = _f(cur[2]), _f(cur[3])
+    co, cc = _f(cur[1]), _f(cur[4])
+
+    if ch <= ph and cl >= pl:
+        kind, direction = "1", "INSIDE"
+    elif ch > ph and cl < pl:
+        kind, direction = "3", "OUTSIDE"
+    elif ch > ph:
+        kind, direction = "2", "UP"
+    elif cl < pl:
+        kind, direction = "2", "DOWN"
+    else:
+        kind, direction = "1", "INSIDE"
+
+    token = kind
+    if kind == "2":
+        token = "2U" if direction == "UP" else "2D"
+    return {
+        "type": kind,
+        "direction": direction,
+        "token": token,
+        "bullish_close": cc > co,
+        "bearish_close": cc < co,
+    }
+
+
+def _strat_context(rows: list[list[Any]]) -> dict[str, Any]:
+    """Detect the strategic 1/2/3 candle combinations shared by the user.
+
+    This is a transparent price-action heuristic, not a probability model and
+    not a standalone entry trigger.
+    """
+    work = rows[-12:]
+    if len(work) < 4:
+        return {"available": False}
+
+    bars = [_strat_bar(work[i - 1], work[i]) for i in range(1, len(work))]
+    tokens = [str(x["token"]) for x in bars]
+    patterns: list[dict[str, Any]] = []
+
+    def add(name: str, bias: str, family: str, strength: float) -> None:
+        patterns.append({
+            "name": name,
+            "bias": bias,
+            "family": family,
+            "strength": strength,
+            "score_is_probability": False,
+        })
+
+    last3 = tokens[-3:] if len(tokens) >= 3 else []
+    last2 = tokens[-2:] if len(tokens) >= 2 else []
+    last4 = tokens[-4:] if len(tokens) >= 4 else []
+
+    mapping3 = {
+        ("2U", "1", "2U"): ("2-1-2_CONTINUATION_BULLISH", "LONG", "2-1-2", 74.0),
+        ("2D", "1", "2U"): ("2-1-2_REVERSAL_BULLISH", "LONG", "2-1-2", 76.0),
+        ("3", "1", "2U"): ("3-1-2_REVERSAL_BULLISH", "LONG", "3-1-2", 72.0),
+        ("2D", "1", "2D"): ("2-1-2_CONTINUATION_BEARISH", "SHORT", "2-1-2", 74.0),
+        ("2U", "1", "2D"): ("2-1-2_REVERSAL_BEARISH", "SHORT", "2-1-2", 76.0),
+        ("3", "1", "2D"): ("3-1-2_REVERSAL_BEARISH", "SHORT", "3-1-2", 72.0),
+        ("1", "2D", "2U"): ("1-2-2_RETURN_BULLISH", "LONG", "1-2-2", 70.0),
+        ("1", "2U", "2D"): ("1-2-2_RETURN_BEARISH", "SHORT", "1-2-2", 70.0),
+        ("3", "2D", "2U"): ("3-2-2_REVERSAL_BULLISH", "LONG", "3-2-2", 70.0),
+        ("3", "2U", "2D"): ("3-2-2_REVERSAL_BEARISH", "SHORT", "3-2-2", 70.0),
+    }
+    if tuple(last3) in mapping3:
+        add(*mapping3[tuple(last3)])
+
+    mapping2 = {
+        ("2U", "2U"): ("2-2_CONTINUATION_BULLISH", "LONG", "2-2", 68.0),
+        ("2D", "2U"): ("2-2_REVERSAL_BULLISH", "LONG", "2-2", 70.0),
+        ("2D", "2D"): ("2-2_CONTINUATION_BEARISH", "SHORT", "2-2", 68.0),
+        ("2U", "2D"): ("2-2_REVERSAL_BEARISH", "SHORT", "2-2", 70.0),
+    }
+    if tuple(last2) in mapping2:
+        add(*mapping2[tuple(last2)])
+
+    # The notebook also shows a 1-3-1-3 "return" idea. It is exposed only as
+    # neutral research context because the screenshot does not define a
+    # directional entry rule for it.
+    if last4 == ["1", "3", "1", "3"]:
+        add("1-3-1-3_RETURN_CONTEXT", "NEUTRAL", "1-3-1-3", 55.0)
+
+    directional = [p for p in patterns if p["bias"] in {"LONG", "SHORT"}]
+    long_strength = max([_f(p.get("strength")) for p in directional if p["bias"] == "LONG"] or [0.0])
+    short_strength = max([_f(p.get("strength")) for p in directional if p["bias"] == "SHORT"] or [0.0])
+    bias = "LONG" if long_strength > short_strength else "SHORT" if short_strength > long_strength else "NEUTRAL"
+
+    return {
+        "available": True,
+        "taxonomy": {
+            "1": "inside_consolidation",
+            "2": "directional_break_one_side",
+            "3": "outside_break_both_sides",
+        },
+        "recent_tokens": tokens[-6:],
+        "recent_bars": bars[-6:],
+        "patterns": patterns,
+        "aggregate_bias": bias,
+        "score_is_probability": False,
+        "can_create_entry": False,
+    }
+
+
+def _liquidity_sweep_context(rows: list[list[Any]], current: float, atr: float) -> dict[str, Any]:
+    """OHLC-only stop-run/reclaim context around recent visible extremes."""
+    work = rows[-32:]
+    if len(work) < 12:
+        return {"available": False}
+    prior = work[:-1]
+    cur = _candle_features(work[-1])
+    prior_high = max(_f(r[2]) for r in prior)
+    prior_low = min(_f(r[3]) for r in prior)
+    scale = max(atr, current * 0.001, 1e-12)
+    buffer = max(scale * 0.05, current * 0.00015)
+
+    swept_high = cur["high"] > prior_high + buffer
+    swept_low = cur["low"] < prior_low - buffer
+    high_reclaimed = swept_high and cur["close"] < prior_high
+    low_reclaimed = swept_low and cur["close"] > prior_low
+
+    if high_reclaimed and not low_reclaimed:
+        bias = "SHORT"
+        event = "HIGH_LIQUIDITY_SWEEP_REJECTED"
+    elif low_reclaimed and not high_reclaimed:
+        bias = "LONG"
+        event = "LOW_LIQUIDITY_SWEEP_RECLAIMED"
+    elif high_reclaimed and low_reclaimed:
+        bias = "NEUTRAL"
+        event = "TWO_SIDED_LIQUIDITY_SWEEP"
+    else:
+        bias = "NEUTRAL"
+        event = "NO_CONFIRMED_SWEEP"
+
+    return {
+        "available": True,
+        "event": event,
+        "bias": bias,
+        "prior_high": round(prior_high, 12),
+        "prior_low": round(prior_low, 12),
+        "swept_high": swept_high,
+        "swept_low": swept_low,
+        "high_reclaimed": high_reclaimed,
+        "low_reclaimed": low_reclaimed,
+        "distance_above_high_atr": round(max(0.0, cur["high"] - prior_high) / scale, 4),
+        "distance_below_low_atr": round(max(0.0, prior_low - cur["low"]) / scale, 4),
+        "ohlc_proxy_only": True,
+        "can_create_entry": False,
+    }
+
+
+def _amd_context(rows: list[list[Any]], current: float, atr: float) -> dict[str, Any]:
+    """Approximate Accumulation -> Manipulation -> Distribution as market story."""
+    work = rows[-36:]
+    if len(work) < 20:
+        return {"available": False}
+
+    base = work[-18:-4]
+    recent = work[-4:]
+    base_high = max(_f(r[2]) for r in base)
+    base_low = min(_f(r[3]) for r in base)
+    base_closes = [_f(r[4]) for r in base]
+    base_range = max(base_high - base_low, 1e-12)
+    scale = max(atr, current * 0.001, 1e-12)
+    base_range_atr = base_range / scale
+    close_band_ratio = (max(base_closes) - min(base_closes)) / base_range if base_range > 0 else 1.0
+    accumulation = base_range_atr <= 6.0 and close_band_ratio <= 0.78
+
+    buffer = max(scale * 0.05, current * 0.00015)
+    recent_high = max(_f(r[2]) for r in recent)
+    recent_low = min(_f(r[3]) for r in recent)
+    last_close = _f(recent[-1][4])
+    midpoint = (base_high + base_low) / 2.0
+    swept_high = recent_high > base_high + buffer
+    swept_low = recent_low < base_low - buffer
+    high_reclaimed = swept_high and last_close < base_high
+    low_reclaimed = swept_low and last_close > base_low
+
+    phase = "NO_CLEAR_AMD"
+    bias = "NEUTRAL"
+    if low_reclaimed and last_close > midpoint:
+        phase = "DISTRIBUTION_UP_AFTER_LOW_MANIPULATION"
+        bias = "LONG"
+    elif high_reclaimed and last_close < midpoint:
+        phase = "DISTRIBUTION_DOWN_AFTER_HIGH_MANIPULATION"
+        bias = "SHORT"
+    elif low_reclaimed:
+        phase = "MANIPULATION_BELOW_RANGE"
+        bias = "LONG"
+    elif high_reclaimed:
+        phase = "MANIPULATION_ABOVE_RANGE"
+        bias = "SHORT"
+    elif accumulation:
+        phase = "ACCUMULATION"
+
+    return {
+        "available": True,
+        "phase": phase,
+        "bias": bias,
+        "accumulation_detected": accumulation,
+        "base_high": round(base_high, 12),
+        "base_low": round(base_low, 12),
+        "base_range_atr": round(base_range_atr, 4),
+        "close_band_ratio": round(close_band_ratio, 4),
+        "swept_high": swept_high,
+        "swept_low": swept_low,
+        "high_reclaimed": high_reclaimed,
+        "low_reclaimed": low_reclaimed,
+        "heuristic_not_institutional_intent_claim": True,
+        "score_is_probability": False,
+        "can_create_entry": False,
     }
 
 
@@ -766,6 +987,9 @@ def technical_arsenal_registry() -> dict[str, Any]:
         "source_scope": "USER_SHARED_PROFESSIONAL_TRADING_ARSENAL_TRANSCRIPT",
         "implemented": [
             "candlestick_engulfing_hammer_shooting_star_doji",
+            "strat_1_2_3_candle_sequences_212_312_122_22_322",
+            "amd_accumulation_manipulation_distribution_context",
+            "ohlc_liquidity_sweep_reclaim_context",
             "support_resistance",
             "trendline_context",
             "stochastic",
@@ -792,6 +1016,11 @@ def technical_arsenal_registry() -> dict[str, Any]:
             "breakout_chart_patterns",
             "reversal_chart_patterns",
             "elliott_wave_structure",
+            "liquidity_target_engine",
+            "order_flow_spot_futures_delta_orderbook",
+            "open_interest_funding_liquidation_context",
+            "structural_stop_position_sizing",
+            "risk_reward_execution_math",
         ],
         "mentioned_but_not_rule_defined_in_source": ["harmonic_patterns"],
         "partially_defined_in_source": ["harmonic_patterns_bat_butterfly_crab"],
@@ -828,6 +1057,9 @@ def build_technical_arsenal_context(
     atr = _atr(rows)
     structure = _market_structure(rows, atr)
     candle = _candlestick_context(rows, atr)
+    strat = _strat_context(rows)
+    liquidity_sweep = _liquidity_sweep_context(rows, current, atr)
+    amd = _amd_context(rows, current, atr)
     sr = _support_resistance(rows, current, atr)
     fib = _fibonacci_context(rows, current, atr)
     fvg = _fair_value_gaps(rows, current, atr)
@@ -872,6 +1104,25 @@ def build_technical_arsenal_context(
         elif pattern.get("bias") == "SHORT":
             short_points += 0.75
 
+    strat_bias = str(strat.get("aggregate_bias") or "NEUTRAL")
+    if strat_bias == "LONG":
+        long_points += 0.55
+        evidence.append("strat_price_action_long")
+    elif strat_bias == "SHORT":
+        short_points += 0.55
+        evidence.append("strat_price_action_short")
+
+    amd_phase = str(amd.get("phase") or "")
+    if amd_phase == "DISTRIBUTION_UP_AFTER_LOW_MANIPULATION":
+        long_points += 0.65
+        evidence.append("amd_distribution_up")
+    elif amd_phase == "DISTRIBUTION_DOWN_AFTER_HIGH_MANIPULATION":
+        short_points += 0.65
+        evidence.append("amd_distribution_down")
+
+    # Liquidity sweeps are exposed for context but intentionally not added to
+    # the aggregate score because ExplodeX already has a dedicated sweep and
+    # liquidity-target stack elsewhere.
     if stochastic.get("state") == "OVERSOLD":
         long_points += 0.40
     elif stochastic.get("state") == "OVERBOUGHT":
@@ -937,6 +1188,9 @@ def build_technical_arsenal_context(
         "short_points": round(short_points, 3),
         "evidence": evidence,
         "candlesticks": candle,
+        "strat_price_action": strat,
+        "liquidity_sweep": liquidity_sweep,
+        "amd_market_story": amd,
         "support_resistance": sr,
         "market_structure": structure,
         "fibonacci": fib,
@@ -957,6 +1211,7 @@ def build_technical_arsenal_context(
         "policy": technical_arsenal_registry()["policy"],
         "note": (
             "Shadow-only translation of the shared technical-analysis arsenal into transparent heuristics. "
+            "The newly shared 1/2/3 candle combinations and AMD market-story context are included, while liquidity/order-flow/risk logic already covered elsewhere is not double-counted. "
             "It deliberately avoids double-counting MACD/RSI/VWAP, Murphy chart patterns and Elliott, which ExplodeX already computes elsewhere."
         ),
     }
