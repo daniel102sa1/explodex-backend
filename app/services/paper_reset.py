@@ -18,6 +18,8 @@ _EXACT_TABLES = {
     "trades",
     "trade_events",
     "scanner_runs",
+    "heart_shadow_forecasts",
+    "trade_theses",
 }
 
 _PREFIXES = (
@@ -46,7 +48,6 @@ _PREFIXES = (
     "runner_",
     "event_risk_",
     "elliott_",
-    "trade_thes",
 )
 
 
