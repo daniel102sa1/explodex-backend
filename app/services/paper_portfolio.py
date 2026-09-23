@@ -307,7 +307,11 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
             "hard_stop": metadata.get("hard_stop") or metadata.get("structural_stop") or _f(row["stop_loss"]),
             "stop_survival_enabled": bool(metadata.get("stop_survival_enabled")),
             "chase_limit": metadata.get("chase_limit"),
-            "actual_stop_risk_usdt": metadata.get("actual_stop_risk_usdt"),
+            "actual_stop_risk_usdt": metadata.get("actual_stop_risk_usdt") or _f(row.get("risk_usdt")),
+            "risk_usdt": _f(row.get("risk_usdt")),
+            "notional": _f(row.get("notional")),
+            "quantity": _f(row.get("quantity")),
+            "evaluation_generation": metadata.get("evaluation_generation"),
             "chati_sarpon_612_monitor": metadata.get("chati_sarpon_612_monitor"),
             "chati_sarpon_612_history": list(metadata.get("chati_sarpon_612_history") or [])[-8:],
             "net_rr": _meta(metadata.get("execution_math_live")).get("net_rr"),
@@ -350,7 +354,8 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
 async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, Any]]:
     await ensure_paper_schema(db)
     rows = (await db.execute(text("""
-        SELECT id, symbol, side, leverage, entry_price, exit_price, stop_loss, take_profit,
+        SELECT id, signal_id, symbol, side, leverage, entry_price, exit_price, stop_loss, take_profit,
+               quantity, notional, margin_used, risk_usdt,
                opened_at, closed_at, exit_reason, gross_pnl, net_pnl, fees, slippage, funding_estimate,
                metadata
         FROM paper_positions WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT :limit
@@ -360,6 +365,8 @@ async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, An
         row = dict(raw)
         metadata = _meta(row.pop("metadata", {}))
         row["strategy_mode"] = metadata.get("strategy_mode")
+        row["evaluation_generation"] = metadata.get("evaluation_generation")
+        row["actual_stop_risk_usdt"] = metadata.get("actual_stop_risk_usdt") or _f(row.get("risk_usdt"))
         row["trade_profile"] = metadata.get("trade_profile") or metadata.get("strategy_mode")
         row["planned_horizon"] = metadata.get("planned_horizon") or metadata.get("horizon")
         row["max_hold_minutes"] = metadata.get("planned_max_hold_minutes") or metadata.get("max_hold_minutes")
@@ -375,6 +382,101 @@ async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, An
         row["technical_plan"] = metadata.get("technical_plan")
         row["fundamental_context"] = metadata.get("fundamental_context")
         row["net_rr"] = _meta(metadata.get("execution_math_live")).get("net_rr")
+        output.append(row)
+    return output
+
+
+async def paper_equity_curve(db: AsyncSession, limit: int = 500) -> dict[str, Any]:
+    """Return a clean realized-equity curve derived from closed PAPER trades.
+
+    This intentionally reconstructs the curve from the canonical paper_positions
+    ledger, so a reset starts at exactly STARTING_BALANCE without carrying old
+    sampled equity points forward.
+    """
+    await ensure_paper_schema(db)
+    account = dict((await db.execute(text("SELECT * FROM paper_accounts WHERE id=1"))).mappings().one())
+    rows = [dict(r) for r in (await db.execute(text("""
+        SELECT id, symbol, side, opened_at, closed_at, net_pnl
+        FROM paper_positions
+        WHERE status='CLOSED' AND closed_at IS NOT NULL
+        ORDER BY closed_at ASC
+        LIMIT :limit
+    """), {"limit": max(1, min(int(limit), 5000))})).mappings().all()]
+
+    starting = _f(account.get("starting_balance"), STARTING_BALANCE)
+    equity = starting
+    points: list[dict[str, Any]] = [{
+        "kind": "START",
+        "trade_id": None,
+        "symbol": None,
+        "side": None,
+        "observed_at": account["created_at"].isoformat() if account.get("created_at") else None,
+        "net_pnl": 0.0,
+        "equity": round(equity, 6),
+        "cumulative_pnl": 0.0,
+    }]
+    for row in rows:
+        pnl = _f(row.get("net_pnl"))
+        equity += pnl
+        points.append({
+            "kind": "CLOSED_TRADE",
+            "trade_id": row.get("id"),
+            "symbol": row.get("symbol"),
+            "side": row.get("side"),
+            "observed_at": row["closed_at"].isoformat() if row.get("closed_at") else None,
+            "net_pnl": round(pnl, 6),
+            "equity": round(equity, 6),
+            "cumulative_pnl": round(equity - starting, 6),
+        })
+    return {
+        "version": "paper_equity_curve_v1",
+        "paper_only": True,
+        "starting_balance": round(starting, 6),
+        "realized_equity": round(equity, 6),
+        "points": points,
+    }
+
+
+async def paper_signal_history(db: AsyncSession, limit: int = 200) -> list[dict[str, Any]]:
+    """Recent scanner signals with PAPER execution linkage for the trade center."""
+    rows = (await db.execute(text("""
+        SELECT
+            s.id::text AS id,
+            sy.symbol,
+            s.created_at,
+            s.updated_at,
+            s.direction,
+            s.state,
+            s.setup_score,
+            s.risk_score,
+            s.current_price,
+            s.entry_low,
+            s.entry_high,
+            s.stop_loss,
+            s.tp1,
+            s.tp2,
+            s.tp3,
+            s.is_active,
+            s.reason,
+            pp.id AS paper_trade_id,
+            pp.status AS paper_trade_status,
+            pp.opened_at AS paper_opened_at,
+            pp.closed_at AS paper_closed_at,
+            pp.exit_reason AS paper_exit_reason,
+            pp.net_pnl AS paper_net_pnl
+        FROM signals s
+        JOIN symbols sy ON sy.id=s.symbol_id
+        LEFT JOIN paper_positions pp ON pp.signal_id=s.id
+        ORDER BY s.created_at DESC
+        LIMIT :limit
+    """), {"limit": max(1, min(int(limit), 1000))})).mappings().all()
+    output: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        for key in ("created_at", "updated_at", "paper_opened_at", "paper_closed_at"):
+            if row.get(key) is not None:
+                row[key] = row[key].isoformat()
+        row["was_executed"] = row.get("paper_trade_id") is not None
         output.append(row)
     return output
 
