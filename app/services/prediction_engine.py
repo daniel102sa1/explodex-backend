@@ -3,6 +3,7 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
+from app.services.professional_arsenal import build_professional_arsenal_context
 from app.services.sarpon_compression import build_sarpon_compression_context
 
 
@@ -149,6 +150,7 @@ def build_pre_move_prediction(
 
     coinglass = coinglass or {}
     metrics = dict(scored.get("metrics") or {})
+    professional = build_professional_arsenal_context(scored, snapshot, coinglass)
     klines = snapshot.get("klines") or []
     if len(klines) < 20:
         return {
@@ -239,6 +241,46 @@ def build_pre_move_prediction(
         long_breakout += 5
         short_breakdown += 5
 
+    # Professional confluence is bounded confirmation, never a standalone entry.
+    pro_aggregate = dict(professional.get("aggregate") or {})
+    pro_pump = dict(professional.get("pump_hunter") or {})
+    pro_patterns = list((professional.get("patterns") or {}).get("patterns") or [])
+    pro_momentum = dict(professional.get("momentum") or {})
+    pro_adx = dict(pro_momentum.get("adx") or {})
+
+    pro_bias = str(pro_aggregate.get("aggregate_bias") or "NEUTRAL")
+    if pro_bias == "LONG":
+        long_breakout += 3
+        long_breakout_conf.append("confluencia profesional favorece LONG")
+    elif pro_bias == "SHORT":
+        short_breakdown += 3
+        short_breakdown_conf.append("confluencia profesional favorece SHORT")
+
+    pump_bias = str(pro_pump.get("bias") or "NEUTRAL")
+    pump_state = str(pro_pump.get("state") or "QUIET")
+    pump_bonus = 8 if pump_state == "STRONG" else 5 if pump_state == "ARMED" else 0
+    if pump_bonus and pump_bias == "LONG":
+        long_breakout += pump_bonus
+        long_breakout_conf.append(f"pump confluence {pump_state.lower()} LONG")
+    elif pump_bonus and pump_bias == "SHORT":
+        short_breakdown += pump_bonus
+        short_breakdown_conf.append(f"pump confluence {pump_state.lower()} SHORT")
+
+    for item in pro_patterns:
+        name = str(item.get("name") or "")
+        if name == "BREAKOUT_RETEST_LONG":
+            long_breakout += 6
+            long_breakout_conf.append("breakout + retest confirmado")
+        elif name == "BREAKDOWN_RETEST_SHORT":
+            short_breakdown += 6
+            short_breakdown_conf.append("breakdown + retest confirmado")
+
+    if str(pro_adx.get("trend_strength") or "") == "STRONG":
+        if pro_adx.get("bias") == "LONG":
+            long_breakout += 3
+        elif pro_adx.get("bias") == "SHORT":
+            short_breakdown += 3
+
     compression_direction = str(sarpon_compression.get("direction") or "NEUTRAL").upper()
     compression_stage = str(sarpon_compression.get("stage") or "NO_COMPRESSION_EDGE").upper()
     compression_bonus = _f(sarpon_compression.get("priority_bonus"))
@@ -317,6 +359,52 @@ def build_pre_move_prediction(
         rejection += 8
     if change_15m > 2.5 and not sweep_high:
         rejection_conflicts.append("subida extendida sin rechazo confirmado")
+
+    # Failed breakouts/range deviations, CVD divergence, VWAP mean reversion and
+    # exhaustion are reversal context. They require the existing structure/trigger
+    # logic above; none can activate a trade alone.
+    pro_vwap = dict(professional.get("vwap") or {})
+    pro_flow = dict(professional.get("flow") or {})
+    pro_fcvd = dict(pro_flow.get("futures_cvd_proxy") or {})
+    pro_scvd = dict(pro_flow.get("spot_cvd_proxy") or {})
+    pro_abs = dict(professional.get("absorption_exhaustion") or {})
+    pro_deriv = dict(professional.get("derivatives") or {})
+
+    for item in pro_patterns:
+        name = str(item.get("name") or "")
+        if name == "FAILED_BREAKDOWN_RANGE_DEVIATION":
+            bounce += 12
+            bounce_conf.append("desviación bajo rango + recuperación")
+        elif name == "FAILED_BREAKOUT_RANGE_DEVIATION":
+            rejection += 12
+            rejection_conf.append("desviación sobre rango + rechazo")
+
+    if pro_vwap.get("mean_reversion_bias") == "LONG":
+        bounce += 4
+        bounce_conf.append("reversión hacia VWAP favorece rebote")
+    elif pro_vwap.get("mean_reversion_bias") == "SHORT":
+        rejection += 4
+        rejection_conf.append("reversión hacia VWAP favorece rechazo")
+
+    if pro_fcvd.get("divergence") == "BULLISH_CVD_DIVERGENCE" or pro_scvd.get("divergence") == "BULLISH_CVD_DIVERGENCE":
+        bounce += 6
+        bounce_conf.append("divergencia CVD alcista")
+    if pro_fcvd.get("divergence") == "BEARISH_CVD_DIVERGENCE" or pro_scvd.get("divergence") == "BEARISH_CVD_DIVERGENCE":
+        rejection += 6
+        rejection_conf.append("divergencia CVD bajista")
+
+    if pro_abs.get("exhaustion") == "DOWNSIDE_EXHAUSTION":
+        bounce += 6
+        bounce_conf.append("agotamiento bajista")
+    elif pro_abs.get("exhaustion") == "UPSIDE_EXHAUSTION":
+        rejection += 6
+        rejection_conf.append("agotamiento alcista")
+
+    crowding = str(pro_deriv.get("crowding") or "NONE")
+    if crowding == "LONGS_CROWDED":
+        long_breakout_conflicts.append("funding/OI: longs sobrecargados")
+    elif crowding == "SHORTS_CROWDED":
+        short_breakdown_conflicts.append("funding/OI: shorts sobrecargados")
 
     candidates = [
         (long_breakout, "IMPULSO_LONG", "LONG", long_breakout_conf, long_conflicts),
@@ -485,6 +573,7 @@ def build_pre_move_prediction(
         "confirmations": confirmations[:12],
         "conflicts": conflicts[:10],
         "sarpon_compression": sarpon_compression,
+        "professional_arsenal": professional,
         "sequence": {
             "compressed": compressed or compression_stage in {"ARMED_EARLY", "BUILDING", "SQUEEZE_NEUTRAL"},
             "compression_priority_stage": compression_stage,
@@ -507,7 +596,7 @@ def build_pre_move_prediction(
             "range_low_48": round(low_48, 12),
         },
         "message": (
-            "Predicción de fase previa basada en estructura y compresión prioritaria SARPON, después volumen, flujo, OI y liquidez. "
+            "Predicción de fase previa basada en precio/estructura/liquidez, compresión SARPON, volumen, CVD, OI/funding y contexto profesional. "
             "La compresión puede adelantar la vigilancia, pero no autoriza por sí sola una entrada ni garantiza ruptura."
         ),
     }
