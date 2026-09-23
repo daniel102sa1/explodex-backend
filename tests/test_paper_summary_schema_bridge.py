@@ -13,8 +13,9 @@ def test_summary_repairs_schema_before_reading_portfolio():
     summary_start = source.index('@router.get("/summary")')
     summary_block = source[summary_start:source.index('@router.get("/edge-lab")')]
     assert "await _ensure_paper_dependencies(db)" in summary_block
-    assert "result = await paper_summary(db)" in summary_block
-    assert summary_block.index("await _ensure_paper_dependencies(db)") < summary_block.index("result = await paper_summary(db)")
+    assert "paper_arsenal_summary(db)" in summary_block
+    assert "paper_summary(db)" in summary_block
+    assert summary_block.index("await _ensure_paper_dependencies(db)") < summary_block.index("paper_arsenal_summary(db)")
 
 
 def test_dependencies_install_canonical_fk_after_base_schema():

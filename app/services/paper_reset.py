@@ -7,10 +7,13 @@ from typing import Any
 from sqlalchemy import text
 
 from app.database import engine
+from app.services.paper_portfolio import ARSENAL_DISPLAY_START
 
 OPEN_RESET_ENV = "EXPLODEX_OPEN_PAPER_RESET_TOKEN"
 MARKER_TABLE = "system_reset_markers"
 MARKER_PREFIX = "OPEN_PAPER_ONLY"
+REPAIR_ENV = "EXPLODEX_REPAIR_ARSENAL_RESET_TOKEN"
+REPAIR_PREFIX = "REPAIR_NEW_ARSENAL_OPEN"
 
 
 def _reset_marker_key(token: str) -> str:
@@ -114,6 +117,91 @@ async def maybe_reset_open_paper_positions() -> dict[str, Any]:
         "requested": True,
         "applied": True,
         "reason": "open_paper_positions_cancelled",
+        **details,
+    }
+
+
+async def maybe_repair_current_arsenal_positions() -> dict[str, Any]:
+    """Undo only the accidental open-reset for positions from the new arsenal cohort.
+
+    Pre-arsenal rows stay archived/hidden. This restores only rows that were OPEN,
+    were marked CANCELLED by RESET_OPEN_ONLY, and were originally opened after the
+    arsenal display cutoff. The normal PAPER manager will then resolve TP/SL/time
+    outcomes from market candles, so no result is fabricated here.
+    """
+    token = str(os.getenv(REPAIR_ENV, "") or "").strip()
+    if not token:
+        return {"requested": False, "applied": False, "reason": "no_repair_token"}
+
+    marker_key = f"{REPAIR_PREFIX}::{token}"
+    async with engine.begin() as conn:
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {MARKER_TABLE} (
+                token TEXT PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                details JSONB NOT NULL DEFAULT '{{}}'::jsonb
+            )
+        """))
+        seen = await conn.execute(
+            text(f"SELECT 1 FROM {MARKER_TABLE} WHERE token=:token"),
+            {"token": marker_key},
+        )
+        if seen.scalar_one_or_none():
+            return {"requested": True, "applied": False, "reason": "repair_token_already_applied"}
+
+        positions_exists = await conn.execute(text("SELECT to_regclass('public.paper_positions')"))
+        if not positions_exists.scalar_one_or_none():
+            return {"requested": True, "applied": False, "reason": "paper_positions_not_ready"}
+
+        candidates = int((
+            await conn.execute(text("""
+                SELECT COUNT(*)
+                FROM paper_positions
+                WHERE status='CANCELLED'
+                  AND exit_reason='RESET_OPEN_ONLY'
+                  AND opened_at >= :cutoff
+            """), {"cutoff": ARSENAL_DISPLAY_START})
+        ).scalar_one() or 0)
+
+        updated = await conn.execute(text("""
+            UPDATE paper_positions
+            SET
+                status='OPEN',
+                closed_at=NULL,
+                exit_reason=NULL,
+                exit_price=NULL,
+                gross_pnl=NULL,
+                net_pnl=NULL,
+                metadata=(COALESCE(metadata, '{}'::jsonb)
+                    - 'open_reset_cancelled'
+                    - 'open_reset_at')
+                    || jsonb_build_object(
+                        'open_reset_repaired', TRUE,
+                        'open_reset_repaired_at', NOW()
+                    )
+            WHERE status='CANCELLED'
+              AND exit_reason='RESET_OPEN_ONLY'
+              AND opened_at >= :cutoff
+        """), {"cutoff": ARSENAL_DISPLAY_START})
+        restored = int(updated.rowcount or 0)
+
+        details = {
+            "mode": "REPAIR_NEW_ARSENAL_OPEN_ONLY",
+            "cutoff": ARSENAL_DISPLAY_START.isoformat(),
+            "candidates": candidates,
+            "positions_restored": restored,
+            "pre_arsenal_positions_left_archived": True,
+            "history_and_learning_untouched": True,
+        }
+        await conn.execute(
+            text(f"INSERT INTO {MARKER_TABLE} (token, details) VALUES (:token, CAST(:details AS JSONB))"),
+            {"token": marker_key, "details": json.dumps(details)},
+        )
+
+    return {
+        "requested": True,
+        "applied": True,
+        "reason": "new_arsenal_open_positions_restored",
         **details,
     }
 

@@ -17,6 +17,13 @@ SLIPPAGE_RATE = 0.0002
 FUNDING_ESTIMATE_8H = 0.0001
 MAX_HOLD_MINUTES = 120
 
+# Visual/evaluation cohort for the arsenal added on 23 Sep 2026 (1/2/3 + AMD).
+# Older positions remain stored and available for learning/audit, but the default
+# user-facing PAPER view starts here so legacy positions do not contaminate the
+# new-arsenal scorecard.
+ARSENAL_DISPLAY_START = datetime(2026, 9, 23, 17, 17, 23, tzinfo=timezone.utc)
+ARSENAL_DISPLAY_LABEL = "ARSENAL_1_2_3_AMD_2026_09_23"
+
 
 def _f(value: Any, default: float = 0.0) -> float:
     if value is None or value == "":
@@ -351,9 +358,65 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
     }
 
 
-async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, Any]]:
+async def paper_arsenal_summary(db: AsyncSession) -> dict[str, Any]:
+    """User-facing scorecard for positions opened after the latest arsenal deploy.
+
+    This is display isolation only. Legacy rows remain in the database and all
+    learning engines can continue using their historical data.
+    """
+    full = await paper_summary(db)
+    cutoff = ARSENAL_DISPLAY_START
+    positions = [
+        p for p in list(full.get("open_positions") or [])
+        if p.get("opened_at") and datetime.fromisoformat(str(p["opened_at"]).replace("Z", "+00:00")) >= cutoff
+    ]
+    unrealized = sum(_f(p.get("unrealized_pnl")) for p in positions)
+
+    stats = dict((await db.execute(text("""
+        SELECT
+            COUNT(*) FILTER (WHERE status='CLOSED') AS closed_trades,
+            COUNT(*) FILTER (WHERE status='CLOSED' AND net_pnl > 0) AS winners,
+            COUNT(*) FILTER (WHERE status='CLOSED' AND net_pnl <= 0) AS losers,
+            COALESCE(SUM(net_pnl) FILTER (WHERE status='CLOSED'),0) AS net_pnl,
+            COALESCE(SUM(COALESCE(fees,0)+COALESCE(slippage,0)+COALESCE(funding_estimate,0))
+                FILTER (WHERE status='CLOSED'),0) AS costs
+        FROM paper_positions
+        WHERE opened_at >= :cutoff
+    """), {"cutoff": cutoff})).mappings().one())
+
+    closed = int(stats.get("closed_trades") or 0)
+    winners = int(stats.get("winners") or 0)
+    realized = _f(stats.get("net_pnl"))
+    costs = _f(stats.get("costs"))
+    display_cash = STARTING_BALANCE + realized
+    display_equity = display_cash + unrealized
+
+    result = dict(full)
+    result.update({
+        "version": "paper_portfolio_arsenal_view_v1",
+        "display_scope": "NEW_ARSENAL_ONLY",
+        "display_label": ARSENAL_DISPLAY_LABEL,
+        "display_started_at": cutoff.isoformat(),
+        "legacy_positions_hidden_not_deleted": True,
+        "starting_balance": STARTING_BALANCE,
+        "cash_balance": round(display_cash, 6),
+        "unrealized_pnl": round(unrealized, 6),
+        "equity": round(display_equity, 6),
+        "realized_pnl": round(realized, 6),
+        "total_costs": round(costs, 6),
+        "open_positions": positions,
+        "closed_trades": closed,
+        "winners": winners,
+        "losers": int(stats.get("losers") or 0),
+        "win_rate_pct": round(winners / closed * 100.0, 2) if closed else None,
+    })
+    return result
+
+
+async def paper_history(db: AsyncSession, limit: int = 100, opened_after: datetime | None = None) -> list[dict[str, Any]]:
     await ensure_paper_schema(db)
-    rows = (await db.execute(text("""
+    cohort_filter = " AND p.opened_at >= :opened_after" if opened_after is not None else ""
+    rows = (await db.execute(text(f"""
         SELECT p.id, p.signal_id, p.symbol, p.side, p.leverage, p.entry_price, p.exit_price, p.stop_loss, p.take_profit,
                p.quantity, p.notional, p.margin_used, p.risk_usdt,
                p.opened_at, p.closed_at, p.exit_reason, p.gross_pnl, p.net_pnl, p.fees, p.slippage, p.funding_estimate,
@@ -361,10 +424,10 @@ async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, An
                vm.mfe_pct, vm.mae_pct, vm.outcome AS verdict_outcome, vm.minutes_to_outcome
         FROM paper_positions p
         LEFT JOIN verdict_memory vm ON vm.signal_id = p.signal_id
-        WHERE p.status='CLOSED'
+        WHERE p.status='CLOSED'{cohort_filter}
         ORDER BY p.closed_at DESC
         LIMIT :limit
-    """), {"limit": limit})).mappings().all()
+    """), {"limit": limit, **({"opened_after": opened_after} if opened_after is not None else {})})).mappings().all()
     output: list[dict[str, Any]] = []
     for raw in rows:
         row = dict(raw)
@@ -395,7 +458,7 @@ async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, An
     return output
 
 
-async def paper_equity_curve(db: AsyncSession, limit: int = 500) -> dict[str, Any]:
+async def paper_equity_curve(db: AsyncSession, limit: int = 500, opened_after: datetime | None = None) -> dict[str, Any]:
     """Return a clean realized-equity curve derived from closed PAPER trades.
 
     This intentionally reconstructs the curve from the canonical paper_positions
@@ -404,22 +467,26 @@ async def paper_equity_curve(db: AsyncSession, limit: int = 500) -> dict[str, An
     """
     await ensure_paper_schema(db)
     account = dict((await db.execute(text("SELECT * FROM paper_accounts WHERE id=1"))).mappings().one())
-    rows = [dict(r) for r in (await db.execute(text("""
+    cohort_filter = " AND opened_at >= :opened_after" if opened_after is not None else ""
+    rows = [dict(r) for r in (await db.execute(text(f"""
         SELECT id, symbol, side, opened_at, closed_at, net_pnl
         FROM paper_positions
-        WHERE status='CLOSED' AND closed_at IS NOT NULL
+        WHERE status='CLOSED' AND closed_at IS NOT NULL{cohort_filter}
         ORDER BY closed_at ASC
         LIMIT :limit
-    """), {"limit": max(1, min(int(limit), 5000))})).mappings().all()]
+    """), {
+        "limit": max(1, min(int(limit), 5000)),
+        **({"opened_after": opened_after} if opened_after is not None else {}),
+    })).mappings().all()]
 
-    starting = _f(account.get("starting_balance"), STARTING_BALANCE)
+    starting = STARTING_BALANCE if opened_after is not None else _f(account.get("starting_balance"), STARTING_BALANCE)
     equity = starting
     points: list[dict[str, Any]] = [{
         "kind": "START",
         "trade_id": None,
         "symbol": None,
         "side": None,
-        "observed_at": account["created_at"].isoformat() if account.get("created_at") else None,
+        "observed_at": opened_after.isoformat() if opened_after is not None else (account["created_at"].isoformat() if account.get("created_at") else None),
         "net_pnl": 0.0,
         "equity": round(equity, 6),
         "cumulative_pnl": 0.0,
@@ -446,9 +513,10 @@ async def paper_equity_curve(db: AsyncSession, limit: int = 500) -> dict[str, An
     }
 
 
-async def paper_signal_history(db: AsyncSession, limit: int = 200) -> list[dict[str, Any]]:
+async def paper_signal_history(db: AsyncSession, limit: int = 200, created_after: datetime | None = None) -> list[dict[str, Any]]:
     """Recent scanner signals with PAPER execution linkage for the trade center."""
-    rows = (await db.execute(text("""
+    cohort_filter = " WHERE s.created_at >= :created_after" if created_after is not None else ""
+    rows = (await db.execute(text(f"""
         SELECT
             s.id::text AS id,
             sy.symbol,
@@ -476,9 +544,13 @@ async def paper_signal_history(db: AsyncSession, limit: int = 200) -> list[dict[
         FROM signals s
         JOIN symbols sy ON sy.id=s.symbol_id
         LEFT JOIN paper_positions pp ON pp.signal_id=s.id
+        {cohort_filter}
         ORDER BY s.created_at DESC
         LIMIT :limit
-    """), {"limit": max(1, min(int(limit), 1000))})).mappings().all()
+    """), {
+        "limit": max(1, min(int(limit), 1000)),
+        **({"created_after": created_after} if created_after is not None else {}),
+    })).mappings().all()
     output: list[dict[str, Any]] = []
     for raw in rows:
         row = dict(raw)
