@@ -354,11 +354,16 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
 async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, Any]]:
     await ensure_paper_schema(db)
     rows = (await db.execute(text("""
-        SELECT id, signal_id, symbol, side, leverage, entry_price, exit_price, stop_loss, take_profit,
-               quantity, notional, margin_used, risk_usdt,
-               opened_at, closed_at, exit_reason, gross_pnl, net_pnl, fees, slippage, funding_estimate,
-               metadata
-        FROM paper_positions WHERE status='CLOSED' ORDER BY closed_at DESC LIMIT :limit
+        SELECT p.id, p.signal_id, p.symbol, p.side, p.leverage, p.entry_price, p.exit_price, p.stop_loss, p.take_profit,
+               p.quantity, p.notional, p.margin_used, p.risk_usdt,
+               p.opened_at, p.closed_at, p.exit_reason, p.gross_pnl, p.net_pnl, p.fees, p.slippage, p.funding_estimate,
+               p.metadata,
+               vm.mfe_pct, vm.mae_pct, vm.outcome AS verdict_outcome, vm.minutes_to_outcome
+        FROM paper_positions p
+        LEFT JOIN verdict_memory vm ON vm.signal_id = p.signal_id
+        WHERE p.status='CLOSED'
+        ORDER BY p.closed_at DESC
+        LIMIT :limit
     """), {"limit": limit})).mappings().all()
     output: list[dict[str, Any]] = []
     for raw in rows:
@@ -367,6 +372,10 @@ async def paper_history(db: AsyncSession, limit: int = 100) -> list[dict[str, An
         row["strategy_mode"] = metadata.get("strategy_mode")
         row["evaluation_generation"] = metadata.get("evaluation_generation")
         row["actual_stop_risk_usdt"] = metadata.get("actual_stop_risk_usdt") or _f(row.get("risk_usdt"))
+        row["mfe_pct"] = _f(row.get("mfe_pct")) if row.get("mfe_pct") is not None else None
+        row["mae_pct"] = _f(row.get("mae_pct")) if row.get("mae_pct") is not None else None
+        row["verdict_outcome"] = row.get("verdict_outcome")
+        row["minutes_to_outcome"] = _f(row.get("minutes_to_outcome")) if row.get("minutes_to_outcome") is not None else None
         row["trade_profile"] = metadata.get("trade_profile") or metadata.get("strategy_mode")
         row["planned_horizon"] = metadata.get("planned_horizon") or metadata.get("horizon")
         row["max_hold_minutes"] = metadata.get("planned_max_hold_minutes") or metadata.get("max_hold_minutes")
