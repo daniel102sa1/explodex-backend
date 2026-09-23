@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-EVALUATION_GENERATION = "EXPLODEX_VNEXT_2026_09_20"
+EVALUATION_GENERATION = "EXPLODEX_ARSENAL_RESET_2026_09_22"
 VERSION = "explodex_vnext_evaluation_v2_normalized_risk"
 SHADOW_HORIZONS = ("15m", "1h", "4h", "6h", "24h", "3d", "7d")
 
@@ -26,6 +26,8 @@ def _normalized_risk_report(
         "risk_0_25_pct": 0.0025,
         "risk_0_50_pct": 0.0050,
         "risk_1_00_pct": 0.0100,
+        "risk_2_00_pct": 0.0200,
+        "risk_3_00_pct": 0.0300,
     }
     totals = {key: 0.0 for key in scenarios}
     usable = 0
