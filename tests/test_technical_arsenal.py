@@ -127,3 +127,76 @@ def test_divergence_and_dynamic_levels_are_exposed():
     assert result["divergence"]["available"] is True
     assert "ema20" in result["dynamic_support_resistance"]
     assert "ema50" in result["dynamic_support_resistance"]
+
+
+def test_shared_strat_212_bullish_continuation_is_detected():
+    rows = trending_rows()[:40]
+    rows.extend([
+        k(40, 114.0, 115.0, 113.0, 114.5),
+        k(41, 114.5, 116.0, 113.2, 115.6),
+        k(42, 115.2, 115.7, 113.5, 114.9),
+        k(43, 114.9, 116.2, 113.6, 116.0),
+    ])
+    result = build_technical_arsenal_context(
+        {"metrics": {}},
+        {"klines": rows},
+        {},
+    )
+    strat = result["strat_price_action"]
+    names = {p["name"] for p in strat["patterns"]}
+    assert "2-1-2_CONTINUATION_BULLISH" in names
+    assert strat["aggregate_bias"] == "LONG"
+    assert strat["can_create_entry"] is False
+
+
+def test_ohlc_liquidity_sweep_rejection_is_exposed_without_double_counting():
+    rows = [
+        k(i, 100.0, 101.0, 99.0, 100.1 if i % 2 else 99.9, 1000 + i)
+        for i in range(44)
+    ]
+    rows.append(k(44, 100.2, 101.8, 99.3, 100.7, 1600))
+    result = build_technical_arsenal_context(
+        {"metrics": {}},
+        {"klines": rows},
+        {},
+    )
+    sweep = result["liquidity_sweep"]
+    assert sweep["event"] == "HIGH_LIQUIDITY_SWEEP_REJECTED"
+    assert sweep["bias"] == "SHORT"
+    assert sweep["can_create_entry"] is False
+
+
+def test_amd_low_manipulation_then_distribution_up_is_detected():
+    rows = [
+        k(i, 100.0, 101.0, 99.0, 100.0, 900 + i)
+        for i in range(22)
+    ]
+    start = len(rows)
+    for j in range(14):
+        close = 100.08 if j % 2 else 99.92
+        rows.append(k(start + j, 100.0, 100.5, 99.5, close, 1000 + j))
+    i = len(rows)
+    rows.extend([
+        k(i, 100.0, 100.2, 98.7, 99.8, 1800),
+        k(i + 1, 99.8, 100.3, 99.7, 100.1, 1400),
+        k(i + 2, 100.1, 100.45, 100.0, 100.3, 1300),
+        k(i + 3, 100.3, 100.45, 100.2, 100.4, 1200),
+    ])
+    result = build_technical_arsenal_context(
+        {"metrics": {}},
+        {"klines": rows},
+        {},
+    )
+    amd = result["amd_market_story"]
+    assert amd["phase"] == "DISTRIBUTION_UP_AFTER_LOW_MANIPULATION"
+    assert amd["bias"] == "LONG"
+    assert amd["heuristic_not_institutional_intent_claim"] is True
+
+
+def test_registry_marks_existing_liquidity_orderflow_and_risk_as_covered_elsewhere():
+    reg = technical_arsenal_registry()
+    covered = set(reg["already_covered_elsewhere"])
+    assert "liquidity_target_engine" in covered
+    assert "order_flow_spot_futures_delta_orderbook" in covered
+    assert "structural_stop_position_sizing" in covered
+    assert "risk_reward_execution_math" in covered
