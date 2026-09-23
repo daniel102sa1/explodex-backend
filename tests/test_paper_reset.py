@@ -1,8 +1,10 @@
 from app.services.paper_reset import (
     MARKER_PREFIX,
+    REPAIR_PREFIX,
     _is_open_position_reset_target,
     _reset_marker_key,
 )
+from app.services.paper_portfolio import ARSENAL_DISPLAY_LABEL, ARSENAL_DISPLAY_START
 from app.services.paper_portfolio import RISK_PER_TRADE
 
 
@@ -37,3 +39,10 @@ def test_open_reset_marker_is_namespaced_from_old_baseline_reset():
 def test_current_three_percent_target_risk_is_unchanged():
     # The correction changes reset scope only; the current PAPER risk experiment stays intact.
     assert RISK_PER_TRADE == 0.03
+
+
+
+def test_new_arsenal_display_cohort_has_fixed_cutoff_without_erasing_learning():
+    assert ARSENAL_DISPLAY_LABEL == "ARSENAL_1_2_3_AMD_2026_09_23"
+    assert ARSENAL_DISPLAY_START.isoformat() == "2026-09-23T17:17:23+00:00"
+    assert REPAIR_PREFIX == "REPAIR_NEW_ARSENAL_OPEN"
