@@ -53,7 +53,7 @@ def choose_leverage(grade: str | None, fingerprint_score: float, catalyst_state:
 def size_position(balance: float, entry: float, stop: float, leverage: int) -> dict[str, float]:
     stop_distance = abs(entry - stop)
     if balance <= 0 or entry <= 0 or stop_distance <= 0:
-        return {"risk_usdt": 0.0, "quantity": 0.0, "notional": 0.0, "margin": 0.0}
+        return {"target_risk_usdt": 0.0, "risk_usdt": 0.0, "quantity": 0.0, "notional": 0.0, "margin": 0.0}
     target_risk_usdt = balance * RISK_PER_TRADE
     quantity_by_risk = target_risk_usdt / stop_distance
     max_margin = balance * 0.30
