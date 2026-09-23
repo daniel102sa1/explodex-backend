@@ -238,7 +238,11 @@ def _trade_cvd(trades: list[dict[str, Any]]) -> dict[str, Any]:
         return {"available": False}
     signed: list[float] = []
     prices: list[float] = []
-    for trade in trades:
+    ordered = sorted(
+        [dict(x) for x in trades if isinstance(x, dict)],
+        key=lambda x: _f(x.get("T") or x.get("time") or x.get("timestamp")),
+    )
+    for trade in ordered:
         price = _f(trade.get("p") or trade.get("price"))
         qty = _f(trade.get("q") or trade.get("qty"))
         notional = price * qty
@@ -679,6 +683,8 @@ def build_professional_arsenal_context(
     return {
         "version": VERSION,
         "available": True,
+        "research_only": False,
+        "score_is_probability": False,
         "policy": POLICY,
         "patterns": range_patterns,
         "vwap": vwap,
