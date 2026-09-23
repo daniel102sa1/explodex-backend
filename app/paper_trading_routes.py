@@ -14,7 +14,7 @@ from app.services.macro_cycle_persistence import macro_cycle_report
 from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
-from app.services.paper_portfolio import ensure_paper_schema, paper_history, paper_summary
+from app.services.paper_portfolio import ensure_paper_schema, paper_equity_curve, paper_history, paper_signal_history, paper_summary
 from app.services.paper_quant_risk_guard import paper_quant_risk_guard
 from app.services.quant_brain_persistence import quant_brain_report
 from app.services.paper_range_micro import range_summary, scan_all_eligible_ranges
