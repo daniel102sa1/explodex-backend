@@ -21,7 +21,7 @@ from app.services.paper_unified_heart_executor import (
 )
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v12_chati_live_monitor"
+VERSION = "paper_fast_cycle_v13_clean_arsenal_baseline"
 _LAST_FAST_CYCLE_RESULT: dict[str, Any] | None = None
 
 install_corrected_paper_sizing()
