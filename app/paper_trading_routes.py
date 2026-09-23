@@ -14,7 +14,7 @@ from app.services.macro_cycle_persistence import macro_cycle_report
 from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
 from app.services.paper_orders import paper_order_history, paper_order_stats
-from app.services.paper_portfolio import ensure_paper_schema, paper_history, paper_summary
+from app.services.paper_portfolio import ensure_paper_schema, paper_equity_curve, paper_history, paper_signal_history, paper_summary
 from app.services.paper_quant_risk_guard import paper_quant_risk_guard
 from app.services.quant_brain_persistence import quant_brain_report
 from app.services.paper_range_micro import range_summary, scan_all_eligible_ranges
@@ -170,6 +170,18 @@ async def run_trade_audit(db: AsyncSession = Depends(get_db)):
         "result": await run_paper_trade_audits(db),
         "note": "Audita stops, +1R, TP1 y manejo. No ensancha ni modifica stops vivos.",
     }
+
+
+@router.get("/equity-curve")
+async def equity_curve(limit: int = Query(default=500, ge=1, le=5000), db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return await paper_equity_curve(db, limit=limit)
+
+
+@router.get("/signal-history")
+async def signal_history(limit: int = Query(default=200, ge=1, le=1000), db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return {"version": "paper_signal_history_v1", "paper_only": True, "rows": await paper_signal_history(db, limit=limit)}
 
 
 @router.get("/history")
