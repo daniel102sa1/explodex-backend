@@ -402,9 +402,9 @@ def build_pre_move_prediction(
 
     crowding = str(pro_deriv.get("crowding") or "NONE")
     if crowding == "LONGS_CROWDED":
-        long_breakout_conflicts.append("funding/OI: longs sobrecargados")
+        long_conflicts.append("funding/OI: longs sobrecargados")
     elif crowding == "SHORTS_CROWDED":
-        short_breakdown_conflicts.append("funding/OI: shorts sobrecargados")
+        short_conflicts.append("funding/OI: shorts sobrecargados")
 
     candidates = [
         (long_breakout, "IMPULSO_LONG", "LONG", long_breakout_conf, long_conflicts),
