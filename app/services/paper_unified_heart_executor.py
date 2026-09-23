@@ -14,7 +14,7 @@ from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v5_stop_survival"
+VERSION = "paper_unified_heart_executor_v6_clean_arsenal_risk"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -386,7 +386,7 @@ async def execute_unified_heart_contracts(
             "shadow_calibration_horizon": lane.get("shadow_calibration_horizon"),
             "shadow_conviction_adjustment": lane.get("shadow_conviction_adjustment"),
             "shadow_risk_multiplier": shadow_risk_multiplier,
-            "target_account_risk_pct_before_portfolio_brakes": conviction.get("target_account_risk_pct_before_portfolio_brakes"),
+            "target_account_risk_pct_before_portfolio_brakes": round(base.RISK_PER_TRADE * 100.0 * conviction_multiplier, 4),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
             "stop_survival": survival,
             "soft_invalidation_stop": survival.get("soft_invalidation_stop") if survival_enabled else original_stop,
@@ -502,10 +502,10 @@ async def execute_unified_heart_contracts(
         "defensive_learning_enabled": defensive,
         "validation_probation": validation_probation,
         "risk_policy": {
-            "base_account_risk_pct": 1.0,
+            "base_account_risk_pct": base.RISK_PER_TRADE * 100.0,
             "min_conviction_multiplier": 0.25,
             "max_conviction_multiplier": 1.50,
-            "max_target_account_risk_pct": 1.50,
+            "max_target_account_risk_pct": base.RISK_PER_TRADE * 100.0 * 1.50,
             "defensive_cap_multiplier": DEFENSIVE_RISK_CAP,
             "probation_cap_multiplier": PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP,
             "probation_max_new_positions": PROBATION_MAX_NEW_POSITIONS,
