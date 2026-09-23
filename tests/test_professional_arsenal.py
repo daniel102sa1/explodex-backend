@@ -151,4 +151,5 @@ def test_prediction_engine_exposes_professional_arsenal_context():
     )
     assert "professional_arsenal" in prediction
     assert prediction["professional_arsenal"]["available"] is True
-    assert prediction["professional_arsenal"]["score_is_probability"] if "score_is_probability" in prediction["professional_arsenal"] else True
+    assert prediction["professional_arsenal"]["score_is_probability"] is False
+    assert prediction["professional_arsenal"]["policy"]["can_create_entry_by_itself"] is False
