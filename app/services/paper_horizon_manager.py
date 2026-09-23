@@ -8,9 +8,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services import paper_portfolio as base
+from app.services.adaptive_profit_trail import build_adaptive_profit_trail
 from app.services.binance import binance_client
 
-VERSION = "paper_horizon_manager_v4_pre_tp1_protection"
+VERSION = "paper_horizon_manager_v5_adaptive_profit_trailing"
 DEFAULT_MAX_HOLD_MINUTES = 120
 PROFIT_LOCK_COST_BUFFER_RATE = 0.0018
 PRE_TP1_ARM_PROGRESS = 0.85
@@ -290,7 +291,9 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
             klines = []
 
         start_ms = int(opened_at.timestamp() * 1000)
-        future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
+        now_ms = int(now.timestamp() * 1000)
+        completed = [k for k in klines if len(k) >= 7 and int(k[0]) >= start_ms and int(k[6]) < now_ms]
+        future = list(completed)
         exit_price = None
         exit_reason = None
         hard_stop = _f(row.get("stop_loss"))
@@ -303,12 +306,16 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
         tp1 = _f(profit_lock.get("tp1"))
         tp2 = _f(profit_lock.get("tp2"))
         lock_stage = str(profit_lock.get("stage") or "INITIAL")
-        resume_after_ms = int(_f(profit_lock.get("last_milestone_candle_ms")))
-        if lock_stage != "INITIAL" and resume_after_ms > 0:
-            # The tightened stop did not exist before its milestone candle.
-            # Resume after activation so we never retroactively stop a trade.
+        resume_after_ms = int(max(
+            _f(profit_lock.get("last_milestone_candle_ms")),
+            _f(profit_lock.get("stop_active_after_candle_ms")),
+        ))
+        if resume_after_ms > 0:
+            # A tightened stop becomes active only after the candle that created it.
+            # Never replay the new stop against older candles.
             future = [k for k in future if len(k) >= 5 and int(k[0]) > resume_after_ms]
         lock_changed = False
+        adaptive_before = _d(profit_lock.get("adaptive_trailing"))
 
         for candle in future:
             high, low, close = _f(candle[2]), _f(candle[3]), _f(candle[4])
@@ -323,6 +330,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                 survival_enabled=survival_enabled,
             )
             if exit_price is not None:
+                adaptive_active = bool(adaptive_before.get("armed"))
                 if lock_stage == "PRE_TP1_PROTECTED" and exit_reason == "HARD_STOP":
                     exit_reason = "PRE_TP1_PROTECT_STOP"
                 elif lock_stage == "PRE_TP1_PROTECTED" and exit_reason == "AMBIGUOUS_HARD_STOP":
@@ -331,6 +339,10 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     exit_reason = "PROFIT_LOCK_STOP"
                 elif lock_stage != "INITIAL" and exit_reason == "AMBIGUOUS_HARD_STOP":
                     exit_reason = "AMBIGUOUS_PROFIT_LOCK_STOP"
+                elif adaptive_active and exit_reason == "HARD_STOP":
+                    exit_reason = "ADAPTIVE_TRAIL_STOP"
+                elif adaptive_active and exit_reason == "AMBIGUOUS_HARD_STOP":
+                    exit_reason = "AMBIGUOUS_ADAPTIVE_TRAIL_STOP"
                 break
 
             if not profit_lock_enabled:
@@ -365,6 +377,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                             "rule_active": "NEAR_TP1_REJECTION_PROTECT_RISK",
                             "pre_tp1_signal": pre_tp1,
                             "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
+                            "stop_active_after_candle_ms": int(candle[0]) if len(candle) else None,
                         })
                         continue
 
@@ -386,6 +399,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     "active_stop": hard_stop,
                     "rule_active": "TP2_REACHED_STOP_AT_TP1",
                     "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
+                    "stop_active_after_candle_ms": int(candle[0]) if len(candle) else None,
                 })
             elif (
                 lock_stage in {"INITIAL", "PRE_TP1_PROTECTED"}
@@ -407,12 +421,56 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                     "active_stop": hard_stop,
                     "rule_active": "TP1_REACHED_BREAKEVEN_PLUS_COST_BUFFER",
                     "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
+                    "stop_active_after_candle_ms": int(candle[0]) if len(candle) else None,
                 })
 
-        if profit_lock_enabled and lock_stage != str(_d(metadata.get("profit_lock")).get("stage") or "INITIAL"):
+        # Mature winners get a volatility/structure trail before TP1 instead
+        # of leaving almost all open profit exposed until the final target.
+        # The proposed stop uses only completed candles and is active next candle.
+        adaptive_changed = False
+        if exit_price is None and profit_lock_enabled and completed:
+            prior_adaptive = _d(profit_lock.get("adaptive_trailing"))
+            initial_hard_stop = _f(
+                metadata.get("initial_hard_stop"),
+                _f(metadata.get("hard_stop"), hard_stop),
+            )
+            adaptive = build_adaptive_profit_trail(
+                side=side,
+                entry=entry,
+                initial_stop=initial_hard_stop,
+                current_stop=hard_stop,
+                tp1=tp1 if tp1 > 0 else tp_value,
+                candles=completed,
+                strategy_mode=str(metadata.get("strategy_mode") or ""),
+                prior_mfe_price=_f(prior_adaptive.get("mfe_price")) or None,
+                cost_buffer_rate=PROFIT_LOCK_COST_BUFFER_RATE,
+            )
+            profit_lock["adaptive_trailing"] = adaptive
+            if adaptive.get("changed"):
+                new_stop = _f(adaptive.get("new_stop"), hard_stop)
+                if new_stop != hard_stop:
+                    hard_stop = new_stop
+                    adaptive_changed = True
+                    lock_changed = True
+                    activation_ms = int(completed[-1][0])
+                    profit_lock["active_stop"] = hard_stop
+                    profit_lock["rule_active"] = "ADAPTIVE_CHANDELIER_ATR_PLUS_PIVOT"
+                    profit_lock["stop_active_after_candle_ms"] = activation_ms
+
+        original_profit_lock = _d(metadata.get("profit_lock"))
+        metadata_needs_update = (
+            profit_lock_enabled
+            and (
+                lock_changed
+                or adaptive_changed
+                or profit_lock != original_profit_lock
+            )
+        )
+        if metadata_needs_update:
             metadata["profit_lock"] = profit_lock
             metadata["hard_stop"] = hard_stop
             metadata["profit_lock_never_widens_stop"] = True
+            metadata["adaptive_profit_trailing_enabled"] = True
             await db.execute(text("""
                 UPDATE paper_positions
                 SET stop_loss=:stop_loss, metadata=CAST(:metadata AS JSONB)
