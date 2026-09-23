@@ -17,6 +17,7 @@ from app.services.market_context import market_context
 from app.services.news_context import news_context_for_symbol
 from app.services.opportunities import calibration_by_score, ranked_opportunities
 from app.services.paper_time_management import manage_open_paper_trades_with_time
+from app.services.paper_reset import maybe_reset_paper_baseline
 from app.services.paper_trading import paper_performance, sync_ready_signals
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
@@ -30,6 +31,7 @@ READY_POLICY = "ExplodeX Heart: guarded prediction + fixed thesis + no_chase + r
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await ensure_runtime_schema()
+    app.state.paper_reset_result = await maybe_reset_paper_baseline()
     tasks = await start_runtime()
     app.state.runtime_tasks = tasks
     try:

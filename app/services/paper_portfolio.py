@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.binance import binance_client
 
 STARTING_BALANCE = 1000.0
-RISK_PER_TRADE = 0.01
+RISK_PER_TRADE = 0.03
 MAX_OPEN_POSITIONS = 3
 TAKER_FEE_RATE = 0.0005
 SLIPPAGE_RATE = 0.0002
@@ -53,16 +53,18 @@ def choose_leverage(grade: str | None, fingerprint_score: float, catalyst_state:
 def size_position(balance: float, entry: float, stop: float, leverage: int) -> dict[str, float]:
     stop_distance = abs(entry - stop)
     if balance <= 0 or entry <= 0 or stop_distance <= 0:
-        return {"risk_usdt": 0.0, "quantity": 0.0, "notional": 0.0, "margin": 0.0}
-    risk_usdt = balance * RISK_PER_TRADE
-    quantity_by_risk = risk_usdt / stop_distance
+        return {"target_risk_usdt": 0.0, "risk_usdt": 0.0, "quantity": 0.0, "notional": 0.0, "margin": 0.0}
+    target_risk_usdt = balance * RISK_PER_TRADE
+    quantity_by_risk = target_risk_usdt / stop_distance
     max_margin = balance * 0.30
     max_notional = max_margin * max(1, leverage)
     quantity = min(quantity_by_risk, max_notional / entry)
     notional = quantity * entry
     margin = notional / max(1, leverage)
+    actual_risk_usdt = quantity * stop_distance
     return {
-        "risk_usdt": round(risk_usdt, 6),
+        "target_risk_usdt": round(target_risk_usdt, 6),
+        "risk_usdt": round(actual_risk_usdt, 6),
         "quantity": round(quantity, 10),
         "notional": round(notional, 6),
         "margin": round(margin, 6),

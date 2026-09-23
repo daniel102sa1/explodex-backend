@@ -103,13 +103,13 @@ def test_mixed_higher_timeframes_do_not_force_swing_entry():
 
 def test_wider_structural_stop_reduces_quantity_and_reports_actual_risk():
     balance = 1000.0
-    narrow = corrected_size_position(balance, 100.0, 99.0, 2)
-    wide = corrected_size_position(balance, 100.0, 95.0, 2)
+    narrow = corrected_size_position(balance, 100.0, 99.0, 4)
+    wide = corrected_size_position(balance, 100.0, 95.0, 4)
     assert wide["quantity"] < narrow["quantity"]
-    assert wide["risk_usdt"] <= 10.0
+    assert wide["risk_usdt"] <= 30.0
     assert wide["risk_usdt"] == round(wide["quantity"] * 5.0, 6)
     swing_risk = wide["risk_usdt"] * 0.5
-    assert swing_risk <= 5.0
+    assert swing_risk <= 15.0
 
 
 def test_legacy_base_sizing_is_replaced_at_runtime_by_patch():
