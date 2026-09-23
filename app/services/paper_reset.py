@@ -7,67 +7,40 @@ from typing import Any
 from sqlalchemy import text
 
 from app.database import engine
-from app.services.paper_portfolio import STARTING_BALANCE
 
-RESET_ENV = "EXPLODEX_PAPER_RESET_TOKEN"
+OPEN_RESET_ENV = "EXPLODEX_OPEN_PAPER_RESET_TOKEN"
 MARKER_TABLE = "system_reset_markers"
-
-_EXACT_TABLES = {
-    "signals",
-    "alerts",
-    "trades",
-    "trade_events",
-    "scanner_runs",
-    "heart_shadow_forecasts",
-    "trade_theses",
-}
-
-_PREFIXES = (
-    "paper_",
-    "validation_",
-    "edge_",
-    "verdict_",
-    "shadow_",
-    "formula_",
-    "entry_",
-    "pre_event_",
-    "structure_",
-    "trajectory_",
-    "horizon_",
-    "macro_cycle_",
-    "microstructure_",
-    "quant_",
-    "market_breadth_",
-    "context_meta_",
-    "context_veto_",
-    "rolling_context_",
-    "plan_lifecycle_",
-    "tp1_",
-    "selective_precision_",
-    "fusion_edge_",
-    "runner_",
-    "event_risk_",
-    "elliott_",
-)
+MARKER_PREFIX = "OPEN_PAPER_ONLY"
 
 
-def _is_resettable_table(name: str) -> bool:
-    value = str(name or "").strip().lower()
-    if not value or value == MARKER_TABLE:
-        return False
-    return value in _EXACT_TABLES or value.startswith(_PREFIXES)
+def _reset_marker_key(token: str) -> str:
+    return f"{MARKER_PREFIX}::{str(token or '').strip()}"
 
 
-async def maybe_reset_paper_baseline() -> dict[str, Any]:
-    """One-shot destructive PAPER reset, keyed by an explicit environment token.
+def _is_open_position_reset_target(name: str) -> bool:
+    """Guardrail: an open-position reset may touch only the canonical PAPER ledger."""
+    return str(name or "").strip().lower() == "paper_positions"
 
-    This is intentionally startup-only so the reset occurs before scanners and
-    PAPER execution resume. The marker table is preserved so the same token is
-    idempotent across redeploys.
+
+async def maybe_reset_open_paper_positions() -> dict[str, Any]:
+    """One-shot reset of *open* canonical PAPER positions only.
+
+    This deliberately preserves:
+    - CLOSED PAPER history and realized PnL
+    - account balances / fees
+    - signals and scanner history
+    - VNext / shadow / formula / verdict / edge learning
+    - all market and research tables
+
+    Open positions are marked CANCELLED instead of being hard-deleted. That makes
+    them disappear from OPEN and CLOSED performance views while preserving the
+    signal_id tombstone so the same old signal cannot be reopened immediately.
     """
-    token = str(os.getenv(RESET_ENV, "") or "").strip()
+    token = str(os.getenv(OPEN_RESET_ENV, "") or "").strip()
     if not token:
-        return {"requested": False, "applied": False, "reason": "no_reset_token"}
+        return {"requested": False, "applied": False, "reason": "no_open_reset_token"}
+
+    marker_key = _reset_marker_key(token)
 
     async with engine.begin() as conn:
         await conn.execute(text(f"""
@@ -77,63 +50,76 @@ async def maybe_reset_paper_baseline() -> dict[str, Any]:
                 details JSONB NOT NULL DEFAULT '{{}}'::jsonb
             )
         """))
+
         seen = await conn.execute(
             text(f"SELECT 1 FROM {MARKER_TABLE} WHERE token=:token"),
-            {"token": token},
+            {"token": marker_key},
         )
         if seen.scalar_one_or_none():
-            return {"requested": True, "applied": False, "reason": "token_already_applied"}
+            return {
+                "requested": True,
+                "applied": False,
+                "reason": "open_reset_token_already_applied",
+            }
 
-        rows = (
-            await conn.execute(
-                text("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename")
-            )
-        ).scalars().all()
-        tables = [str(name) for name in rows if _is_resettable_table(str(name))]
+        positions_exists = await conn.execute(text("SELECT to_regclass('public.paper_positions')"))
+        if not positions_exists.scalar_one_or_none():
+            return {
+                "requested": True,
+                "applied": False,
+                "reason": "paper_positions_not_ready",
+            }
 
-        counts: dict[str, int] = {}
-        for table in tables:
-            # table names come only from pg_tables + strict prefix/exact allowlist.
-            result = await conn.execute(text(f'SELECT COUNT(*) FROM "{table}"'))
-            counts[table] = int(result.scalar_one() or 0)
+        open_before = int(
+            (
+                await conn.execute(
+                    text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'")
+                )
+            ).scalar_one()
+            or 0
+        )
 
-        if tables:
-            quoted = ", ".join(f'"{name}"' for name in tables)
-            await conn.execute(text(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE"))
-
-        paper_accounts_exists = await conn.execute(text("SELECT to_regclass('public.paper_accounts')"))
-        if paper_accounts_exists.scalar_one_or_none():
-            await conn.execute(
-                text("""
-                    INSERT INTO paper_accounts (
-                        id, starting_balance, cash_balance, realized_pnl, total_fees, created_at, updated_at
-                    ) VALUES (1, :balance, :balance, 0, 0, NOW(), NOW())
-                    ON CONFLICT (id) DO UPDATE SET
-                        starting_balance=EXCLUDED.starting_balance,
-                        cash_balance=EXCLUDED.cash_balance,
-                        realized_pnl=0,
-                        total_fees=0,
-                        updated_at=NOW()
-                """),
-                {"balance": STARTING_BALANCE},
-            )
+        updated = await conn.execute(
+            text("""
+                UPDATE paper_positions
+                SET
+                    status='CANCELLED',
+                    closed_at=COALESCE(closed_at, NOW()),
+                    exit_reason='RESET_OPEN_ONLY',
+                    metadata=COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                        'open_reset_cancelled', TRUE,
+                        'open_reset_at', NOW()
+                    )
+                WHERE status='OPEN'
+            """)
+        )
+        cancelled = int(updated.rowcount or 0)
 
         details = {
-            "starting_balance": STARTING_BALANCE,
-            "tables_reset": tables,
-            "rows_removed": counts,
-            "mode": "PAPER_ONLY_CLEAN_ARSENAL_BASELINE",
+            "mode": "OPEN_PAPER_POSITIONS_ONLY",
+            "canonical_table": "paper_positions",
+            "open_before": open_before,
+            "positions_cancelled": cancelled,
+            "closed_history_preserved": True,
+            "account_preserved": True,
+            "signals_preserved": True,
+            "learning_preserved": True,
         }
         await conn.execute(
             text(f"INSERT INTO {MARKER_TABLE} (token, details) VALUES (:token, CAST(:details AS JSONB))"),
-            {"token": token, "details": json.dumps(details)},
+            {"token": marker_key, "details": json.dumps(details)},
         )
 
     return {
         "requested": True,
         "applied": True,
-        "reason": "clean_paper_baseline_created",
-        "starting_balance": STARTING_BALANCE,
-        "tables_reset": tables,
-        "rows_removed": counts,
+        "reason": "open_paper_positions_cancelled",
+        **details,
     }
+
+
+# Backward-compatible import name. Its behavior is intentionally no longer a
+# broad baseline wipe. Keeping the alias prevents stale callers from restoring
+# the dangerous semantics accidentally.
+async def maybe_reset_paper_baseline() -> dict[str, Any]:
+    return await maybe_reset_open_paper_positions()
