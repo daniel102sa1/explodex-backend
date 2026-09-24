@@ -14,7 +14,7 @@ from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v7_safe_adaptive_leverage"
+VERSION = "paper_unified_heart_executor_v8_horizon_stop_guard"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -325,6 +325,9 @@ async def execute_unified_heart_contracts(
             entry=fill,
             btc_context=btc_overlay,
         )
+        if bool(survival.get("entry_should_be_rejected")):
+            reject(str(survival.get("rejection_reason") or survival.get("reason") or "horizon_stop_not_viable"))
+            continue
         survival_enabled = bool(survival.get("enabled"))
         hard_stop = _f(survival.get("hard_stop"), original_stop) if survival_enabled else original_stop
         target = _f(survival.get("target_price"), original_target) if survival_enabled else original_target
