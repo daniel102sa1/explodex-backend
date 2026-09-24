@@ -6,7 +6,7 @@ from typing import Any
 from app.services.impulse_pullback_confirmation import build_impulse_pullback_confirmation
 from app.services.price_action_pattern_vision import detect_price_action_patterns
 
-VERSION = "professional_confluence_arsenal_v3_impulse_pullback"
+VERSION = "professional_confluence_arsenal_v4_failopen_shadow_layers"
 POLICY = {
     "indicators_are_confirmation_not_standalone_triggers": True,
     "can_create_entry_by_itself": False,
@@ -668,8 +668,37 @@ def build_professional_arsenal_context(
     futures_cvd = _trade_cvd(snapshot.get("agg_trades") or [])
     spot_cvd = _trade_cvd(snapshot.get("spot_agg_trades") or [])
     range_patterns = _range_patterns(rows)
-    price_action = detect_price_action_patterns(rows)
-    impulse_pullback = build_impulse_pullback_confirmation(rows)
+    try:
+        price_action = detect_price_action_patterns(rows)
+    except Exception as exc:
+        price_action = {
+            "version": "price_action_pattern_vision_unavailable",
+            "available": False,
+            "reason": "shadow_layer_runtime_error",
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            "policy": {
+                "paper_only": True,
+                "shadow_only": True,
+                "can_create_entry": False,
+                "can_raise_leverage": False,
+            },
+        }
+    try:
+        impulse_pullback = build_impulse_pullback_confirmation(rows)
+    except Exception as exc:
+        impulse_pullback = {
+            "version": "impulse_pullback_confirmation_unavailable",
+            "available": False,
+            "phase": "UNAVAILABLE",
+            "reason": "shadow_layer_runtime_error",
+            "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            "policy": {
+                "paper_only": True,
+                "can_create_entry_by_itself": False,
+                "can_raise_leverage_by_itself": False,
+                "do_not_chase": True,
+            },
+        }
     derivatives = _derivatives_context(metrics, snapshot.get("premium") or {}, cg)
     absorption = _absorption_exhaustion(metrics, futures_cvd, spot_cvd)
     layers = _layer_scores(
@@ -754,6 +783,7 @@ def build_professional_arsenal_context(
             "Professional confluence layer: price/structure/liquidity/volume/derivatives first; "
             "geometric chart/candlestick/harmonic patterns are shadow evidence until confirmed; "
             "impulse-pullback-reaction sequencing provides bounded timing evidence and never authorizes a trade alone; "
+            "shadow pattern/timing layers fail open as UNAVAILABLE instead of taking down the core analysis endpoint; "
             "oscillators are confirmation only. No single indicator or pattern can authorize a trade."
         ),
     }
