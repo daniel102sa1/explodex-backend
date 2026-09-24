@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import paper_portfolio as base
 from app.services.binance import binance_client
 
-VERSION = "paper_horizon_manager_v4_pre_tp1_protection"
+VERSION = "paper_horizon_manager_v5_immutable_structural_stop"
 DEFAULT_MAX_HOLD_MINUTES = 120
 PROFIT_LOCK_COST_BUFFER_RATE = 0.0018
 PRE_TP1_ARM_PROGRESS = 0.85
@@ -293,22 +293,41 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
         future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
         exit_price = None
         exit_reason = None
-        hard_stop = _f(row.get("stop_loss"))
+        # The stop used for PAPER execution is frozen at entry. Older open rows
+        # may have been tightened by the previous profit-lock engine, so restore
+        # their original structural stop from metadata when available.
+        row_stop = _f(row.get("stop_loss"))
+        hard_stop = _f(metadata.get("initial_hard_stop"), row_stop)
         soft_stop = _f(metadata.get("soft_invalidation_stop"), hard_stop)
         tp_value = _f(row.get("take_profit"))
         side = str(row.get("side") or "").upper()
         entry = _f(row.get("entry_price"))
+
+        stop_repaired = abs(row_stop - hard_stop) > max(1e-12, abs(hard_stop) * 1e-10)
         profit_lock = _d(metadata.get("profit_lock"))
-        profit_lock_enabled = bool(profit_lock.get("enabled"))
-        tp1 = _f(profit_lock.get("tp1"))
-        tp2 = _f(profit_lock.get("tp2"))
-        lock_stage = str(profit_lock.get("stage") or "INITIAL")
-        resume_after_ms = int(_f(profit_lock.get("last_milestone_candle_ms")))
-        if lock_stage != "INITIAL" and resume_after_ms > 0:
-            # The tightened stop did not exist before its milestone candle.
-            # Resume after activation so we never retroactively stop a trade.
-            future = [k for k in future if len(k) >= 5 and int(k[0]) > resume_after_ms]
-        lock_changed = False
+        if bool(profit_lock.get("enabled")) or str(profit_lock.get("stage") or "") != "IMMUTABLE_STRUCTURAL_STOP":
+            profit_lock.update({
+                "enabled": False,
+                "stage": "IMMUTABLE_STRUCTURAL_STOP",
+                "active_stop": hard_stop,
+                "rule": "NEVER_MOVE_STOP_AFTER_ENTRY",
+            })
+            metadata["profit_lock"] = profit_lock
+            metadata["hard_stop"] = hard_stop
+            metadata["stop_policy"] = "IMMUTABLE_STRUCTURAL_STOP"
+            metadata["stop_can_tighten_after_entry"] = False
+            stop_repaired = True
+
+        if stop_repaired:
+            await db.execute(text("""
+                UPDATE paper_positions
+                SET stop_loss=:stop_loss, metadata=CAST(:metadata AS JSONB)
+                WHERE id=:id AND status='OPEN'
+            """), {
+                "id": row["id"],
+                "stop_loss": hard_stop,
+                "metadata": json.dumps(metadata),
+            })
 
         for candle in future:
             high, low, close = _f(candle[2]), _f(candle[3]), _f(candle[4])
@@ -323,105 +342,7 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                 survival_enabled=survival_enabled,
             )
             if exit_price is not None:
-                if lock_stage == "PRE_TP1_PROTECTED" and exit_reason == "HARD_STOP":
-                    exit_reason = "PRE_TP1_PROTECT_STOP"
-                elif lock_stage == "PRE_TP1_PROTECTED" and exit_reason == "AMBIGUOUS_HARD_STOP":
-                    exit_reason = "AMBIGUOUS_PRE_TP1_PROTECT_STOP"
-                elif lock_stage != "INITIAL" and exit_reason == "HARD_STOP":
-                    exit_reason = "PROFIT_LOCK_STOP"
-                elif lock_stage != "INITIAL" and exit_reason == "AMBIGUOUS_HARD_STOP":
-                    exit_reason = "AMBIGUOUS_PROFIT_LOCK_STOP"
                 break
-
-            if not profit_lock_enabled:
-                continue
-
-            # Before TP1, protect an almost-completed move only after a completed
-            # candle confirms a meaningful rejection. Nearness alone never moves
-            # the stop. The new stop is active from the NEXT candle.
-            if lock_stage == "INITIAL" and tp1 > 0:
-                pre_tp1 = pre_tp1_protection_signal(
-                    side=side,
-                    entry=entry,
-                    tp1=tp1,
-                    high=high,
-                    low=low,
-                    close=close,
-                )
-                if pre_tp1.get("triggered") and not _touched(side, high, low, tp1):
-                    new_stop = pre_tp1_protective_stop(
-                        side=side,
-                        entry=entry,
-                        current_stop=hard_stop,
-                        close=close,
-                    )
-                    if new_stop != hard_stop:
-                        hard_stop = new_stop
-                        lock_changed = True
-                        lock_stage = "PRE_TP1_PROTECTED"
-                        profit_lock.update({
-                            "stage": lock_stage,
-                            "active_stop": hard_stop,
-                            "rule_active": "NEAR_TP1_REJECTION_PROTECT_RISK",
-                            "pre_tp1_signal": pre_tp1,
-                            "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
-                        })
-                        continue
-
-            # Milestone tightening becomes active only for later candles. We do
-            # not assume whether TP and the tighter stop happened first inside
-            # the same OHLC candle.
-            if (
-                lock_stage not in {"TP2_LOCKED"}
-                and _target_beyond(side, tp_value, tp2)
-                and _touched(side, high, low, tp2)
-            ):
-                new_stop = tp2_profit_lock_stop(side=side, tp1=tp1, current_stop=hard_stop)
-                if new_stop != hard_stop:
-                    hard_stop = new_stop
-                    lock_changed = True
-                lock_stage = "TP2_LOCKED"
-                profit_lock.update({
-                    "stage": lock_stage,
-                    "active_stop": hard_stop,
-                    "rule_active": "TP2_REACHED_STOP_AT_TP1",
-                    "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
-                })
-            elif (
-                lock_stage in {"INITIAL", "PRE_TP1_PROTECTED"}
-                and _target_beyond(side, tp_value, tp1)
-                and _touched(side, high, low, tp1)
-            ):
-                new_stop = breakeven_profit_lock_stop(
-                    side=side,
-                    entry=entry,
-                    tp1=tp1,
-                    current_stop=hard_stop,
-                )
-                if new_stop != hard_stop:
-                    hard_stop = new_stop
-                    lock_changed = True
-                lock_stage = "TP1_LOCKED"
-                profit_lock.update({
-                    "stage": lock_stage,
-                    "active_stop": hard_stop,
-                    "rule_active": "TP1_REACHED_BREAKEVEN_PLUS_COST_BUFFER",
-                    "last_milestone_candle_ms": int(candle[0]) if len(candle) else None,
-                })
-
-        if profit_lock_enabled and lock_stage != str(_d(metadata.get("profit_lock")).get("stage") or "INITIAL"):
-            metadata["profit_lock"] = profit_lock
-            metadata["hard_stop"] = hard_stop
-            metadata["profit_lock_never_widens_stop"] = True
-            await db.execute(text("""
-                UPDATE paper_positions
-                SET stop_loss=:stop_loss, metadata=CAST(:metadata AS JSONB)
-                WHERE id=:id AND status='OPEN'
-            """), {
-                "id": row["id"],
-                "stop_loss": hard_stop,
-                "metadata": json.dumps(metadata),
-            })
 
         if exit_price is None and age_minutes >= max_hold:
             if future:
@@ -473,7 +394,8 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
             "stop_survival_enabled": survival_enabled,
             "soft_invalidation_stop": soft_stop,
             "hard_stop": hard_stop,
-            "profit_lock_stage": lock_stage,
+            "profit_lock_stage": "IMMUTABLE_STRUCTURAL_STOP",
+            "stop_policy": "IMMUTABLE_STRUCTURAL_STOP",
             "confirmation_minutes": confirmation_minutes if survival_enabled else None,
         })
 
