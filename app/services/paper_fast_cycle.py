@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,17 +15,15 @@ from app.services.paper_regime_router import current_paper_regime
 from app.services.paper_signal_bridge import ensure_signal_fk, heart_diagnostics
 from app.services.paper_structure_retest_executor import execute_structure_retest_contracts
 from app.services.paper_trade_auditor import run_paper_trade_audits
-from app.services.paper_sizing_patch import install_corrected_paper_sizing
 from app.services.paper_unified_heart_executor import (
     PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP,
     execute_unified_heart_contracts,
 )
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v13_clean_arsenal_baseline"
+VERSION = "paper_fast_cycle_v14_single_authority_hardened"
 _LAST_FAST_CYCLE_RESULT: dict[str, Any] | None = None
-
-install_corrected_paper_sizing()
+_PAPER_CYCLE_LOCK = asyncio.Lock()
 
 
 def _probation_risk_multiplier(base_non_quant_multiplier: float) -> float:
@@ -40,6 +39,26 @@ def latest_fast_cycle_result() -> dict[str, Any] | None:
 
 
 async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
+    """Serialize canonical PAPER execution inside this process.
+
+    Runtime scheduling and compatibility API calls share this same lock so a
+    manual request cannot race the automatic Heart cycle and exceed portfolio
+    limits or double-process exits.
+    """
+    if _PAPER_CYCLE_LOCK.locked():
+        return {
+            "version": VERSION,
+            "opened": 0,
+            "closed": 0,
+            "reason": "paper_cycle_already_running",
+            "single_paper_authority": True,
+            "authority": "UNIFIED_HEART_CONTRACT_ONLY",
+        }
+    async with _PAPER_CYCLE_LOCK:
+        return await _run_fast_paper_cycle_unlocked(db)
+
+
+async def _run_fast_paper_cycle_unlocked(db: AsyncSession) -> dict[str, Any]:
     """Visible PAPER portfolio driven only by lanes emitted by the unified Heart."""
     global _LAST_FAST_CYCLE_RESULT
     await ensure_validation_schema(db)
