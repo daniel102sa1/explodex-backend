@@ -14,7 +14,7 @@ from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v6_clean_arsenal_risk"
+VERSION = "paper_unified_heart_executor_v7_safe_adaptive_leverage"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -71,12 +71,20 @@ def _sarpon_leverage_policy(
     conviction: dict[str, Any],
     defensive: bool,
     btc_overlay: dict[str, Any] | None,
+    quant_multiplier: float = 1.0,
+    council_multiplier: float = 1.0,
+    shadow_risk_multiplier: float = 1.0,
+    btc_side_multiplier: float = 1.0,
 ) -> dict[str, Any]:
-    """Allow only a small PAPER leverage step-up under full current confluence.
+    """Choose PAPER leverage from confluence without increasing stop-risk.
 
-    This never raises the account risk budget; sizing still comes from the hard
-    stop and risk multipliers. Higher leverage can only reduce margin required
-    to express the already-approved risk size.
+    Leverage is a margin-efficiency tool only. Position quantity is still sized
+    from the immutable structural stop and then multiplied by the portfolio,
+    BTC, quant, council and historical-calibration brakes.
+
+    x20 is reserved for the strongest tactical PAPER setups only. Any defensive,
+    probation, BTC conflict, weak quant/council vote or immature/negative memory
+    keeps leverage well below that ceiling.
     """
     base_cap = int(max(1, min(4, _f(lane.get("max_leverage"), 2.0))))
     monitor = _d(heart.get("chati_sarpon_612_monitor"))
@@ -86,38 +94,56 @@ def _sarpon_leverage_policy(
     classic_green = str(classic.get("stage") or "") == "GREEN_CONFIRMATION"
     no_contradictions = not list(monitor.get("contradictions") or [])
     tier = str(conviction.get("tier") or "")
-    conviction_high = tier in {"HIGH", "MAX_CONVICTION"}
+    horizon_conflict = bool(conviction.get("horizon_conflict"))
     btc = _d(btc_overlay)
-    btc_safe = str(btc.get("stress") or "NORMAL").upper() not in {"EXTREME", "SHOCK"} and not bool(_d(monitor.get("btc")).get("hard_conflict"))
-
-    eligible = bool(
+    btc_safe = (
+        str(btc.get("stress") or "NORMAL").upper() not in {"EXTREME", "SHOCK"}
+        and not bool(_d(monitor.get("btc")).get("hard_conflict"))
+        and btc_side_multiplier >= 0.85
+    )
+    quality_safe = quant_multiplier >= 0.85 and council_multiplier >= 0.85 and shadow_risk_multiplier >= 0.85
+    full_green = bool(
         not defensive
         and lane_name in {"TACTICAL", "SWING_PAPER"}
         and phase_green
         and classic_green
         and no_contradictions
-        and conviction_high
+        and not horizon_conflict
         and btc_safe
+        and quality_safe
     )
-    if eligible:
-        boosted_cap = min(4, base_cap + 1)
-        reason = "full_sarpon_chati_612_confluence"
-    else:
-        boosted_cap = base_cap
-        reason = "base_cap"
+
+    selected = base_cap
+    reason = "base_cap"
+    tier_name = "BASE"
+
+    if full_green and lane_name == "TACTICAL" and tier == "MAX_CONVICTION":
+        selected, reason, tier_name = 20, "max_conviction_full_arsenal", "MAX_20X"
+    elif full_green and lane_name == "TACTICAL" and tier == "HIGH":
+        selected, reason, tier_name = 10, "high_conviction_full_arsenal", "HIGH_10X"
+    elif full_green and lane_name == "SWING_PAPER" and tier in {"HIGH", "MAX_CONVICTION", "HIGH_SWING_CAPPED"}:
+        selected, reason, tier_name = 8, "swing_full_arsenal", "SWING_8X"
+    elif full_green and tier in {"NORMAL_PLUS", "NORMAL"}:
+        selected, reason, tier_name = max(base_cap, 5), "confirmed_arsenal", "CONFIRMED_5X"
 
     return {
-        "eligible": eligible,
+        "eligible": full_green,
         "base_cap": base_cap,
-        "selected_leverage": boosted_cap,
+        "selected_leverage": int(max(1, min(20, selected))),
+        "tier": tier_name,
         "reason": reason,
         "risk_budget_unchanged": True,
+        "paper_only": True,
+        "max_leverage": 20,
         "requires": {
             "chati_sarpon_612_green": phase_green,
             "sarpon_murphy_nison_green": classic_green,
             "no_contradictions": no_contradictions,
-            "conviction_high": conviction_high,
+            "no_horizon_conflict": not horizon_conflict,
             "btc_safe": btc_safe,
+            "quant_safe": quant_multiplier >= 0.85,
+            "council_safe": council_multiplier >= 0.85,
+            "history_calibration_safe": shadow_risk_multiplier >= 0.85,
             "not_defensive": not defensive,
         },
     }
@@ -322,6 +348,10 @@ async def execute_unified_heart_contracts(
         )
         conviction_multiplier = max(0.25, min(1.50, _f(conviction.get("risk_budget_multiplier"), 0.25)))
 
+        shadow_risk_multiplier = _shadow_calibration_risk_multiplier(
+            lane,
+            validation_probation=validation_probation,
+        )
         leverage_policy = _sarpon_leverage_policy(
             lane_name=lane_name,
             lane=lane,
@@ -329,6 +359,10 @@ async def execute_unified_heart_contracts(
             conviction=conviction,
             defensive=defensive,
             btc_overlay=btc_overlay,
+            quant_multiplier=quant_multiplier,
+            council_multiplier=council_multiplier,
+            shadow_risk_multiplier=shadow_risk_multiplier,
+            btc_side_multiplier=btc_side_multiplier,
         )
         lane_leverage = 1 if validation_probation else int(leverage_policy["selected_leverage"])
         sizing = base.size_position(balance, fill, hard_stop, lane_leverage)
@@ -337,10 +371,6 @@ async def execute_unified_heart_contracts(
             portfolio_multiplier = min(portfolio_multiplier, PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP)
         elif defensive:
             portfolio_multiplier = min(portfolio_multiplier, DEFENSIVE_RISK_CAP)
-        shadow_risk_multiplier = _shadow_calibration_risk_multiplier(
-            lane,
-            validation_probation=validation_probation,
-        )
         scale = (
             conviction_multiplier
             * portfolio_multiplier
@@ -394,19 +424,42 @@ async def execute_unified_heart_contracts(
             "initial_hard_stop": hard_stop,
             "stop_survival_enabled": survival_enabled,
             "profit_lock": {
-                "enabled": True,
-                "stage": "INITIAL",
+                "enabled": False,
+                "stage": "IMMUTABLE_STRUCTURAL_STOP",
                 "tp1": _f(lane.get("tp1")),
                 "tp2": _f(lane.get("tp2")),
                 "tp3": _f(lane.get("tp3")),
                 "final_target": target,
-                "after_tp1": "MOVE_STOP_TO_BREAKEVEN_PLUS_COST_BUFFER_ON_NEXT_CANDLE",
-                "after_tp2": "MOVE_STOP_TO_TP1_ON_NEXT_CANDLE",
-                "never_widen_stop": True,
-                "same_candle_sequence_is_not_assumed": True,
+                "rule": "NEVER_MOVE_STOP_AFTER_ENTRY",
+                "reason": "User-facing PAPER keeps the pre-entry structural stop fixed; TP milestones do not rewrite SL.",
+            },
+            "frozen_plan": {
+                "entry": fill,
+                "side": side,
+                "structural_stop": hard_stop,
+                "target": target,
+                "tp1": _f(lane.get("tp1")),
+                "tp2": _f(lane.get("tp2")),
+                "tp3": _f(lane.get("tp3")),
+                "leverage": lane_leverage,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "arsenal_memory_snapshot": {
+                "timing_memory": _d(_d(heart.get("ignition")).get("timing_memory")),
+                "shadow_calibration_status": lane.get("shadow_calibration_status"),
+                "shadow_calibration_sample": lane.get("shadow_calibration_sample"),
+                "shadow_conviction_adjustment": lane.get("shadow_conviction_adjustment"),
+                "quant_directional_edge": quant.get("directional_edge"),
+                "council_risk_multiplier": council_multiplier,
+                "forecast_consensus": matrix.get("consensus"),
+                "horizon_conflict": matrix.get("horizon_conflict"),
+                "elliott_pattern": _d(elliott.get("best_pattern")).get("pattern"),
+                "sarpon_phase": _d(heart.get("chati_sarpon_612_monitor")).get("phase"),
             },
             "stop_was_fixed_before_entry": True,
             "stop_can_widen_after_entry": False,
+            "stop_can_tighten_after_entry": False,
+            "stop_policy": "IMMUTABLE_STRUCTURAL_STOP",
             "size_calculated_from_hard_stop": True,
             "max_hold_minutes": lane.get("max_hold_minutes"),
             "horizon_policy_fixed_before_entry": True,
