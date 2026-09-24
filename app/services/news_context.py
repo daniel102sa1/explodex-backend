@@ -98,6 +98,44 @@ def _headline_score(title: str) -> int:
     return positive - negative
 
 
+def _classify_catalyst(title: str, source: str = "") -> dict[str, Any]:
+    text = " ".join(_tokenize(title))
+    words = set(text.split())
+
+    categories = [
+        ("HACK_EXPLOIT", {"hack", "hacked", "hackeo", "exploit", "breach", "attack", "ataque", "stolen", "robado"}, "NEGATIVE", "HIGH"),
+        ("DELISTING", {"delist", "delisted", "delisting", "retirada", "suspension"}, "NEGATIVE", "HIGH"),
+        ("LISTING", {"listing", "listed", "listado"}, "POSITIVE", "HIGH"),
+        ("TOKEN_UNLOCK_SUPPLY", {"unlock", "unlocks", "vesting", "emision", "emissions", "supply"}, "AMBIGUOUS", "HIGH"),
+        ("MAINNET_UPGRADE", {"mainnet", "upgrade", "actualizacion", "upgrades"}, "AMBIGUOUS", "MEDIUM"),
+        ("AIRDROP", {"airdrop", "airdrops"}, "AMBIGUOUS", "MEDIUM"),
+        ("REGULATION_LEGAL", {"regulation", "regulatory", "lawsuit", "demanda", "sec", "cftc", "ban", "prohibicion", "fine", "multa"}, "AMBIGUOUS", "HIGH"),
+        ("PARTNERSHIP_INTEGRATION", {"partnership", "partners", "alianza", "integration", "integracion"}, "POSITIVE", "MEDIUM"),
+        ("GOVERNANCE", {"governance", "proposal", "vote", "gobernanza", "votacion"}, "AMBIGUOUS", "MEDIUM"),
+        ("BURN_SUPPLY", {"burn", "burned", "quema"}, "AMBIGUOUS", "MEDIUM"),
+    ]
+
+    event_type = "OTHER_NEWS"
+    direction_hint = "AMBIGUOUS"
+    magnitude = "LOW"
+    for name, terms, direction, mag in categories:
+        if words & terms:
+            event_type, direction_hint, magnitude = name, direction, mag
+            break
+
+    source_name = str(source or "").strip()
+    return {
+        "event_type": event_type,
+        "direction_hint": direction_hint,
+        "estimated_magnitude": magnitude,
+        "source_name": source_name,
+        "official_source_verified": False,
+        "known_previously": "UNKNOWN",
+        "requires_primary_source_verification": event_type != "OTHER_NEWS",
+        "classifier": "DETERMINISTIC_KEYWORD_V1",
+    }
+
+
 async def _fetch_google_news_rss(query: str, timeout_seconds: float = 8.0) -> list[dict[str, str]]:
     # Prefer Latin-American Spanish and Guatemala-localized Google News results.
     url = (
@@ -177,11 +215,21 @@ async def news_context_for_symbol(symbol: str) -> dict[str, Any]:
             return value
 
         scored: list[dict[str, Any]] = []
+        structured_events: list[dict[str, Any]] = []
         raw = 0
         for headline in headlines:
             score = _headline_score(headline["title"])
             raw += score
-            scored.append({**headline, "headline_sentiment": score})
+            catalyst = _classify_catalyst(headline["title"], headline.get("source", ""))
+            row = {**headline, "headline_sentiment": score, "catalyst": catalyst}
+            scored.append(row)
+            if catalyst.get("event_type") != "OTHER_NEWS":
+                structured_events.append({
+                    "title": headline.get("title"),
+                    "published": headline.get("published"),
+                    "source": headline.get("source"),
+                    **catalyst,
+                })
 
         if raw >= 3:
             sentiment = "POSITIVE"
@@ -192,6 +240,7 @@ async def news_context_for_symbol(symbol: str) -> dict[str, Any]:
 
         adjustment = max(-5.0, min(5.0, raw * 1.25))
 
+        high_events = sum(1 for event in structured_events if event.get("estimated_magnitude") == "HIGH")
         value = {
             "enabled": True,
             "symbol": cache_key,
@@ -201,7 +250,21 @@ async def news_context_for_symbol(symbol: str) -> dict[str, Any]:
             "score_adjustment": round(adjustment, 2),
             "headline_count": len(scored),
             "headlines": scored[:5],
-            "note": "Las noticias son un filtro secundario; no generan una entrada por sí solas.",
+            "structured_events": structured_events[:8],
+            "catalyst_summary": {
+                "detected_events": len(structured_events),
+                "high_magnitude_events": high_events,
+                "requires_primary_source_verification": any(
+                    bool(event.get("requires_primary_source_verification")) for event in structured_events
+                ),
+                "can_create_entry": False,
+                "can_raise_leverage": False,
+            },
+            "analysis_method": "RSS + deterministic event/keyword classifier; no LLM price prediction",
+            "note": (
+                "Las noticias son contexto secundario. Un evento detectado por titulares debe verificarse "
+                "en una fuente primaria/oficial antes de tratarlo como catalizador confirmado."
+            ),
         }
         _CACHE[cache_key] = (time.monotonic() + settings.news_cache_ttl_seconds, value)
         return value

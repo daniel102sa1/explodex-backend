@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-VERSION = "explosion_intelligence_v1"
+VERSION = "explosion_intelligence_v2_fundamental_pump_features"
 MODEL_CACHE_SECONDS = 60.0
 _model_cache: tuple[float, dict[str, Any]] | None = None
 
@@ -67,6 +67,14 @@ def extract_signal_features(reason: Any) -> dict[str, Any]:
     sequence = _d(prediction.get("sequence"))
     context = _d(prediction.get("context_engine"))
     regime = _d(context.get("regime"))
+    fundamental = _d(bundle.get("fundamental_intelligence")) or _d(heart.get("fundamental_intelligence"))
+    catalyst_context = _d(bundle.get("catalyst_context")) or _d(heart.get("catalyst_context"))
+    catalyst_summary = _d(catalyst_context.get("catalyst_summary"))
+    fundamental_risk = _d(fundamental.get("risk"))
+    fundamental_market = _d(fundamental.get("market"))
+    fundamental_tokenomics = _d(fundamental.get("tokenomics"))
+    fundamental_liquidity = _d(fundamental.get("liquidity_proxy"))
+    pump_state = _d(bundle.get("pump_state_machine")) or _d(heart.get("pump_state_machine"))
 
     return {
         "feature_version": VERSION,
@@ -92,7 +100,26 @@ def extract_signal_features(reason: Any) -> dict[str, Any]:
         "futures_delta_ratio": metrics.get("futures_delta_ratio"),
         "spot_delta_ratio": metrics.get("spot_delta_ratio"),
         "order_book_imbalance": metrics.get("order_book_imbalance"),
+        "order_book_imbalance_10bps": metrics.get("order_book_imbalance_10bps"),
+        "order_book_imbalance_25bps": metrics.get("order_book_imbalance_25bps"),
+        "order_book_imbalance_50bps": metrics.get("order_book_imbalance_50bps"),
+        "order_book_near_depth_25bps_usd": metrics.get("order_book_near_depth_25bps_usd"),
         "funding_rate": metrics.get("funding_rate"),
+        "fundamental_available": fundamental.get("available"),
+        "fundamental_risk_score": fundamental_risk.get("risk_score"),
+        "fundamental_risk_state": fundamental_risk.get("state"),
+        "market_cap_usd": fundamental_market.get("market_cap_usd"),
+        "fully_diluted_valuation_usd": fundamental_market.get("fully_diluted_valuation_usd"),
+        "fdv_to_market_cap": fundamental_tokenomics.get("fdv_to_market_cap"),
+        "circulating_to_total_supply": fundamental_tokenomics.get("circulating_to_total_supply"),
+        "volume_to_market_cap_24h": fundamental_liquidity.get("volume_to_market_cap_24h"),
+        "pump_state": pump_state.get("state"),
+        "pump_state_score": pump_state.get("state_score"),
+        "pump_state_direction": pump_state.get("dominant_direction"),
+        "catalyst_sentiment": catalyst_context.get("sentiment"),
+        "catalyst_event_count": catalyst_summary.get("detected_events"),
+        "catalyst_high_magnitude_count": catalyst_summary.get("high_magnitude_events"),
+        "catalyst_requires_primary_verification": catalyst_summary.get("requires_primary_source_verification"),
         "cg_oi_5m_pct": cg_oi.get("change_5m_pct"),
         "cg_oi_15m_pct": cg_oi.get("change_15m_pct"),
         "cg_oi_1h_pct": cg_oi.get("change_1h_pct"),

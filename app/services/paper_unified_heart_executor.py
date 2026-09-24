@@ -14,7 +14,7 @@ from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v8_horizon_stop_guard"
+VERSION = "paper_unified_heart_executor_v9_fundamental_risk_context"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -75,6 +75,8 @@ def _sarpon_leverage_policy(
     council_multiplier: float = 1.0,
     shadow_risk_multiplier: float = 1.0,
     btc_side_multiplier: float = 1.0,
+    fundamental_multiplier: float = 1.0,
+    pump_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Choose PAPER leverage from confluence without increasing stop-risk.
 
@@ -101,7 +103,21 @@ def _sarpon_leverage_policy(
         and not bool(_d(monitor.get("btc")).get("hard_conflict"))
         and btc_side_multiplier >= 0.85
     )
-    quality_safe = quant_multiplier >= 0.85 and council_multiplier >= 0.85 and shadow_risk_multiplier >= 0.85
+    pump_stage = str(_d(pump_state).get("state") or "UNAVAILABLE").upper()
+    pump_leverage_safe = pump_stage not in {"DERIVATIVE_SQUEEZE", "EXHAUSTION", "REVERSAL_CONFIRMED"}
+    history_status = str(lane.get("shadow_calibration_status") or "").upper()
+    history_sample = int(_f(lane.get("shadow_calibration_sample"), 0.0))
+    history_boost_safe = history_status == "USABLE" and history_sample >= 60
+    history_high_safe = history_status == "USABLE" and history_sample >= 100
+    history_max_safe = history_status == "USABLE" and history_sample >= 200
+    quality_safe = (
+        quant_multiplier >= 0.85
+        and council_multiplier >= 0.85
+        and shadow_risk_multiplier >= 0.85
+        and fundamental_multiplier >= 0.80
+        and pump_leverage_safe
+        and history_boost_safe
+    )
     full_green = bool(
         not defensive
         and lane_name in {"TACTICAL", "SWING_PAPER"}
@@ -117,14 +133,14 @@ def _sarpon_leverage_policy(
     reason = "base_cap"
     tier_name = "BASE"
 
-    if full_green and lane_name == "TACTICAL" and tier == "MAX_CONVICTION":
-        selected, reason, tier_name = 20, "max_conviction_full_arsenal", "MAX_20X"
-    elif full_green and lane_name == "TACTICAL" and tier == "HIGH":
-        selected, reason, tier_name = 10, "high_conviction_full_arsenal", "HIGH_10X"
-    elif full_green and lane_name == "SWING_PAPER" and tier in {"HIGH", "MAX_CONVICTION", "HIGH_SWING_CAPPED"}:
-        selected, reason, tier_name = 8, "swing_full_arsenal", "SWING_8X"
-    elif full_green and tier in {"NORMAL_PLUS", "NORMAL"}:
-        selected, reason, tier_name = max(base_cap, 5), "confirmed_arsenal", "CONFIRMED_5X"
+    if full_green and lane_name == "TACTICAL" and tier == "MAX_CONVICTION" and history_max_safe:
+        selected, reason, tier_name = 20, "max_conviction_full_arsenal_oos_sample", "MAX_20X"
+    elif full_green and lane_name == "TACTICAL" and tier in {"HIGH", "MAX_CONVICTION"} and history_high_safe:
+        selected, reason, tier_name = 10, "high_conviction_full_arsenal_oos_sample", "HIGH_10X"
+    elif full_green and lane_name == "SWING_PAPER" and tier in {"HIGH", "MAX_CONVICTION", "HIGH_SWING_CAPPED"} and history_high_safe:
+        selected, reason, tier_name = 8, "swing_full_arsenal_oos_sample", "SWING_8X"
+    elif full_green and tier in {"MAX_CONVICTION", "HIGH", "NORMAL_PLUS", "NORMAL"}:
+        selected, reason, tier_name = max(base_cap, 5), "confirmed_arsenal_minimum_history", "CONFIRMED_5X"
 
     return {
         "eligible": full_green,
@@ -144,6 +160,13 @@ def _sarpon_leverage_policy(
             "quant_safe": quant_multiplier >= 0.85,
             "council_safe": council_multiplier >= 0.85,
             "history_calibration_safe": shadow_risk_multiplier >= 0.85,
+            "history_boost_sample_safe": history_boost_safe,
+            "history_high_sample_safe": history_high_safe,
+            "history_max_sample_safe": history_max_safe,
+            "history_sample": history_sample,
+            "fundamental_risk_safe": fundamental_multiplier >= 0.80,
+            "pump_state_safe_for_leverage_escalation": pump_leverage_safe,
+            "pump_state": pump_stage,
             "not_defensive": not defensive,
         },
     }
@@ -161,6 +184,7 @@ def _shadow_calibration_risk_multiplier(
     increase size until the real VNext execution cohort is mature.
     """
     status = str(lane.get("shadow_calibration_status") or "").upper()
+    sample = int(_f(lane.get("shadow_calibration_sample"), 0.0))
     if status != "USABLE":
         return 1.0
     adjustment = _f(lane.get("shadow_conviction_adjustment"))
@@ -169,7 +193,9 @@ def _shadow_calibration_risk_multiplier(
         return 0.55
     if adjustment <= -2.5:
         return 0.75
-    if validation_probation or downside_only:
+    if validation_probation or downside_only or sample < 200:
+        # Positive historical evidence is shadow-only until a materially larger
+        # sample exists. Small cohorts may reduce risk but cannot increase it.
         return 1.0
     if adjustment >= 5.0:
         return 1.10
@@ -356,6 +382,15 @@ async def execute_unified_heart_contracts(
             lane,
             validation_probation=validation_probation,
         )
+        fundamental = _d(heart.get("fundamental_intelligence"))
+        catalyst_context = _d(heart.get("catalyst_context"))
+        fundamental_risk = _d(fundamental.get("risk"))
+        fundamental_multiplier = (
+            max(0.65, min(1.0, _f(fundamental_risk.get("risk_multiplier_cap"), 1.0)))
+            if bool(fundamental.get("available"))
+            else 1.0
+        )
+        pump_state = _d(heart.get("pump_state_machine"))
         leverage_policy = _sarpon_leverage_policy(
             lane_name=lane_name,
             lane=lane,
@@ -367,6 +402,8 @@ async def execute_unified_heart_contracts(
             council_multiplier=council_multiplier,
             shadow_risk_multiplier=shadow_risk_multiplier,
             btc_side_multiplier=btc_side_multiplier,
+            fundamental_multiplier=fundamental_multiplier,
+            pump_state=pump_state,
         )
         lane_leverage = 1 if validation_probation else int(leverage_policy["selected_leverage"])
         sizing = base.size_position(balance, fill, hard_stop, lane_leverage)
@@ -382,6 +419,7 @@ async def execute_unified_heart_contracts(
             * quant_multiplier
             * council_multiplier
             * shadow_risk_multiplier
+            * fundamental_multiplier
         )
         for key in ("quantity", "notional", "margin", "risk_usdt"):
             sizing[key] = round(_f(sizing.get(key)) * scale, 10)
@@ -420,6 +458,12 @@ async def execute_unified_heart_contracts(
             "shadow_calibration_horizon": lane.get("shadow_calibration_horizon"),
             "shadow_conviction_adjustment": lane.get("shadow_conviction_adjustment"),
             "shadow_risk_multiplier": shadow_risk_multiplier,
+            "fundamental_intelligence": fundamental,
+            "catalyst_context": catalyst_context,
+            "fundamental_risk_multiplier": fundamental_multiplier,
+            "pump_state_machine": pump_state,
+            "fundamental_is_shadow_context": True,
+            "pump_state_is_shadow_context": True,
             "target_account_risk_pct_before_portfolio_brakes": round(base.RISK_PER_TRADE * 100.0 * conviction_multiplier, 4),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
             "stop_survival": survival,

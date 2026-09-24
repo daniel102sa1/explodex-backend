@@ -14,7 +14,9 @@ from app.services.coinglass_confirmation import apply_coinglass_confirmation
 from app.services.dashboard import live_event_feed, live_predictions, prediction_history
 from app.services.explodex_heart import run_explodex_heart
 from app.services.market_context import market_context
+from app.services.fundamental_intelligence import fundamental_context_for_symbol
 from app.services.news_context import news_context_for_symbol
+from app.services.pump_state_machine import classify_pump_state
 from app.services.opportunities import calibration_by_score, ranked_opportunities
 from app.services.paper_fast_cycle import VERSION as PAPER_EXECUTION_VERSION, run_fast_paper_cycle, run_paper_exit_management
 from app.services.paper_portfolio import ARSENAL_DISPLAY_START, paper_arsenal_summary, paper_history as canonical_paper_history, paper_performance_summary, paper_summary
@@ -183,6 +185,14 @@ async def symbol_news(symbol: str):
         raise HTTPException(status_code=502, detail=f"News context failed: {exc}") from exc
 
 
+@app.get("/api/v1/fundamentals/{symbol}")
+async def symbol_fundamentals(symbol: str):
+    try:
+        return await fundamental_context_for_symbol(_safe_symbol(symbol))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Fundamental context failed: {exc}") from exc
+
+
 @app.get("/api/v1/market/price/{symbol}")
 async def market_price(symbol: str):
     try:
@@ -254,7 +264,20 @@ async def live_symbol_analysis(
         )
         scored = heart_result["score"]
         prediction = heart_result["prediction"]
-        heart = heart_result["heart"]
+        heart = dict(heart_result["heart"])
+
+        fundamental, catalyst_context = await asyncio.gather(
+            fundamental_context_for_symbol(safe_symbol),
+            news_context_for_symbol(safe_symbol),
+        )
+        pump_state = classify_pump_state(
+            score=scored,
+            prediction=prediction,
+            fundamental=fundamental,
+        )
+        heart["fundamental_intelligence"] = fundamental
+        heart["catalyst_context"] = catalyst_context
+        heart["pump_state_machine"] = pump_state
 
         availability = {
             "price_structure": bool(snapshot.get("klines")),
@@ -274,6 +297,8 @@ async def live_symbol_analysis(
             "coinglass_aggregated_taker": bool(cg.get("taker", {}).get("available")),
             "coinglass_funding": bool(cg.get("funding", {}).get("available")),
             "coinglass_liquidations": bool(cg.get("liquidations", {}).get("available")),
+            "fundamental_market_tokenomics": bool(fundamental.get("available")),
+            "catalyst_news": bool(catalyst_context.get("enabled")) and catalyst_context.get("sentiment") != "UNAVAILABLE",
         }
         required = [
             availability["price_structure"],
@@ -297,6 +322,9 @@ async def live_symbol_analysis(
             "data_quality": data_quality,
             "availability": availability,
             "coinglass": cg,
+            "fundamental_intelligence": fundamental,
+            "catalyst_context": catalyst_context,
+            "pump_state_machine": pump_state,
             "explodex_heart": heart,
             "prediction": prediction,
             "current_open_interest": _float(snapshot.get("open_interest", {}).get("openInterest")),
