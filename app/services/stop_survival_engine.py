@@ -4,7 +4,7 @@ from typing import Any
 
 from app.services.execution_math import choose_target_for_min_net_rr
 
-VERSION = "stop_survival_engine_v2_pre_event"
+VERSION = "stop_survival_engine_v3_horizon_noise_guard"
 
 
 def _d(value: Any) -> dict[str, Any]: return value if isinstance(value, dict) else {}
@@ -62,6 +62,26 @@ def build_stop_survival_plan(*, heart: dict[str, Any], lane_name: str, lane: dic
     targets = [(n,p) for n,p in _targets_for_lane(heart,lane_name,lane) if p > 0]
     math = choose_target_for_min_net_rr(side=direction, entry=entry, stop=hard_stop, targets=targets, expected_hold_hours=hold_hours, min_net_rr=min_net_rr) if targets else {"accepted":False,"reason":"no_targets"}
     if not math.get("accepted"):
-        return {"version":VERSION,"enabled":False,"reason":"survival_stop_breaks_min_net_rr","soft_invalidation_stop":round(soft_stop,12),"proposed_hard_stop":round(hard_stop,12),"buffer_pct":round(buffer_pct,4),"execution_math":math,"creates_entry":False,"changes_direction":False}
+        # Do not fall back to a cosmetically tight stop just to make R/R look
+        # attractive. If the trade cannot afford normal structural/volatility
+        # room before entry, the PAPER entry itself is rejected.
+        soft_pct = abs(entry-soft_stop)/entry*100.0
+        hard_pct = abs(entry-hard_stop)/entry*100.0
+        return {
+            "version": VERSION,
+            "enabled": False,
+            "reason": "survival_stop_breaks_min_net_rr",
+            "entry_should_be_rejected": True,
+            "rejection_reason": "target_does_not_pay_for_horizon_matched_stop",
+            "soft_invalidation_stop": round(soft_stop, 12),
+            "proposed_hard_stop": round(hard_stop, 12),
+            "soft_stop_distance_pct": round(soft_pct, 4),
+            "proposed_hard_stop_distance_pct": round(hard_pct, 4),
+            "robust_4h_range_pct": round(robust4, 4),
+            "buffer_pct": round(buffer_pct, 4),
+            "execution_math": math,
+            "creates_entry": False,
+            "changes_direction": False,
+        }
     chosen = _d(math.get("chosen_target")); soft_pct = abs(entry-soft_stop)/entry*100.0; hard_pct = abs(entry-hard_stop)/entry*100.0
-    return {"version":VERSION,"enabled":True,"mode":"CLOSE_CONFIRMATION_WITH_HARD_STOP","direction":direction,"soft_invalidation_stop":round(soft_stop,12),"hard_stop":round(hard_stop,12),"soft_stop_distance_pct":round(soft_pct,4),"hard_stop_distance_pct":round(hard_pct,4),"extra_room_pct":round(max(0.0,hard_pct-soft_pct),4),"confirmation_minutes":confirmation_minutes,"buffer_pct":round(buffer_pct,4),"btc_stop_buffer_multiplier":round(btc_buffer_multiplier,3),"btc_stress":btc_context.get("stress"),"elliott_invalidation_used":elliott_used,"elliott_invalidation":round(einv,12) if einv>0 else None,"elliott_score":round(es,1) if es>0 else None,"target_name":chosen.get("name"),"target_price":chosen.get("price"),"execution_math":math,"hard_stop_fixed_before_entry":True,"widen_after_entry":False,"size_from_hard_stop":True,"creates_entry":False,"changes_direction":False,"rule":"A wick through soft invalidation is tolerated; candle close beyond it confirms exit, or hard stop exits immediately."}
+    return {"version":VERSION,"enabled":True,"mode":"CLOSE_CONFIRMATION_WITH_HARD_STOP","direction":direction,"soft_invalidation_stop":round(soft_stop,12),"hard_stop":round(hard_stop,12),"soft_stop_distance_pct":round(soft_pct,4),"hard_stop_distance_pct":round(hard_pct,4),"extra_room_pct":round(max(0.0,hard_pct-soft_pct),4),"robust_4h_range_pct":round(robust4,4),"hard_stop_to_robust_4h_range":round(hard_pct/robust4,4) if robust4>0 else None,"entry_should_be_rejected":False,"confirmation_minutes":confirmation_minutes,"buffer_pct":round(buffer_pct,4),"btc_stop_buffer_multiplier":round(btc_buffer_multiplier,3),"btc_stress":btc_context.get("stress"),"elliott_invalidation_used":elliott_used,"elliott_invalidation":round(einv,12) if einv>0 else None,"elliott_score":round(es,1) if es>0 else None,"target_name":chosen.get("name"),"target_price":chosen.get("price"),"execution_math":math,"hard_stop_fixed_before_entry":True,"widen_after_entry":False,"size_from_hard_stop":True,"creates_entry":False,"changes_direction":False,"rule":"A wick through soft invalidation is tolerated; candle close beyond it confirms exit, or hard stop exits immediately."}
