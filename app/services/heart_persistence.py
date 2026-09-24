@@ -14,7 +14,7 @@ from app.services.liquidity_target_engine import build_liquidity_targets
 from app.services.trade_thesis import apply_trade_thesis, apply_thesis_to_score
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-HEART_PERSISTENCE_VERSION = "heart_persistence_v6_lean_vnext_expectancy"
+HEART_PERSISTENCE_VERSION = "heart_persistence_v7_fundamental_pump_context"
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -381,6 +381,13 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         decision["expectancy_policy"] = expectancy_policy
         allowed = bool(decision.get("should_enter"))
 
+        # Fundamental/tokenomics and pump-state are intentionally shadow context
+        # at this stage. They are persisted before Heart so every execution can be
+        # audited later without allowing an unvalidated feature to manufacture a
+        # direction or entry.
+        fundamental = _json(reason.get("fundamental_intelligence"))
+        pump_state = _json(reason.get("pump_state_machine"))
+
         if allowed:
             score["state"] = "READY"
             execution_ready += 1
@@ -408,6 +415,8 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             "higher_timeframe": htf,
             "higher_timeframe_context": htf,
             "higher_timeframe_alignment": htf_alignment,
+            "fundamental_intelligence": fundamental,
+            "pump_state_machine": pump_state,
             "prediction_phase": prediction.get("phase"),
             "prediction_type": prediction.get("type"),
             "thesis": thesis,
@@ -431,6 +440,10 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
                 "memory_can_influence_entry": bool(_json(ignition.get("timing_memory")).get("can_influence_entry")),
                 "higher_timeframe_is_context_only": True,
                 "expectancy_policy": expectancy_policy,
+                "fundamental_shadow_only": True,
+                "pump_state_shadow_only": True,
+                "fundamental_can_create_entry": False,
+                "pump_state_can_create_entry": False,
             },
             "score_is_probability": False,
         }
