@@ -288,14 +288,14 @@ def build_pre_move_prediction(
             short_breakdown_conf.append("impulso + BOS + retroceso a zona + reacción bajista confirmada")
     elif impulse_phase in {"WAIT_PULLBACK", "WAIT_PULLBACK_NO_CHASE", "ZONE_TOUCHED_WAIT_CONFIRMATION"}:
         if impulse_direction == "LONG":
-            long_breakout_conflicts.append("impulso alcista detectado: esperar retroceso/reacción, no perseguir")
+            long_conflicts.append("impulso alcista detectado: esperar retroceso/reacción, no perseguir")
         elif impulse_direction == "SHORT":
-            short_breakdown_conflicts.append("impulso bajista detectado: esperar retroceso/reacción, no perseguir")
+            short_conflicts.append("impulso bajista detectado: esperar retroceso/reacción, no perseguir")
     elif impulse_phase == "INVALIDATED":
         if impulse_direction == "LONG":
-            long_breakout_conflicts.append("zona del impulso alcista invalidada")
+            long_conflicts.append("zona del impulso alcista invalidada")
         elif impulse_direction == "SHORT":
-            short_breakdown_conflicts.append("zona del impulso bajista invalidada")
+            short_conflicts.append("zona del impulso bajista invalidada")
 
     if str(pro_adx.get("trend_strength") or "") == "STRONG":
         if pro_adx.get("bias") == "LONG":
