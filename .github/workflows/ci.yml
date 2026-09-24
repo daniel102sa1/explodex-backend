@@ -34,5 +34,8 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q app
 
+      - name: Run production smoke checks
+        run: python -m app.smoke_checks
+
       - name: Run tests
         run: python -m pytest -q
