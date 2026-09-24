@@ -44,6 +44,18 @@ class Settings(BaseSettings):
     fundamentals_enabled: bool = True
     fundamentals_max_scanner_candidates: int = 8
     fundamentals_cache_ttl_seconds: int = 900
+
+    # Historical Market Brain. Builds a point-in-time OHLCV replay archive in
+    # small background batches. It is shadow-only and cannot create entries.
+    historical_market_enabled: bool = True
+    historical_market_interval: str = "5m"
+    historical_market_backfill_days: int = 60
+    historical_market_stride_bars: int = 6
+    historical_market_max_symbols: int = 20
+    historical_market_worker_interval_seconds: int = 3600
+    historical_market_min_analog_sample: int = 30
+    historical_market_max_analog_rows: int = 12000
+
     coingecko_base_url: str = "https://api.coingecko.com/api/v3"
     coingecko_demo_api_key: str = ""
     coingecko_timeout_seconds: float = 10.0
