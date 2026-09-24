@@ -570,7 +570,7 @@ async def paper_performance_summary(
         if _f(row.get("risk_usdt")) > 0
     ]
     average_r = sum(r_values) / len(r_values) if r_values else None
-    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else (None if gross_profit <= 0 else float("inf"))
+    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else None
 
     curve = await paper_equity_curve(db, limit=5000, opened_after=opened_after)
     peak = _f(curve.get("starting_balance"), STARTING_BALANCE)
@@ -595,7 +595,7 @@ async def paper_performance_summary(
         "gross_loss_usdt": round(gross_loss, 6),
         "expectancy_usdt_per_trade": round(expectancy, 6) if expectancy is not None else None,
         "average_r": round(average_r, 4) if average_r is not None else None,
-        "profit_factor": round(profit_factor, 4) if profit_factor not in {None, float("inf")} else profit_factor,
+        "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
         "max_drawdown_pct": round(max_drawdown_pct, 4),
         "current_equity_usdt": _f(summary.get("equity")),
         "starting_equity_usdt": _f(summary.get("starting_balance"), STARTING_BALANCE),
