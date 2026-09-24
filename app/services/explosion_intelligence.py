@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-VERSION = "explosion_intelligence_v2_fundamental_pump_features"
+VERSION = "explosion_intelligence_v3_historical_analog_features"
 MODEL_CACHE_SECONDS = 60.0
 _model_cache: tuple[float, dict[str, Any]] | None = None
 
@@ -75,6 +75,11 @@ def extract_signal_features(reason: Any) -> dict[str, Any]:
     fundamental_tokenomics = _d(fundamental.get("tokenomics"))
     fundamental_liquidity = _d(fundamental.get("liquidity_proxy"))
     pump_state = _d(bundle.get("pump_state_machine")) or _d(heart.get("pump_state_machine"))
+    historical_analog = _d(bundle.get("historical_analog")) or _d(heart.get("historical_analog"))
+    historical_oos = _d(historical_analog.get("out_of_sample"))
+    historical_horizons = _d(historical_analog.get("horizons"))
+    historical_1h = _d(historical_horizons.get("1h"))
+    historical_4h = _d(historical_horizons.get("4h"))
 
     return {
         "feature_version": VERSION,
@@ -116,6 +121,17 @@ def extract_signal_features(reason: Any) -> dict[str, Any]:
         "pump_state": pump_state.get("state"),
         "pump_state_score": pump_state.get("state_score"),
         "pump_state_direction": pump_state.get("dominant_direction"),
+        "historical_analog_sample": historical_analog.get("sample"),
+        "historical_analog_status": historical_analog.get("status"),
+        "historical_analog_top_similarity": historical_analog.get("top_similarity"),
+        "historical_analog_median_similarity": historical_analog.get("median_similarity"),
+        "historical_analog_oos_status": historical_oos.get("status"),
+        "historical_analog_1h_positive_close_rate_pct": historical_1h.get("positive_close_rate_pct"),
+        "historical_analog_1h_mean_signed_return_pct": historical_1h.get("mean_signed_return_pct"),
+        "historical_analog_1h_generic_barrier_rate_pct": historical_1h.get("generic_1p5atr_before_1atr_rate_pct"),
+        "historical_analog_4h_positive_close_rate_pct": historical_4h.get("positive_close_rate_pct"),
+        "historical_analog_4h_mean_signed_return_pct": historical_4h.get("mean_signed_return_pct"),
+        "historical_analog_4h_generic_barrier_rate_pct": historical_4h.get("generic_1p5atr_before_1atr_rate_pct"),
         "catalyst_sentiment": catalyst_context.get("sentiment"),
         "catalyst_event_count": catalyst_summary.get("detected_events"),
         "catalyst_high_magnitude_count": catalyst_summary.get("high_magnitude_events"),
