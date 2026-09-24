@@ -370,6 +370,7 @@ async def execute_unified_heart_contracts(
             validation_probation=validation_probation,
         )
         fundamental = _d(heart.get("fundamental_intelligence"))
+        catalyst_context = _d(heart.get("catalyst_context"))
         fundamental_risk = _d(fundamental.get("risk"))
         fundamental_multiplier = (
             max(0.65, min(1.0, _f(fundamental_risk.get("risk_multiplier_cap"), 1.0)))
@@ -445,6 +446,7 @@ async def execute_unified_heart_contracts(
             "shadow_conviction_adjustment": lane.get("shadow_conviction_adjustment"),
             "shadow_risk_multiplier": shadow_risk_multiplier,
             "fundamental_intelligence": fundamental,
+            "catalyst_context": catalyst_context,
             "fundamental_risk_multiplier": fundamental_multiplier,
             "pump_state_machine": pump_state,
             "fundamental_is_shadow_context": True,
