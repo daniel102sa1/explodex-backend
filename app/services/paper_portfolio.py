@@ -47,6 +47,11 @@ def _meta(value: Any) -> dict[str, Any]:
     return {}
 
 
+async def acquire_paper_open_lock(db: AsyncSession) -> None:
+    """Serialize PAPER openings across Railway workers at the database level."""
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext('explodex-paper-open-v1'))"))
+
+
 def choose_leverage(grade: str | None, fingerprint_score: float, catalyst_state: str | None) -> int:
     grade = str(grade or "").upper()
     if catalyst_state in {"CONFLICT", "SHOCK_RISK"}:
