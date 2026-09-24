@@ -59,6 +59,7 @@ async def execute_structure_retest_contracts(
     risk_multiplier: float = 1.0,
     btc_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    await base.acquire_paper_open_lock(db)
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
@@ -208,17 +209,26 @@ async def execute_structure_retest_contracts(
             "soft_invalidation_stop": lane.get("soft_invalidation_level"),
             "structural_stop": stop,
             "hard_stop": stop,
+            "initial_hard_stop": stop,
             "profit_lock": {
-                "enabled": True,
-                "stage": "INITIAL",
+                "enabled": False,
+                "stage": "IMMUTABLE_STRUCTURAL_STOP",
                 "tp1": _f(lane.get("tp1"), target),
                 "tp2": _f(lane.get("tp2")),
                 "tp3": _f(lane.get("tp3")),
                 "final_target": target,
-                "after_tp1": "MOVE_STOP_TO_BREAKEVEN_PLUS_COST_BUFFER_ON_NEXT_CANDLE",
-                "after_tp2": "MOVE_STOP_TO_TP1_ON_NEXT_CANDLE",
-                "pre_tp1_protection": "85pct_route_plus_confirmed_rejection",
-                "never_widen_stop": True,
+                "rule": "NEVER_MOVE_STOP_AFTER_ENTRY",
+            },
+            "frozen_plan": {
+                "entry": fill,
+                "side": side,
+                "structural_stop": stop,
+                "target": target,
+                "tp1": _f(lane.get("tp1"), target),
+                "tp2": _f(lane.get("tp2")),
+                "tp3": _f(lane.get("tp3")),
+                "leverage": leverage,
+                "created_at": datetime.now(timezone.utc).isoformat(),
             },
             "stop_survival_enabled": True,
             "stop_survival": {
@@ -233,6 +243,8 @@ async def execute_structure_retest_contracts(
             "position_size_calculated_after_stop": True,
             "stop_fixed_before_entry": True,
             "stop_can_widen_after_entry": False,
+            "stop_can_tighten_after_entry": False,
+            "stop_policy": "IMMUTABLE_STRUCTURAL_STOP",
             "entry_zone_frozen": True,
             "chase_limit": lane.get("chase_limit"),
             "execution_math_live": math,

@@ -1,5 +1,4 @@
 from app.services import paper_portfolio as base
-from app.services.paper_sizing_patch import corrected_size_position
 from app.services.paper_swing_trajectory import swing_candidate_ok
 from app.services.trajectory_forecast import build_trajectory_forecast
 
@@ -103,8 +102,8 @@ def test_mixed_higher_timeframes_do_not_force_swing_entry():
 
 def test_wider_structural_stop_reduces_quantity_and_reports_actual_risk():
     balance = 1000.0
-    narrow = corrected_size_position(balance, 100.0, 99.0, 4)
-    wide = corrected_size_position(balance, 100.0, 95.0, 4)
+    narrow = base.size_position(balance, 100.0, 99.0, 4)
+    wide = base.size_position(balance, 100.0, 95.0, 4)
     assert wide["quantity"] < narrow["quantity"]
     assert wide["risk_usdt"] <= 30.0
     assert wide["risk_usdt"] == round(wide["quantity"] * 5.0, 6)
@@ -112,5 +111,9 @@ def test_wider_structural_stop_reduces_quantity_and_reports_actual_risk():
     assert swing_risk <= 15.0
 
 
-def test_legacy_base_sizing_is_replaced_at_runtime_by_patch():
-    assert callable(base.size_position)
+def test_canonical_sizing_reports_budget_and_actual_stop_risk_without_patch():
+    sized = base.size_position(1000.0, 100.0, 99.0, 4)
+    assert sized["risk_budget_usdt"] == 30.0
+    assert sized["target_risk_usdt"] == 30.0
+    assert sized["risk_usdt"] == 12.0
+    assert sized["risk_pct_of_balance"] == 1.2

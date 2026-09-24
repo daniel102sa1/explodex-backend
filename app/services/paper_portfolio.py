@@ -12,6 +12,7 @@ from app.services.binance import binance_client
 STARTING_BALANCE = 1000.0
 RISK_PER_TRADE = 0.03
 MAX_OPEN_POSITIONS = 3
+MAX_PAPER_LEVERAGE = 20
 TAKER_FEE_RATE = 0.0005
 SLIPPAGE_RATE = 0.0002
 FUNDING_ESTIMATE_8H = 0.0001
@@ -46,6 +47,11 @@ def _meta(value: Any) -> dict[str, Any]:
     return {}
 
 
+async def acquire_paper_open_lock(db: AsyncSession) -> None:
+    """Serialize PAPER openings across Railway workers at the database level."""
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext('explodex-paper-open-v1'))"))
+
+
 def choose_leverage(grade: str | None, fingerprint_score: float, catalyst_state: str | None) -> int:
     grade = str(grade or "").upper()
     if catalyst_state in {"CONFLICT", "SHOCK_RISK"}:
@@ -58,20 +64,43 @@ def choose_leverage(grade: str | None, fingerprint_score: float, catalyst_state:
 
 
 def size_position(balance: float, entry: float, stop: float, leverage: int) -> dict[str, float]:
+    """Size PAPER positions from structural stop risk, then cap by margin.
+
+    Leverage changes required margin only; it never increases the approved stop
+    risk budget. Keep the full sizing payload here so every executor uses the
+    same implementation without runtime monkey-patching.
+    """
+    balance = _f(balance)
+    entry = _f(entry)
+    stop = _f(stop)
+    leverage = max(1, min(MAX_PAPER_LEVERAGE, int(_f(leverage, 1.0))))
     stop_distance = abs(entry - stop)
     if balance <= 0 or entry <= 0 or stop_distance <= 0:
-        return {"target_risk_usdt": 0.0, "risk_usdt": 0.0, "quantity": 0.0, "notional": 0.0, "margin": 0.0}
-    target_risk_usdt = balance * RISK_PER_TRADE
-    quantity_by_risk = target_risk_usdt / stop_distance
+        return {
+            "risk_budget_usdt": 0.0,
+            "target_risk_usdt": 0.0,
+            "risk_usdt": 0.0,
+            "risk_pct_of_balance": 0.0,
+            "quantity": 0.0,
+            "notional": 0.0,
+            "margin": 0.0,
+        }
+
+    risk_budget_usdt = balance * RISK_PER_TRADE
+    quantity_by_risk = risk_budget_usdt / stop_distance
     max_margin = balance * 0.30
-    max_notional = max_margin * max(1, leverage)
-    quantity = min(quantity_by_risk, max_notional / entry)
+    max_notional = max_margin * leverage
+    quantity_by_margin = max_notional / entry
+    quantity = max(0.0, min(quantity_by_risk, quantity_by_margin))
     notional = quantity * entry
-    margin = notional / max(1, leverage)
+    margin = notional / leverage
     actual_risk_usdt = quantity * stop_distance
+
     return {
-        "target_risk_usdt": round(target_risk_usdt, 6),
+        "risk_budget_usdt": round(risk_budget_usdt, 6),
+        "target_risk_usdt": round(risk_budget_usdt, 6),
         "risk_usdt": round(actual_risk_usdt, 6),
+        "risk_pct_of_balance": round(actual_risk_usdt / balance * 100.0, 6),
         "quantity": round(quantity, 10),
         "notional": round(notional, 6),
         "margin": round(margin, 6),
@@ -354,6 +383,7 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
         "assumptions": {
             "risk_per_trade_pct": RISK_PER_TRADE * 100,
             "max_open_positions": MAX_OPEN_POSITIONS,
+            "max_paper_leverage": MAX_PAPER_LEVERAGE,
             "taker_fee_pct_per_side": TAKER_FEE_RATE * 100,
             "slippage_pct_per_side": SLIPPAGE_RATE * 100,
             "funding_estimate_pct_per_8h": FUNDING_ESTIMATE_8H * 100,
@@ -514,6 +544,69 @@ async def paper_equity_curve(db: AsyncSession, limit: int = 500, opened_after: d
         "starting_balance": round(starting, 6),
         "realized_equity": round(equity, 6),
         "points": points,
+    }
+
+
+async def paper_performance_summary(
+    db: AsyncSession,
+    *,
+    opened_after: datetime | None = None,
+) -> dict[str, Any]:
+    """Canonical PAPER performance metrics from paper_positions only."""
+    await ensure_paper_schema(db)
+    cohort_filter = " AND opened_at >= :opened_after" if opened_after is not None else ""
+    params = {"opened_after": opened_after} if opened_after is not None else {}
+    rows = [dict(r) for r in (await db.execute(text(f"""
+        SELECT net_pnl, risk_usdt
+        FROM paper_positions
+        WHERE status='CLOSED' AND net_pnl IS NOT NULL{cohort_filter}
+        ORDER BY closed_at ASC
+    """), params)).mappings().all()]
+
+    closed = len(rows)
+    wins = sum(1 for row in rows if _f(row.get("net_pnl")) > 0)
+    losses = closed - wins
+    pnl_values = [_f(row.get("net_pnl")) for row in rows]
+    gross_profit = sum(value for value in pnl_values if value > 0)
+    gross_loss = sum(value for value in pnl_values if value < 0)
+    net_pnl = sum(pnl_values)
+    expectancy = net_pnl / closed if closed else None
+    r_values = [
+        _f(row.get("net_pnl")) / _f(row.get("risk_usdt"))
+        for row in rows
+        if _f(row.get("risk_usdt")) > 0
+    ]
+    average_r = sum(r_values) / len(r_values) if r_values else None
+    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else None
+
+    curve = await paper_equity_curve(db, limit=5000, opened_after=opened_after)
+    peak = _f(curve.get("starting_balance"), STARTING_BALANCE)
+    max_drawdown_pct = 0.0
+    for point in list(curve.get("points") or []):
+        equity = _f(point.get("equity"), peak)
+        peak = max(peak, equity)
+        if peak > 0:
+            max_drawdown_pct = max(max_drawdown_pct, (peak - equity) / peak * 100.0)
+
+    summary = await (paper_arsenal_summary(db) if opened_after is not None else paper_summary(db))
+    return {
+        "paper_only": True,
+        "source": "paper_positions",
+        "scope": "arsenal" if opened_after is not None else "all",
+        "closed_trades": closed,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(wins / closed * 100.0, 2) if closed else None,
+        "net_pnl_usdt": round(net_pnl, 6),
+        "gross_profit_usdt": round(gross_profit, 6),
+        "gross_loss_usdt": round(gross_loss, 6),
+        "expectancy_usdt_per_trade": round(expectancy, 6) if expectancy is not None else None,
+        "average_r": round(average_r, 4) if average_r is not None else None,
+        "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
+        "max_drawdown_pct": round(max_drawdown_pct, 4),
+        "current_equity_usdt": _f(summary.get("equity")),
+        "starting_equity_usdt": _f(summary.get("starting_balance"), STARTING_BALANCE),
+        "ready_for_real_money": False,
     }
 
 

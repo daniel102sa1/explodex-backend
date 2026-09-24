@@ -297,7 +297,14 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
         # may have been tightened by the previous profit-lock engine, so restore
         # their original structural stop from metadata when available.
         row_stop = _f(row.get("stop_loss"))
-        hard_stop = _f(metadata.get("initial_hard_stop"), row_stop)
+        original_structural_stop = (
+            metadata.get("initial_hard_stop")
+            or metadata.get("hard_stop")
+            or metadata.get("structural_stop")
+            or _d(metadata.get("stop_survival")).get("hard_stop")
+            or row_stop
+        )
+        hard_stop = _f(original_structural_stop, row_stop)
         soft_stop = _f(metadata.get("soft_invalidation_stop"), hard_stop)
         tp_value = _f(row.get("take_profit"))
         side = str(row.get("side") or "").upper()
@@ -363,12 +370,13 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
             opened_at=opened_at,
             closed_at=now,
         )
-        await db.execute(text("""
+        close_result = await db.execute(text("""
             UPDATE paper_positions
             SET status='CLOSED', closed_at=:closed_at, exit_price=:exit_price,
                 exit_reason=:exit_reason, gross_pnl=:gross_pnl, net_pnl=:net_pnl,
                 fees=:fees, slippage=:slippage, funding_estimate=:funding_estimate
-            WHERE id=:id
+            WHERE id=:id AND status='OPEN'
+            RETURNING id
         """), {
             "id": row["id"],
             "closed_at": now,
@@ -376,6 +384,9 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
             "exit_reason": exit_reason,
             **pnl,
         })
+        if close_result.scalar_one_or_none() is None:
+            # Another worker/process already closed this row. Never book PnL twice.
+            continue
         await db.execute(text("""
             UPDATE paper_accounts
             SET cash_balance=cash_balance+:net_pnl,

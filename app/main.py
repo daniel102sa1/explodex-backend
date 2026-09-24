@@ -16,9 +16,9 @@ from app.services.explodex_heart import run_explodex_heart
 from app.services.market_context import market_context
 from app.services.news_context import news_context_for_symbol
 from app.services.opportunities import calibration_by_score, ranked_opportunities
-from app.services.paper_time_management import manage_open_paper_trades_with_time
+from app.services.paper_fast_cycle import VERSION as PAPER_EXECUTION_VERSION, run_fast_paper_cycle, run_paper_exit_management
+from app.services.paper_portfolio import ARSENAL_DISPLAY_START, paper_arsenal_summary, paper_history as canonical_paper_history, paper_performance_summary, paper_summary
 from app.services.paper_reset import maybe_repair_current_arsenal_positions
-from app.services.paper_trading import paper_performance, sync_ready_signals
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
 from app.services.scanner_progress import scanner_progress
@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.13.0",
+    version="0.14.0",
     description=(
         "ExplodeX unified market heart for pre-explosion detection, "
         "fixed trade theses and paper-only risk management"
@@ -57,7 +57,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"https://explodex-web(?:-[a-z0-9-]+)?\.vercel\.app",
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -84,7 +84,7 @@ def _float(value, default: float = 0.0) -> float:
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.13.0",
+        "version": "0.14.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
@@ -94,6 +94,9 @@ async def root():
             "require_for_ready": settings.coinglass_require_for_ready,
         },
         "prediction_engine": "explodex-heart-v1",
+        "paper_execution_engine": PAPER_EXECUTION_VERSION,
+        "paper_authority": "UNIFIED_HEART_CONTRACT_ONLY",
+        "legacy_paper_writes_disabled": True,
         "ready_policy": READY_POLICY,
         "message": "ExplodeX unified heart online",
     }
@@ -110,6 +113,9 @@ async def health():
         "market_data_source": binance_client.active_source,
         "provider_warning": binance_client.last_primary_error,
         "prediction_engine": "explodex-heart-v1",
+        "paper_execution_engine": PAPER_EXECUTION_VERSION,
+        "paper_authority": "UNIFIED_HEART_CONTRACT_ONLY",
+        "legacy_paper_writes_disabled": True,
         "ready_policy": READY_POLICY,
         "coinglass": coinglass_client.status(),
     }
@@ -426,57 +432,99 @@ async def calibration(db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/v1/paper/sync")
 async def paper_sync(db: AsyncSession = Depends(get_db)):
+    """Compatibility endpoint routed to the single canonical PAPER engine."""
     try:
-        return await sync_ready_signals(db)
+        result = await run_fast_paper_cycle(db)
+        result["compatibility_route"] = "/api/v1/paper/sync"
+        result["legacy_trades_table_write_disabled"] = True
+        return result
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Paper sync failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Canonical PAPER sync failed: {exc}") from exc
 
 
 @app.post("/api/v1/paper/manage")
 async def paper_manage(db: AsyncSession = Depends(get_db)):
+    """Compatibility endpoint: manage exits only, never open legacy trades."""
     try:
-        return await manage_open_paper_trades_with_time(db)
+        result = await run_paper_exit_management(db)
+        result["compatibility_route"] = "/api/v1/paper/manage"
+        result["authority"] = "paper_positions"
+        result["legacy_trades_table_write_disabled"] = True
+        return result
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Paper manager failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Canonical PAPER manager failed: {exc}") from exc
 
 
 @app.get("/api/v1/paper/open")
 async def paper_open(
     limit: int = Query(default=20, ge=1, le=100),
+    scope: str = Query(default="arsenal"),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        text(
-            "SELECT t.id::text, sy.symbol, t.direction, t.status, t.leverage, t.risk_pct, t.entry_price, "
-            "t.quantity, t.notional_usdt, t.stop_loss, t.tp1, t.tp2, t.tp3, t.opened_at, t.pnl_usdt, "
-            "t.r_multiple, t.metadata FROM trades t JOIN symbols sy ON sy.id = t.symbol_id "
-            "WHERE t.mode = 'PAPER' AND t.status IN ('OPEN','PARTIAL') ORDER BY t.opened_at DESC LIMIT :limit"
-        ),
-        {"limit": limit},
-    )
-    return [dict(row) for row in result.mappings().all()]
+    """Compatibility read backed by the canonical paper_positions ledger."""
+    normalized_scope = "all" if str(scope).lower() == "all" else "arsenal"
+    summary = await (paper_summary(db) if normalized_scope == "all" else paper_arsenal_summary(db))
+    rows = list(summary.get("open_positions") or [])[:limit]
+    return [
+        {
+            **row,
+            "id": str(row.get("id")),
+            "direction": row.get("side"),
+            "status": "OPEN",
+            "notional_usdt": row.get("notional"),
+            "pnl_usdt": row.get("unrealized_pnl"),
+            "risk_pct": (
+                round(float(row.get("risk_usdt") or 0) / float(summary.get("equity") or 1) * 100.0, 6)
+                if float(summary.get("equity") or 0) > 0 else None
+            ),
+            "r_multiple": None,
+        }
+        for row in rows
+    ]
 
 
 @app.get("/api/v1/paper/history")
 async def paper_history(
     limit: int = Query(default=50, ge=1, le=500),
+    scope: str = Query(default="arsenal"),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        text(
-            "SELECT t.id::text, sy.symbol, t.direction, t.status, t.entry_price, t.exit_price, t.stop_loss, "
-            "t.tp1, t.tp2, t.tp3, t.opened_at, t.closed_at, t.pnl_usdt, t.pnl_pct, t.r_multiple, t.fees_usdt, "
-            "t.close_reason FROM trades t JOIN symbols sy ON sy.id = t.symbol_id "
-            "WHERE t.mode = 'PAPER' AND t.status IN ('CLOSED','STOPPED') ORDER BY t.closed_at DESC LIMIT :limit"
-        ),
-        {"limit": limit},
+    """Compatibility read backed by the canonical paper_positions ledger."""
+    normalized_scope = "all" if str(scope).lower() == "all" else "arsenal"
+    rows = await canonical_paper_history(
+        db,
+        limit=limit,
+        opened_after=None if normalized_scope == "all" else ARSENAL_DISPLAY_START,
     )
-    return [dict(row) for row in result.mappings().all()]
+    output = []
+    for row in rows:
+        risk = float(row.get("risk_usdt") or 0)
+        net = float(row.get("net_pnl") or 0)
+        output.append({
+            **row,
+            "id": str(row.get("id")),
+            "direction": row.get("side"),
+            "status": "CLOSED",
+            "pnl_usdt": row.get("net_pnl"),
+            "pnl_pct": None,
+            "r_multiple": round(net / risk, 4) if risk > 0 else None,
+            "fees_usdt": float(row.get("fees") or 0) + float(row.get("slippage") or 0) + float(row.get("funding_estimate") or 0),
+            "close_reason": row.get("exit_reason"),
+            "notional_usdt": row.get("notional"),
+        })
+    return output
 
 
 @app.get("/api/v1/paper/performance")
-async def paper_stats(db: AsyncSession = Depends(get_db)):
-    return await paper_performance(db)
+async def paper_stats(
+    scope: str = Query(default="arsenal"),
+    db: AsyncSession = Depends(get_db),
+):
+    normalized_scope = "all" if str(scope).lower() == "all" else "arsenal"
+    return await paper_performance_summary(
+        db,
+        opened_after=None if normalized_scope == "all" else ARSENAL_DISPLAY_START,
+    )
 
 
 @app.get("/api/v1/alerts/pending")

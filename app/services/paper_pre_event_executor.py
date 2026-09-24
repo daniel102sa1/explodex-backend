@@ -36,6 +36,7 @@ def _geometry_ok(side: str, entry: float, stop: float, target: float) -> bool:
 
 
 async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk_multiplier: float, btc_overlay: dict[str, Any] | None = None) -> dict[str, Any]:
+    await base.acquire_paper_open_lock(db)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
     if open_count >= base.MAX_OPEN_POSITIONS:
         return {"version": VERSION, "opened": 0, "reason": "max_open_positions", "rejected": {}}
@@ -99,18 +100,31 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
             "contract_lane": lane, "pre_event_prediction": contract.get("pre_event_prediction"), "event_risk": contract.get("event_risk"),
             "risk_conviction": conviction, "stop_survival": survival, "soft_invalidation_stop": survival.get("soft_invalidation_stop") if survival.get("enabled") else stop,
             "hard_stop": hard_stop,
+            "initial_hard_stop": hard_stop,
             "profit_lock": {
-                "enabled": True,
-                "stage": "INITIAL",
+                "enabled": False,
+                "stage": "IMMUTABLE_STRUCTURAL_STOP",
                 "tp1": _f(lane.get("tp1"), live_target),
                 "tp2": _f(lane.get("tp2")),
                 "tp3": _f(lane.get("tp3")),
                 "final_target": live_target,
-                "after_tp1": "MOVE_STOP_TO_BREAKEVEN_PLUS_COST_BUFFER_ON_NEXT_CANDLE",
-                "after_tp2": "MOVE_STOP_TO_TP1_ON_NEXT_CANDLE",
-                "pre_tp1_protection": "85pct_route_plus_confirmed_rejection",
-                "never_widen_stop": True,
+                "rule": "NEVER_MOVE_STOP_AFTER_ENTRY",
             },
+            "frozen_plan": {
+                "entry": fill,
+                "side": side,
+                "structural_stop": hard_stop,
+                "target": live_target,
+                "tp1": _f(lane.get("tp1"), live_target),
+                "tp2": _f(lane.get("tp2")),
+                "tp3": _f(lane.get("tp3")),
+                "leverage": leverage,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "stop_was_fixed_before_entry": True,
+            "stop_can_widen_after_entry": False,
+            "stop_can_tighten_after_entry": False,
+            "stop_policy": "IMMUTABLE_STRUCTURAL_STOP",
             "max_hold_minutes": lane.get("max_hold_minutes"), "experimental": True,
             "portfolio_mode": "DEFENSIVE_LEARNING" if defensive else "NORMAL", "pre_event_risk_cap": 0.25,
             "executor_cannot_change_direction": True, "executor_cannot_create_lane": True,
