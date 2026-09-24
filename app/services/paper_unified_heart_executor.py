@@ -391,6 +391,7 @@ async def execute_unified_heart_contracts(
             else 1.0
         )
         pump_state = _d(heart.get("pump_state_machine"))
+        historical_analog = _d(heart.get("historical_analog"))
         leverage_policy = _sarpon_leverage_policy(
             lane_name=lane_name,
             lane=lane,
@@ -462,7 +463,11 @@ async def execute_unified_heart_contracts(
             "catalyst_context": catalyst_context,
             "fundamental_risk_multiplier": fundamental_multiplier,
             "pump_state_machine": pump_state,
+            "historical_analog": historical_analog,
             "fundamental_is_shadow_context": True,
+            "historical_analog_is_shadow_context": True,
+            "historical_analog_can_create_entry": False,
+            "historical_analog_can_raise_leverage": False,
             "pump_state_is_shadow_context": True,
             "target_account_risk_pct_before_portfolio_brakes": round(base.RISK_PER_TRADE * 100.0 * conviction_multiplier, 4),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
@@ -503,6 +508,10 @@ async def execute_unified_heart_contracts(
                 "horizon_conflict": matrix.get("horizon_conflict"),
                 "elliott_pattern": _d(elliott.get("best_pattern")).get("pattern"),
                 "sarpon_phase": _d(heart.get("chati_sarpon_612_monitor")).get("phase"),
+                "historical_analog_sample": historical_analog.get("sample"),
+                "historical_analog_top_similarity": historical_analog.get("top_similarity"),
+                "historical_analog_status": historical_analog.get("status"),
+                "historical_analog_oos_status": _d(historical_analog.get("out_of_sample")).get("status"),
             },
             "stop_was_fixed_before_entry": True,
             "stop_can_widen_after_entry": False,
