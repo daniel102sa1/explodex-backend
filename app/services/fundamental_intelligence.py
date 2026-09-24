@@ -72,7 +72,9 @@ async def _resolve_coin(base_asset: str) -> dict[str, Any] | None:
         return mr, score
 
     exact.sort(key=rank)
-    return exact[0]
+    selected = dict(exact[0])
+    selected["_exact_symbol_candidates"] = len(exact)
+    return selected
 
 
 def _risk_layer(market: dict[str, Any]) -> dict[str, Any]:
@@ -191,6 +193,12 @@ async def fundamental_context_for_symbol(symbol: str) -> dict[str, Any]:
                 raise RuntimeError(f"CoinGecko market data unavailable for {coin_id}")
             market = dict(rows[0])
             risk = _risk_layer(market)
+            exact_candidates = int(_f(coin.get("_exact_symbol_candidates"), 1.0))
+            mapping_ambiguous = exact_candidates > 1
+            if mapping_ambiguous:
+                risk["raw_risk_multiplier_cap"] = risk.get("risk_multiplier_cap")
+                risk["risk_multiplier_cap"] = 1.0
+                risk["flags"] = list(risk.get("flags") or []) + ["ambiguous_symbol_mapping_no_risk_action"]
             value = {
                 "version": VERSION,
                 "enabled": True,
@@ -204,6 +212,13 @@ async def fundamental_context_for_symbol(symbol: str) -> dict[str, Any]:
                     "id": coin_id,
                     "name": market.get("name") or coin.get("name"),
                     "market_cap_rank": market.get("market_cap_rank") or coin.get("market_cap_rank"),
+                },
+                "symbol_mapping": {
+                    "method": "EXACT_TICKER_BEST_MARKET_CAP_RANK",
+                    "exact_symbol_candidates": exact_candidates,
+                    "ambiguous": mapping_ambiguous,
+                    "contract_address_verified": False,
+                    "can_affect_risk": not mapping_ambiguous,
                 },
                 "market": {
                     "market_cap_usd": _f(market.get("market_cap")),
@@ -240,7 +255,7 @@ async def fundamental_context_for_symbol(symbol: str) -> dict[str, Any]:
                 "can_create_entry": False,
                 "can_change_direction": False,
                 "can_raise_leverage": False,
-                "can_reduce_risk": True,
+                "can_reduce_risk": not mapping_ambiguous,
                 "note": (
                     "Fundamental/tokenomics context only. CoinGecko is used for market-cap/supply/dilution context; "
                     "execution still uses exchange-native data and missing on-chain/unlock/security layers are not fabricated."
