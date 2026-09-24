@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.services.fundamental_intelligence import VERSION as FUNDAMENTAL_VERSION, fundamental_context_for_symbol
+from app.services.news_context import news_context_for_symbol
 from app.services.pump_state_machine import VERSION as PUMP_VERSION, classify_pump_state
 
 VERSION = "fundamental_persistence_v1_shadow"
@@ -88,18 +89,36 @@ async def persist_fundamental_intelligence_for_run(db: AsyncSession, run_id: str
     fetch_rows = rows[:fetch_limit] if settings.fundamentals_enabled else []
     semaphore = asyncio.Semaphore(3)
 
-    async def load(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    async def load(row: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
         symbol = str(row.get("symbol") or "").upper()
         try:
             async with semaphore:
-                value = await fundamental_context_for_symbol(symbol)
+                value, news = await asyncio.gather(
+                    fundamental_context_for_symbol(symbol),
+                    news_context_for_symbol(symbol),
+                )
         except Exception as exc:
             value = _unavailable_fundamental(symbol, f"runtime_error:{type(exc).__name__}")
             value["error"] = str(exc)[:300]
-        return symbol, value
+            news = {
+                "enabled": bool(settings.news_enabled),
+                "symbol": symbol,
+                "sentiment": "UNAVAILABLE",
+                "structured_events": [],
+                "catalyst_summary": {
+                    "detected_events": 0,
+                    "high_magnitude_events": 0,
+                    "requires_primary_source_verification": False,
+                    "can_create_entry": False,
+                    "can_raise_leverage": False,
+                },
+                "error": str(exc)[:300],
+            }
+        return symbol, value, news
 
     fetched = await asyncio.gather(*(load(row) for row in fetch_rows))
-    fundamental_by_symbol = {symbol: value for symbol, value in fetched}
+    fundamental_by_symbol = {symbol: value for symbol, value, _news in fetched}
+    news_by_symbol = {symbol: news for symbol, _value, news in fetched}
 
     updated = 0
     available = 0
@@ -156,11 +175,27 @@ async def persist_fundamental_intelligence_for_run(db: AsyncSession, run_id: str
             "pump_state_score": pump_state.get("state_score"),
             "pump_state_direction": pump_state.get("dominant_direction"),
         })
+        catalyst_context = news_by_symbol.get(symbol) or {
+            "enabled": bool(settings.news_enabled),
+            "symbol": symbol,
+            "sentiment": "UNAVAILABLE",
+            "structured_events": [],
+            "catalyst_summary": {
+                "detected_events": 0,
+                "high_magnitude_events": 0,
+                "requires_primary_source_verification": False,
+                "can_create_entry": False,
+                "can_raise_leverage": False,
+            },
+            "reason": "outside_news_fetch_budget",
+        }
         reason["metrics"] = metrics
         reason["fundamental_intelligence"] = fundamental
+        reason["catalyst_context"] = catalyst_context
         reason["pump_state_machine"] = pump_state
         if prediction:
             prediction["fundamental_intelligence"] = fundamental
+            prediction["catalyst_context"] = catalyst_context
             prediction["pump_state_machine"] = pump_state
             reason["prediction"] = prediction
 
@@ -182,6 +217,7 @@ async def persist_fundamental_intelligence_for_run(db: AsyncSession, run_id: str
         "seen": len(rows),
         "fundamentals_requested": len(fetch_rows),
         "fundamentals_available": available,
+        "news_context_requested": len(fetch_rows),
         "high_tokenomics_risk": high_risk,
         "updated": updated,
         "pump_states": pump_counts,
