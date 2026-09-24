@@ -3,9 +3,10 @@ from __future__ import annotations
 from statistics import mean, pstdev
 from typing import Any
 
+from app.services.impulse_pullback_confirmation import build_impulse_pullback_confirmation
 from app.services.price_action_pattern_vision import detect_price_action_patterns
 
-VERSION = "professional_confluence_arsenal_v2_price_action_vision"
+VERSION = "professional_confluence_arsenal_v3_impulse_pullback"
 POLICY = {
     "indicators_are_confirmation_not_standalone_triggers": True,
     "can_create_entry_by_itself": False,
@@ -668,6 +669,7 @@ def build_professional_arsenal_context(
     spot_cvd = _trade_cvd(snapshot.get("spot_agg_trades") or [])
     range_patterns = _range_patterns(rows)
     price_action = detect_price_action_patterns(rows)
+    impulse_pullback = build_impulse_pullback_confirmation(rows)
     derivatives = _derivatives_context(metrics, snapshot.get("premium") or {}, cg)
     absorption = _absorption_exhaustion(metrics, futures_cvd, spot_cvd)
     layers = _layer_scores(
@@ -691,6 +693,7 @@ def build_professional_arsenal_context(
         "policy": POLICY,
         "patterns": range_patterns,
         "price_action_pattern_vision": price_action,
+        "impulse_pullback_confirmation": impulse_pullback,
         "vwap": vwap,
         "ema_context": ema,
         "volume_profile_note": "ExplodeX technical_arsenal already computes approximate POC/value area; not double-counted here.",
@@ -729,6 +732,7 @@ def build_professional_arsenal_context(
             "structure": {
                 "range_patterns": range_patterns,
                 "price_action_pattern_vision": price_action,
+                "impulse_pullback_confirmation": impulse_pullback,
             },
             "liquidity": {
                 "order_book_imbalance": metrics.get("order_book_imbalance"),
@@ -749,6 +753,7 @@ def build_professional_arsenal_context(
         "note": (
             "Professional confluence layer: price/structure/liquidity/volume/derivatives first; "
             "geometric chart/candlestick/harmonic patterns are shadow evidence until confirmed; "
+            "impulse-pullback-reaction sequencing provides bounded timing evidence and never authorizes a trade alone; "
             "oscillators are confirmation only. No single indicator or pattern can authorize a trade."
         ),
     }
