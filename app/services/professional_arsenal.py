@@ -699,6 +699,12 @@ def build_professional_arsenal_context(
                 "do_not_chase": True,
             },
         }
+    degraded_layers: list[str] = []
+    if not bool(price_action.get("available")) and price_action.get("reason") == "shadow_layer_runtime_error":
+        degraded_layers.append("price_action_pattern_vision")
+    if not bool(impulse_pullback.get("available")) and impulse_pullback.get("reason") == "shadow_layer_runtime_error":
+        degraded_layers.append("impulse_pullback_confirmation")
+
     derivatives = _derivatives_context(metrics, snapshot.get("premium") or {}, cg)
     absorption = _absorption_exhaustion(metrics, futures_cvd, spot_cvd)
     layers = _layer_scores(
@@ -720,6 +726,7 @@ def build_professional_arsenal_context(
         "research_only": False,
         "score_is_probability": False,
         "policy": POLICY,
+        "degraded_layers": degraded_layers,
         "patterns": range_patterns,
         "price_action_pattern_vision": price_action,
         "impulse_pullback_confirmation": impulse_pullback,
