@@ -8,6 +8,7 @@ from app.services import scanner as scanner_module
 from app.services.elliott_persistence import persist_elliott_for_run
 from app.services.entry_latch_persistence import apply_entry_latches_for_run
 from app.services.event_risk_persistence import persist_event_risk_for_run
+from app.services.fundamental_persistence import persist_fundamental_intelligence_for_run
 from app.services.chati_sarpon_612_monitor import persist_manual_monitor_for_run
 from app.services.heart_persistence import canonicalize_scanner_run
 from app.services.horizon_matrix_persistence import persist_horizon_matrix_for_run
@@ -62,6 +63,7 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
     if run_id:
         steps = [
             ("edge_gate", apply_edge_gate_to_scanner_run, "scanner_edge_gate"),
+            ("fundamental_intelligence", persist_fundamental_intelligence_for_run, "fundamental_intelligence_persistence"),
             ("explodex_heart", canonicalize_scanner_run, "explodex_heart"),
             ("quant_brain", persist_quant_brain_for_run, "quant_brain_persistence"),
             ("macro_cycle", persist_macro_cycle_for_run, "macro_cycle_persistence"),
