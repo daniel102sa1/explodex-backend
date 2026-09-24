@@ -68,6 +68,8 @@ def extract_signal_features(reason: Any) -> dict[str, Any]:
     context = _d(prediction.get("context_engine"))
     regime = _d(context.get("regime"))
     fundamental = _d(bundle.get("fundamental_intelligence")) or _d(heart.get("fundamental_intelligence"))
+    catalyst_context = _d(bundle.get("catalyst_context")) or _d(heart.get("catalyst_context"))
+    catalyst_summary = _d(catalyst_context.get("catalyst_summary"))
     fundamental_risk = _d(fundamental.get("risk"))
     fundamental_market = _d(fundamental.get("market"))
     fundamental_tokenomics = _d(fundamental.get("tokenomics"))
@@ -114,6 +116,10 @@ def extract_signal_features(reason: Any) -> dict[str, Any]:
         "pump_state": pump_state.get("state"),
         "pump_state_score": pump_state.get("state_score"),
         "pump_state_direction": pump_state.get("dominant_direction"),
+        "catalyst_sentiment": catalyst_context.get("sentiment"),
+        "catalyst_event_count": catalyst_summary.get("detected_events"),
+        "catalyst_high_magnitude_count": catalyst_summary.get("high_magnitude_events"),
+        "catalyst_requires_primary_verification": catalyst_summary.get("requires_primary_source_verification"),
         "cg_oi_5m_pct": cg_oi.get("change_5m_pct"),
         "cg_oi_15m_pct": cg_oi.get("change_15m_pct"),
         "cg_oi_1h_pct": cg_oi.get("change_1h_pct"),
