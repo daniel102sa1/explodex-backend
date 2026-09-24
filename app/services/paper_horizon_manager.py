@@ -370,12 +370,13 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
             opened_at=opened_at,
             closed_at=now,
         )
-        await db.execute(text("""
+        close_result = await db.execute(text("""
             UPDATE paper_positions
             SET status='CLOSED', closed_at=:closed_at, exit_price=:exit_price,
                 exit_reason=:exit_reason, gross_pnl=:gross_pnl, net_pnl=:net_pnl,
                 fees=:fees, slippage=:slippage, funding_estimate=:funding_estimate
-            WHERE id=:id
+            WHERE id=:id AND status='OPEN'
+            RETURNING id
         """), {
             "id": row["id"],
             "closed_at": now,
@@ -383,6 +384,9 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
             "exit_reason": exit_reason,
             **pnl,
         })
+        if close_result.scalar_one_or_none() is None:
+            # Another worker/process already closed this row. Never book PnL twice.
+            continue
         await db.execute(text("""
             UPDATE paper_accounts
             SET cash_balance=cash_balance+:net_pnl,
