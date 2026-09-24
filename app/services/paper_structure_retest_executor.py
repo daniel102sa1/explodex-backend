@@ -59,6 +59,7 @@ async def execute_structure_retest_contracts(
     risk_multiplier: float = 1.0,
     btc_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    await base.acquire_paper_open_lock(db)
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
