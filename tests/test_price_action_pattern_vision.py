@@ -1,4 +1,4 @@
-from app.services.price_action_pattern_vision import _candles, _harmonics, detect_price_action_patterns
+from app.services.price_action_pattern_vision import _candles, _chart_patterns, _harmonics, detect_price_action_patterns
 
 
 def _row(i, o, h, l, c, v=100.0):
@@ -47,3 +47,21 @@ def test_full_detector_is_shadow_only_and_returns_levels_patterns():
     assert "candlestick_patterns" in result
     assert "harmonic_patterns" in result
     assert "market_cycle" in result
+
+
+
+def test_chart_pattern_flat_trendline_checks_receive_atr():
+    bars = [
+        {"time": i, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 100.0}
+        for i in range(20)
+    ]
+    pivots = [
+        {"index": 2, "time": 2, "type": "H", "price": 101.0},
+        {"index": 4, "time": 4, "type": "L", "price": 99.0},
+        {"index": 7, "time": 7, "type": "H", "price": 101.02},
+        {"index": 9, "time": 9, "type": "L", "price": 99.3},
+        {"index": 12, "time": 12, "type": "H", "price": 101.01},
+        {"index": 14, "time": 14, "type": "L", "price": 99.6},
+    ]
+    found = _chart_patterns(bars, pivots, 0.5)
+    assert any(item["name"] == "ASCENDING_TRIANGLE" for item in found)
