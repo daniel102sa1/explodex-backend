@@ -39,6 +39,15 @@ class Settings(BaseSettings):
     news_max_headlines: int = 10
     news_cache_ttl_seconds: int = 900
 
+    # Fundamental/tokenomics context. This is a PAPER/shadow risk layer, never
+    # a standalone entry or leverage trigger.
+    fundamentals_enabled: bool = True
+    fundamentals_max_scanner_candidates: int = 8
+    fundamentals_cache_ttl_seconds: int = 900
+    coingecko_base_url: str = "https://api.coingecko.com/api/v3"
+    coingecko_demo_api_key: str = ""
+    coingecko_timeout_seconds: float = 10.0
+
     # Automatic runtime loops. These values are deliberately conservative so
     # Railway usage and exchange/API traffic remain controlled in v1.
     scheduler_enabled: bool = True
