@@ -332,6 +332,74 @@ class BinancePublicClient:
             loader=load,
         )
 
+    async def historical_spot_klines(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        days: int = 60,
+    ) -> dict[str, Any]:
+        """Fetch point-in-time OHLCV history from Binance spot without future leakage.
+
+        Historical Market Brain uses spot OHLCV as a price/volume structure archive.
+        Derivative-only features (OI, funding, liquidations, L2) are deliberately
+        excluded unless a point-in-time provider is available for them.
+        """
+        symbol = symbol.upper()
+        interval_ms = {
+            "1m": 60_000,
+            "3m": 180_000,
+            "5m": 300_000,
+            "15m": 900_000,
+            "30m": 1_800_000,
+            "1h": 3_600_000,
+            "2h": 7_200_000,
+            "4h": 14_400_000,
+            "1d": 86_400_000,
+        }
+        if interval not in interval_ms:
+            raise ValueError(f"Unsupported historical interval: {interval}")
+
+        safe_days = max(2, min(int(days), 365))
+        wanted_rows = max(100, int((safe_days * 86_400_000) / interval_ms[interval]))
+        rows: list[list[Any]] = []
+        end_time: int | None = None
+
+        while len(rows) < wanted_rows:
+            batch_limit = min(1000, wanted_rows - len(rows))
+            params: dict[str, Any] = {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": batch_limit,
+            }
+            if end_time is not None:
+                params["endTime"] = end_time
+            batch = await self._binance_spot_get("/api/v3/klines", params)
+            if not isinstance(batch, list) or not batch:
+                break
+            rows = list(batch) + rows
+            first_ts = int(batch[0][0])
+            end_time = first_ts - 1
+            if len(batch) < batch_limit:
+                break
+            await asyncio.sleep(0)
+
+        dedup: dict[int, list[Any]] = {}
+        for row in rows:
+            if isinstance(row, list) and len(row) >= 8:
+                dedup[int(row[0])] = row
+        ordered = [dedup[key] for key in sorted(dedup)][-wanted_rows:]
+        return {
+            "symbol": symbol,
+            "interval": interval,
+            "source": "BINANCE_SPOT_HISTORY",
+            "days_requested": safe_days,
+            "rows_requested": wanted_rows,
+            "rows_available": len(ordered),
+            "rows": ordered,
+            "point_in_time": True,
+            "derivatives_included": False,
+        }
+
     async def historical_daily_klines(self, symbol: str, days: int = 1095) -> dict[str, Any]:
         """Fetch long daily history for macro-cycle analysis.
 
