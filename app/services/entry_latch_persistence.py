@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.entry_trigger_latch import latched_action, resolve_entry_latch, trigger_entry_latch
 
-VERSION = "entry_latch_persistence_v1"
+VERSION = "entry_latch_persistence_v2_db_state_compat"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -120,7 +120,10 @@ async def apply_entry_latches_for_run(db: AsyncSession, run_id: str) -> dict[str
             reason["prediction"] = prediction
         reason["explodex_heart"] = heart
 
-        signal_state = "READY" if bool(new_decision.get("should_enter")) else "NO_TRADE" if status in {"INVALIDATED", "COMPLETED"} else "ACTIVE_PLAN"
+        # ACTIVE_PLAN is an internal Heart lifecycle state. The legacy signals.state
+        # CHECK constraint accepts scanner states such as PREPARING/READY/NO_TRADE,
+        # so persist PREPARING while the latched plan is alive but not executable.
+        signal_state = "READY" if bool(new_decision.get("should_enter")) else "NO_TRADE" if status in {"INVALIDATED", "COMPLETED"} else "PREPARING"
         await db.execute(text("""
             UPDATE signals
             SET state=:state, reason=CAST(:reason AS JSONB), updated_at=NOW()
