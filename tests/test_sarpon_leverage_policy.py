@@ -13,7 +13,8 @@ def _green_heart():
 
 
 def _policy(*, tier="HIGH", lane_name="TACTICAL", defensive=False, btc_stress="NORMAL",
-            quant=1.0, council=1.0, shadow=1.0, btc_side=1.0, heart=None):
+            quant=1.0, council=1.0, shadow=1.0, btc_side=1.0, fundamental=1.0,
+            pump_stage="NORMAL", heart=None):
     return _sarpon_leverage_policy(
         lane_name=lane_name,
         lane={"max_leverage": 3 if lane_name == "TACTICAL" else 2},
@@ -25,6 +26,8 @@ def _policy(*, tier="HIGH", lane_name="TACTICAL", defensive=False, btc_stress="N
         council_multiplier=council,
         shadow_risk_multiplier=shadow,
         btc_side_multiplier=btc_side,
+        fundamental_multiplier=fundamental,
+        pump_state={"state": pump_stage},
     )
 
 
@@ -72,3 +75,15 @@ def test_sarpon_contradiction_blocks_boost():
     result = _policy(tier="MAX_CONVICTION", heart=heart)
     assert result["eligible"] is False
     assert result["selected_leverage"] == 3
+
+
+def test_high_fundamental_risk_or_unvalidated_pump_exhaustion_blocks_leverage_boost():
+    high_tokenomics_risk = _policy(tier="MAX_CONVICTION", fundamental=0.65)
+    assert high_tokenomics_risk["eligible"] is False
+    assert high_tokenomics_risk["selected_leverage"] == 3
+    assert high_tokenomics_risk["requires"]["fundamental_risk_safe"] is False
+
+    exhausted = _policy(tier="MAX_CONVICTION", pump_stage="EXHAUSTION")
+    assert exhausted["eligible"] is False
+    assert exhausted["selected_leverage"] == 3
+    assert exhausted["requires"]["pump_state_safe_for_leverage_escalation"] is False
