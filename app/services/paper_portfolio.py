@@ -540,6 +540,69 @@ async def paper_equity_curve(db: AsyncSession, limit: int = 500, opened_after: d
     }
 
 
+async def paper_performance_summary(
+    db: AsyncSession,
+    *,
+    opened_after: datetime | None = None,
+) -> dict[str, Any]:
+    """Canonical PAPER performance metrics from paper_positions only."""
+    await ensure_paper_schema(db)
+    cohort_filter = " AND opened_at >= :opened_after" if opened_after is not None else ""
+    params = {"opened_after": opened_after} if opened_after is not None else {}
+    rows = [dict(r) for r in (await db.execute(text(f"""
+        SELECT net_pnl, risk_usdt
+        FROM paper_positions
+        WHERE status='CLOSED' AND net_pnl IS NOT NULL{cohort_filter}
+        ORDER BY closed_at ASC
+    """), params)).mappings().all()]
+
+    closed = len(rows)
+    wins = sum(1 for row in rows if _f(row.get("net_pnl")) > 0)
+    losses = closed - wins
+    pnl_values = [_f(row.get("net_pnl")) for row in rows]
+    gross_profit = sum(value for value in pnl_values if value > 0)
+    gross_loss = sum(value for value in pnl_values if value < 0)
+    net_pnl = sum(pnl_values)
+    expectancy = net_pnl / closed if closed else None
+    r_values = [
+        _f(row.get("net_pnl")) / _f(row.get("risk_usdt"))
+        for row in rows
+        if _f(row.get("risk_usdt")) > 0
+    ]
+    average_r = sum(r_values) / len(r_values) if r_values else None
+    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else (None if gross_profit <= 0 else float("inf"))
+
+    curve = await paper_equity_curve(db, limit=5000, opened_after=opened_after)
+    peak = _f(curve.get("starting_balance"), STARTING_BALANCE)
+    max_drawdown_pct = 0.0
+    for point in list(curve.get("points") or []):
+        equity = _f(point.get("equity"), peak)
+        peak = max(peak, equity)
+        if peak > 0:
+            max_drawdown_pct = max(max_drawdown_pct, (peak - equity) / peak * 100.0)
+
+    summary = await (paper_arsenal_summary(db) if opened_after is not None else paper_summary(db))
+    return {
+        "paper_only": True,
+        "source": "paper_positions",
+        "scope": "arsenal" if opened_after is not None else "all",
+        "closed_trades": closed,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(wins / closed * 100.0, 2) if closed else None,
+        "net_pnl_usdt": round(net_pnl, 6),
+        "gross_profit_usdt": round(gross_profit, 6),
+        "gross_loss_usdt": round(gross_loss, 6),
+        "expectancy_usdt_per_trade": round(expectancy, 6) if expectancy is not None else None,
+        "average_r": round(average_r, 4) if average_r is not None else None,
+        "profit_factor": round(profit_factor, 4) if profit_factor not in {None, float("inf")} else profit_factor,
+        "max_drawdown_pct": round(max_drawdown_pct, 4),
+        "current_equity_usdt": _f(summary.get("equity")),
+        "starting_equity_usdt": _f(summary.get("starting_balance"), STARTING_BALANCE),
+        "ready_for_real_money": False,
+    }
+
+
 async def paper_signal_history(db: AsyncSession, limit: int = 200, created_after: datetime | None = None) -> list[dict[str, Any]]:
     """Recent scanner signals with PAPER execution linkage for the trade center."""
     cohort_filter = " WHERE s.created_at >= :created_after" if created_after is not None else ""
