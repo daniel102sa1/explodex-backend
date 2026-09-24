@@ -53,6 +53,56 @@ def test_short_squeeze_detects_upside_pressure():
     assert event["event_type"] in {"SHORT_SQUEEZE", "LIQUIDATION_CASCADE", "BLACK_SWAN_PROXY", "STRESS"}
 
 
+def test_pump_state_radar_prefers_spot_supported_continuation():
+    event = build_event_risk(
+        reason={
+            "metrics": {
+                "change_5m_pct": 1.0,
+                "change_15m_pct": 2.4,
+                "change_1h_pct": 4.2,
+                "atr_pct": 0.9,
+                "relative_volume": 3.0,
+                "volume_acceleration": 1.8,
+                "oi_change_pct": 0.45,
+                "funding_rate": 0.0001,
+                "futures_delta_ratio": 0.14,
+                "spot_delta_ratio": 0.16,
+                "order_book_imbalance": 0.12,
+            }
+        },
+        score={"symbol": "ALTUSDT"},
+    )
+    radar = event["pump_state"]
+    assert radar["state"] == "UPSIDE_CONTINUATION"
+    assert radar["experimental"] is True
+    assert radar["creates_entry"] is False
+
+
+def test_pump_state_radar_flags_perp_led_exhaustion_after_pump():
+    event = build_event_risk(
+        reason={
+            "metrics": {
+                "change_5m_pct": -0.4,
+                "change_15m_pct": 3.0,
+                "change_1h_pct": 7.0,
+                "atr_pct": 1.0,
+                "relative_volume": 3.4,
+                "volume_acceleration": 1.2,
+                "oi_change_pct": 1.4,
+                "funding_rate": 0.0008,
+                "futures_delta_ratio": 0.18,
+                "spot_delta_ratio": -0.02,
+                "order_book_imbalance": -0.05,
+            }
+        },
+        score={"symbol": "ALTUSDT"},
+    )
+    radar = event["pump_state"]
+    assert radar["state"] == "UPSIDE_EXHAUSTION"
+    assert radar["perp_led_up"] is True
+    assert radar["validated_out_of_sample"] is False
+
+
 def test_depeg_risk_can_block_new_entries():
     event = build_event_risk(
         reason={"stablecoin_distance_pct": 1.2, "metrics": {"change_15m_pct": -1.1, "change_1h_pct": -1.4}},
