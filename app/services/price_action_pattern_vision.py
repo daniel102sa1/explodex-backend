@@ -3,7 +3,7 @@ from __future__ import annotations
 from statistics import mean
 from typing import Any
 
-VERSION = "price_action_pattern_vision_v1_shadow"
+VERSION = "price_action_pattern_vision_v2_pivot_candle_fix"
 
 POLICY = {
     "paper_only": True,
@@ -84,11 +84,11 @@ def _pivots(bars: list[dict[str, float]], *, window: int = 2, atr: float = 0.0) 
         is_low = all(bar["low"] <= x["low"] for x in left + right)
         if is_high:
             surrounding = max([x["high"] for x in left + right] or [bar["high"]])
-            if bar["high"] - surrounding >= -prominence:
+            if bar["high"] - surrounding >= prominence:
                 out.append({"index": i, "time": bar["time"], "type": "H", "price": bar["high"]})
         if is_low:
             surrounding = min([x["low"] for x in left + right] or [bar["low"]])
-            if surrounding - bar["low"] >= -prominence:
+            if surrounding - bar["low"] >= prominence:
                 out.append({"index": i, "time": bar["time"], "type": "L", "price": bar["low"]})
     out.sort(key=lambda p: p["index"])
 
@@ -198,9 +198,11 @@ def _candles(bars: list[dict[str, float]], atr: float) -> list[dict[str, Any]]:
     closes = [b["close"] for b in bars]
     trend = _trend(closes, 20)
     out: list[dict[str, Any]] = []
-    b = bars[-2]  # last fully closed candle
-    p = bars[-3]
-    p2 = bars[-4]
+    # detect_price_action_patterns() already removes the still-forming candle,
+    # so bars[-1] is the most recent fully closed candle.
+    b = bars[-1]
+    p = bars[-2]
+    p2 = bars[-3]
 
     body = abs(b["close"] - b["open"])
     span = max(b["high"] - b["low"], 1e-12)
@@ -241,7 +243,7 @@ def _candles(bars: list[dict[str, float]], atr: float) -> list[dict[str, Any]]:
         if p2["close"] > p2["open"] and b["close"] < b["open"] and b["close"] < (p2["open"] + p2["close"]) / 2:
             out.append({"name": "EVENING_STAR", "bias": "SHORT", "quality": 72.0})
 
-    last3 = bars[-4:-1]
+    last3 = bars[-3:]
     if all(x["close"] > x["open"] for x in last3) and last3[0]["close"] < last3[1]["close"] < last3[2]["close"]:
         out.append({"name": "THREE_WHITE_SOLDIERS", "bias": "LONG", "quality": 68.0})
     if all(x["close"] < x["open"] for x in last3) and last3[0]["close"] > last3[1]["close"] > last3[2]["close"]:
