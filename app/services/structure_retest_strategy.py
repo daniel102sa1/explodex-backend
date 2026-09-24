@@ -3,7 +3,7 @@ from __future__ import annotations
 from statistics import median
 from typing import Any
 
-VERSION = "structure_retest_strategy_v1"
+VERSION = "structure_retest_strategy_v2_noise_floor"
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -202,14 +202,14 @@ def detect_structure_retest(
             recent_lows = [bar["low"] for bar in subsequent[-4:]]
             higher_low_or_lower_high = bool(recent_lows) and min(recent_lows) >= retest_bar["low"] - atr * 0.08
             structural_level = min(recent_lows + [retest_bar["low"]])
-            structural_buffer = max(atr * 0.45, current_price * 0.0015) * btc_stop_buffer_multiplier * btc_stop_buffer_multiplier
+            structural_buffer = max(atr * 0.45, current_price * 0.0015) * btc_stop_buffer_multiplier
             structural_stop = structural_level - structural_buffer
         else:
             continuation = latest["close"] <= level - atr * 0.18 and latest["close"] < retest_bar["close"]
             recent_highs = [bar["high"] for bar in subsequent[-4:]]
             higher_low_or_lower_high = bool(recent_highs) and max(recent_highs) <= retest_bar["high"] + atr * 0.08
             structural_level = max(recent_highs + [retest_bar["high"]])
-            structural_buffer = max(atr * 0.45, current_price * 0.0015)
+            structural_buffer = max(atr * 0.45, current_price * 0.0015) * btc_stop_buffer_multiplier
             structural_stop = structural_level + structural_buffer
 
         phase = "RETEST_CONFIRMED" if continuation else "RETESTING"
@@ -258,11 +258,15 @@ def detect_structure_retest(
 
     htf_target = _nearest_htf_target(direction, reference_entry, bars1h)
 
+    # A stop that sits inside ordinary 15m noise is not a valid way to
+    # manufacture attractive R/R. Reject it and wait for a better retest/entry.
+    min_stop_distance_atr = 0.75
+    stop_too_tight_for_noise = structural_stop > 0 and stop_distance_atr < min_stop_distance_atr
     paper_candidate = bool(
         phase == "RETEST_CONFIRMED"
         and score >= 72.0
         and structural_stop > 0
-        and stop_distance_atr <= 3.5
+        and min_stop_distance_atr <= stop_distance_atr <= 3.5
         and not chased
     )
 
@@ -291,6 +295,8 @@ def detect_structure_retest(
         "structural_level": round(structural_level, 12) if structural_level else None,
         "structural_stop": round(structural_stop, 12) if structural_stop else None,
         "stop_distance_atr": round(stop_distance_atr, 3),
+        "min_stop_distance_atr": min_stop_distance_atr,
+        "stop_too_tight_for_noise": stop_too_tight_for_noise,
         "targets": {
             "htf_liquidity": round(htf_target, 12) if htf_target else None,
             "r2_5": round(r25, 12) if r25 else None,
@@ -304,6 +310,8 @@ def detect_structure_retest(
             "stop_fixed_before_entry": True,
             "stop_never_widens_after_entry": True,
             "btc_stop_buffer_multiplier": round(btc_stop_buffer_multiplier, 3),
+            "min_stop_distance_atr": min_stop_distance_atr,
+            "reject_noise_tight_stop": True,
         },
         "reason": "breakout_retest_structure" if paper_candidate else phase.lower(),
     }

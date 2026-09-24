@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-VERSION = "event_risk_engine_v1_1"
+VERSION = "event_risk_engine_v2_pump_state_radar"
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -20,6 +20,115 @@ def _f(value: Any, default: float = 0.0) -> float:
 
 def _clip(value: float) -> float:
     return max(0.0, min(100.0, float(value)))
+
+
+def _pump_state_radar(
+    *,
+    ch5: float,
+    ch15: float,
+    ch1h: float,
+    atr: float,
+    relative_volume: float,
+    volume_acceleration: float,
+    oi_change_pct: float,
+    funding: float,
+    futures_delta: float,
+    spot_delta: float,
+    book_imbalance: float,
+) -> dict[str, Any]:
+    """Experimental PAPER-only continuation/exhaustion diagnostic.
+
+    This does not create a trade direction. It separates spot-supported expansion
+    from leverage-led moves that are more vulnerable to exhaustion/reversal.
+    Thresholds are deliberately interpretable so they can be calibrated later
+    against ExplodeX's stored horizon outcomes.
+    """
+    atr = max(0.25, atr)
+    up_move = ch15 >= max(1.2, atr * 1.35) or ch1h >= max(2.5, atr * 2.2)
+    down_move = ch15 <= -max(1.2, atr * 1.35) or ch1h <= -max(2.5, atr * 2.2)
+    perp_led_up = futures_delta >= 0.08 and spot_delta <= max(0.02, futures_delta - 0.08)
+    perp_led_down = futures_delta <= -0.08 and spot_delta >= min(-0.02, futures_delta + 0.08)
+
+    scores = {
+        "UPSIDE_CONTINUATION": 0.0,
+        "DOWNSIDE_CONTINUATION": 0.0,
+        "UPSIDE_EXHAUSTION": 0.0,
+        "DOWNSIDE_EXHAUSTION": 0.0,
+    }
+    evidence: dict[str, list[str]] = {key: [] for key in scores}
+
+    def add(key: str, points: float, why: str) -> None:
+        scores[key] += points
+        evidence[key].append(why)
+
+    if up_move:
+        add("UPSIDE_CONTINUATION", 20, "abnormal_up_move")
+        add("UPSIDE_EXHAUSTION", 20, "abnormal_up_move")
+    if down_move:
+        add("DOWNSIDE_CONTINUATION", 20, "abnormal_down_move")
+        add("DOWNSIDE_EXHAUSTION", 20, "abnormal_down_move")
+    if relative_volume >= 2.0:
+        for key in scores:
+            add(key, 10, "relative_volume>=2x")
+    if volume_acceleration >= 1.5:
+        add("UPSIDE_CONTINUATION", 8, "volume_accelerating")
+        add("DOWNSIDE_CONTINUATION", 8, "volume_accelerating")
+    if spot_delta >= 0.08:
+        add("UPSIDE_CONTINUATION", 22, "spot_buying_confirms")
+    if spot_delta <= -0.08:
+        add("DOWNSIDE_CONTINUATION", 22, "spot_selling_confirms")
+    if futures_delta >= 0.08:
+        add("UPSIDE_CONTINUATION", 10, "futures_buying_confirms")
+    if futures_delta <= -0.08:
+        add("DOWNSIDE_CONTINUATION", 10, "futures_selling_confirms")
+    if book_imbalance >= 0.08:
+        add("UPSIDE_CONTINUATION", 10, "book_supports_upside")
+    if book_imbalance <= -0.08:
+        add("DOWNSIDE_CONTINUATION", 10, "book_supports_downside")
+    if oi_change_pct >= 0.35:
+        add("UPSIDE_CONTINUATION", 6, "new_open_interest")
+        add("DOWNSIDE_CONTINUATION", 6, "new_open_interest")
+
+    if up_move and perp_led_up:
+        add("UPSIDE_EXHAUSTION", 20, "perp_led_spot_weak")
+    if down_move and perp_led_down:
+        add("DOWNSIDE_EXHAUSTION", 20, "perp_led_spot_weak")
+    if up_move and oi_change_pct >= 0.80:
+        add("UPSIDE_EXHAUSTION", 12, "oi_crowding")
+    if down_move and oi_change_pct >= 0.80:
+        add("DOWNSIDE_EXHAUSTION", 12, "oi_crowding")
+    if up_move and funding >= 0.0005:
+        add("UPSIDE_EXHAUSTION", 10, "positive_funding_crowding")
+    if down_move and funding <= -0.0005:
+        add("DOWNSIDE_EXHAUSTION", 10, "negative_funding_crowding")
+    if up_move and book_imbalance <= 0.0:
+        add("UPSIDE_EXHAUSTION", 10, "book_no_longer_supports_upside")
+    if down_move and book_imbalance >= 0.0:
+        add("DOWNSIDE_EXHAUSTION", 10, "book_no_longer_supports_downside")
+    if up_move and ch5 < 0:
+        add("UPSIDE_EXHAUSTION", 14, "short_term_reversal_after_pump")
+    if down_move and ch5 > 0:
+        add("DOWNSIDE_EXHAUSTION", 14, "short_term_reversal_after_dump")
+
+    best_state, best_score = max(scores.items(), key=lambda item: item[1])
+    if best_score < 45:
+        best_state = "NO_CLEAR_STATE"
+    return {
+        "version": "pump_state_radar_v1",
+        "state": best_state,
+        "confidence_score": round(_clip(best_score), 1),
+        "scores": {key: round(_clip(value), 1) for key, value in scores.items()},
+        "evidence": evidence.get(best_state, []),
+        "up_move_active": up_move,
+        "down_move_active": down_move,
+        "perp_led_up": perp_led_up,
+        "perp_led_down": perp_led_down,
+        "experimental": True,
+        "paper_only": True,
+        "validated_out_of_sample": False,
+        "creates_entry": False,
+        "changes_direction": False,
+    }
 
 
 def build_event_risk(*, reason: dict[str, Any], score: dict[str, Any]) -> dict[str, Any]:
@@ -107,13 +216,26 @@ def build_event_risk(*, reason: dict[str, Any], score: dict[str, Any]) -> dict[s
 
     risk_multiplier = {"NORMAL": 1.0, "WATCH": 0.85, "ELEVATED": 0.65, "HIGH": 0.40, "CRITICAL": 0.20}[severity]
     block = event_type in {"BLACK_SWAN_PROXY", "DEPEG_RISK"} and event_score >= 60
+    pump_state = _pump_state_radar(
+        ch5=ch5,
+        ch15=ch15,
+        ch1h=ch1h,
+        atr=atr,
+        relative_volume=rv,
+        volume_acceleration=vacc,
+        oi_change_pct=max(oi, oi15),
+        funding=funding,
+        futures_delta=fd,
+        spot_delta=sd,
+        book_imbalance=book,
+    )
 
     return {
         "version": VERSION, "event_type": event_type, "event_score": round(event_score, 1), "severity": severity,
         "directional_bias": directional_bias, "block_new_entries": block,
         "require_extra_confirmation": severity in {"HIGH", "CRITICAL"} or event_type in {"NEWS_SHOCK_PROXY", "LIQUIDATION_CASCADE"},
         "risk_multiplier": risk_multiplier, "scores": {k: round(_clip(v), 1) for k, v in scores.items()},
-        "reasons": why.get(event_type, []), "funding": funding,
+        "reasons": why.get(event_type, []), "funding": funding, "pump_state": pump_state,
         "black_swan_is_proxy": True, "predicts_true_black_swan": False,
         "creates_entry": False, "changes_direction": False,
     }

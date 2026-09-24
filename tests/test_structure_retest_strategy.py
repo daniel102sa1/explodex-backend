@@ -53,6 +53,9 @@ def test_detects_breakout_retest_continuation_with_structural_stop():
     assert result["stop_policy"]["money_loss_does_not_place_stop"] is True
     assert result["stop_policy"]["position_size_must_adapt_to_stop"] is True
     assert result["stop_policy"]["stop_never_widens_after_entry"] is True
+    assert result["stop_distance_atr"] >= result["min_stop_distance_atr"]
+    assert result["stop_too_tight_for_noise"] is False
+    assert result["stop_policy"]["reject_noise_tight_stop"] is True
 
 
 def test_does_not_create_candidate_without_retest():

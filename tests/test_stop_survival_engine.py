@@ -130,3 +130,6 @@ def test_survival_plan_refuses_extra_room_when_rr_becomes_bad():
     )
     assert plan["enabled"] is False
     assert plan["reason"] == "survival_stop_breaks_min_net_rr"
+    assert plan["entry_should_be_rejected"] is True
+    assert plan["rejection_reason"] == "target_does_not_pay_for_horizon_matched_stop"
+    assert plan["proposed_hard_stop_distance_pct"] > plan["soft_stop_distance_pct"]
