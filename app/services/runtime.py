@@ -312,6 +312,14 @@ async def _run_historical_market_once() -> None:
             "total_samples": cov.get("total_samples"),
             "top_coverage": (cov.get("symbols") or [])[:8],
         }
+        logger.info(
+            "Historical Market Brain: status=%s symbol=%s written=%s coverage_symbols=%s total_samples=%s",
+            backfill.get("status"),
+            backfill.get("symbol"),
+            backfill.get("replay_rows_written"),
+            cov.get("symbols_covered"),
+            cov.get("total_samples"),
+        )
         runtime_state.last_historical_market_ok = True
         runtime_state.last_historical_market_error = None
     except Exception as exc:
