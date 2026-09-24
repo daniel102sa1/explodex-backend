@@ -131,9 +131,9 @@ def _chart_patterns(bars: list[dict[str, float]], pivots: list[dict[str, Any]], 
         scale = max(atr, bars[-1]["close"] * 0.001, 1e-12)
         hs_n, ls_n = hs / scale, ls / scale
 
-        if _flat(highs) and ls_n > 0.08:
+        if _flat(highs, atr) and ls_n > 0.08:
             patterns.append({"name": "ASCENDING_TRIANGLE", "bias": "LONG", "quality": 72.0})
-        if _flat(lows) and hs_n < -0.08:
+        if _flat(lows, atr) and hs_n < -0.08:
             patterns.append({"name": "DESCENDING_TRIANGLE", "bias": "SHORT", "quality": 72.0})
         if hs_n < -0.06 and ls_n > 0.06:
             patterns.append({"name": "SYMMETRICAL_TRIANGLE", "bias": "NEUTRAL", "quality": 64.0})
