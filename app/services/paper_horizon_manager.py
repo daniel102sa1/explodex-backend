@@ -297,7 +297,14 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
         # may have been tightened by the previous profit-lock engine, so restore
         # their original structural stop from metadata when available.
         row_stop = _f(row.get("stop_loss"))
-        hard_stop = _f(metadata.get("initial_hard_stop"), row_stop)
+        original_structural_stop = (
+            metadata.get("initial_hard_stop")
+            or metadata.get("hard_stop")
+            or metadata.get("structural_stop")
+            or _d(metadata.get("stop_survival")).get("hard_stop")
+            or row_stop
+        )
+        hard_stop = _f(original_structural_stop, row_stop)
         soft_stop = _f(metadata.get("soft_invalidation_stop"), hard_stop)
         tp_value = _f(row.get("take_profit"))
         side = str(row.get("side") or "").upper()
