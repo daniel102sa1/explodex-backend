@@ -57,21 +57,58 @@ def _trend(klines: list[list[Any]]) -> str:
 
 
 def _order_book_metrics(book: dict[str, Any]) -> dict[str, float]:
+    """Measure executable visible depth at comparable distances from mid.
+
+    The old top-20-level imbalance could compare different price distances across
+    symbols. Multi-depth bps buckets are more stable for altcoin microstructure.
+    This remains visible-book OBI, not true event-by-event OFI.
+    """
     bids = book.get("bids") or []
     asks = book.get("asks") or []
-    bid_notional = sum(float(p) * float(q) for p, q in bids[:20])
-    ask_notional = sum(float(p) * float(q) for p, q in asks[:20])
-    total = bid_notional + ask_notional
-    imbalance = ((bid_notional - ask_notional) / total) if total > 0 else 0.0
     best_bid = float(bids[0][0]) if bids else 0.0
     best_ask = float(asks[0][0]) if asks else 0.0
     mid = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
     spread_bps = ((best_ask - best_bid) / mid) * 10000 if mid else 0.0
+
+    def bucket(bps: int) -> tuple[float, float, float]:
+        if mid <= 0:
+            return 0.0, 0.0, 0.0
+        pct = bps / 10_000.0
+        bid_floor = mid * (1.0 - pct)
+        ask_ceiling = mid * (1.0 + pct)
+        bid_usd = sum(float(p) * float(q) for p, q in bids if float(p) >= bid_floor)
+        ask_usd = sum(float(p) * float(q) for p, q in asks if float(p) <= ask_ceiling)
+        total = bid_usd + ask_usd
+        imbalance = (bid_usd - ask_usd) / total if total > 0 else 0.0
+        return bid_usd, ask_usd, imbalance
+
+    depth: dict[int, tuple[float, float, float]] = {bps: bucket(bps) for bps in (10, 25, 50, 100)}
+    bid25, ask25, imbalance25 = depth[25]
+    if bid25 + ask25 <= 0:
+        bid25 = sum(float(p) * float(q) for p, q in bids[:20])
+        ask25 = sum(float(p) * float(q) for p, q in asks[:20])
+        total = bid25 + ask25
+        imbalance25 = (bid25 - ask25) / total if total > 0 else 0.0
+
+    near_depth = bid25 + ask25
     return {
-        "bid_notional": bid_notional,
-        "ask_notional": ask_notional,
-        "imbalance": imbalance,
+        "bid_notional": bid25,
+        "ask_notional": ask25,
+        "imbalance": imbalance25,
         "spread_bps": spread_bps,
+        "bid_depth_10bps_usd": depth[10][0],
+        "ask_depth_10bps_usd": depth[10][1],
+        "imbalance_10bps": depth[10][2],
+        "bid_depth_25bps_usd": bid25,
+        "ask_depth_25bps_usd": ask25,
+        "imbalance_25bps": imbalance25,
+        "bid_depth_50bps_usd": depth[50][0],
+        "ask_depth_50bps_usd": depth[50][1],
+        "imbalance_50bps": depth[50][2],
+        "bid_depth_100bps_usd": depth[100][0],
+        "ask_depth_100bps_usd": depth[100][1],
+        "imbalance_100bps": depth[100][2],
+        "near_depth_25bps_usd": near_depth,
     }
 
 
@@ -519,7 +556,19 @@ def score_snapshot(snapshot: dict[str, Any], btc_context: dict[str, Any] | None 
             "top_account_long_short_ratio": round(top_account_ls, 4),
             "top_position_long_short_ratio": round(top_position_ls, 4),
             "order_book_imbalance": round(order_book["imbalance"], 4),
+            "order_book_imbalance_10bps": round(order_book["imbalance_10bps"], 4),
+            "order_book_imbalance_25bps": round(order_book["imbalance_25bps"], 4),
+            "order_book_imbalance_50bps": round(order_book["imbalance_50bps"], 4),
+            "order_book_imbalance_100bps": round(order_book["imbalance_100bps"], 4),
+            "order_book_bid_depth_10bps_usd": round(order_book["bid_depth_10bps_usd"], 2),
+            "order_book_ask_depth_10bps_usd": round(order_book["ask_depth_10bps_usd"], 2),
+            "order_book_bid_depth_25bps_usd": round(order_book["bid_depth_25bps_usd"], 2),
+            "order_book_ask_depth_25bps_usd": round(order_book["ask_depth_25bps_usd"], 2),
+            "order_book_bid_depth_50bps_usd": round(order_book["bid_depth_50bps_usd"], 2),
+            "order_book_ask_depth_50bps_usd": round(order_book["ask_depth_50bps_usd"], 2),
+            "order_book_near_depth_25bps_usd": round(order_book["near_depth_25bps_usd"], 2),
             "order_book_spread_bps": round(order_book["spread_bps"], 4),
+            "order_book_obi_is_snapshot_not_ofi": True,
             "futures_delta_ratio": round(futures_flow["delta_ratio"], 4),
             "futures_buy_sell_ratio": round(futures_flow["buy_sell_ratio"], 4),
             "spot_delta_ratio": round(spot_flow["delta_ratio"], 4),
