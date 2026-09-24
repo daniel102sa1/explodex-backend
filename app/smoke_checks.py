@@ -12,7 +12,7 @@ from app.services.impulse_pullback_confirmation import build_impulse_pullback_co
 from app.services.paper_unified_heart_executor import _sarpon_leverage_policy
 from app.services.prediction_engine import build_pre_move_prediction as build_raw_pre_move_prediction
 from app.services.prediction_guarded import build_pre_move_prediction as build_guarded_pre_move_prediction
-from app.services.price_action_pattern_vision import detect_price_action_patterns
+from app.services.price_action_pattern_vision import _candles, _pivots, detect_price_action_patterns
 from app.services.pump_state_machine import classify_pump_state
 from app.services.scoring import _order_book_metrics
 
@@ -70,6 +70,23 @@ def run() -> None:
     vision = detect_price_action_patterns(_pattern_rows())
     assert vision["available"] is True
     assert vision["policy"]["can_create_entry"] is False
+
+    candle_bars = [
+        {"open": 10.0, "high": 10.2, "low": 9.8, "close": 10.1, "volume": 100, "time": 1},
+        {"open": 10.1, "high": 10.25, "low": 9.95, "close": 10.15, "volume": 100, "time": 2},
+        {"open": 10.15, "high": 10.2, "low": 9.75, "close": 9.8, "volume": 100, "time": 3},
+        {"open": 9.75, "high": 10.3, "low": 9.7, "close": 10.22, "volume": 130, "time": 4},
+    ]
+    assert any(item["name"] == "BULLISH_ENGULFING" for item in _candles(candle_bars, 0.3))
+
+    pivot_bars = [
+        {"time": 0, "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 100},
+        {"time": 1, "open": 100.0, "high": 100.8, "low": 99.6, "close": 100.2, "volume": 100},
+        {"time": 2, "open": 100.2, "high": 101.25, "low": 99.7, "close": 100.1, "volume": 100},
+        {"time": 3, "open": 100.1, "high": 100.79, "low": 99.65, "close": 100.0, "volume": 100},
+        {"time": 4, "open": 100.0, "high": 100.6, "low": 99.55, "close": 99.9, "volume": 100},
+    ]
+    assert any(p["type"] == "H" and p["index"] == 2 for p in _pivots(pivot_bars, window=2, atr=1.0))
 
     # 3) Impulse/no-chase state.
     rows = _impulse_wait_rows()

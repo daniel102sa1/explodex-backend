@@ -1,4 +1,4 @@
-from app.services.price_action_pattern_vision import _candles, _chart_patterns, _harmonics, detect_price_action_patterns
+from app.services.price_action_pattern_vision import _candles, _chart_patterns, _harmonics, _pivots, detect_price_action_patterns
 
 
 def _row(i, o, h, l, c, v=100.0):
@@ -17,12 +17,12 @@ def test_harmonic_detector_accepts_gartley_like_ratios():
     assert any(item["name"] == "GARTLEY" for item in found)
 
 
-def test_candle_detector_finds_bullish_engulfing():
+def test_candle_detector_uses_latest_closed_candle_for_bullish_engulfing():
     bars = [
         {"open": 10.0, "high": 10.2, "low": 9.8, "close": 10.1, "volume": 100, "time": 1},
-        {"open": 10.1, "high": 10.15, "low": 9.75, "close": 9.8, "volume": 100, "time": 2},
-        {"open": 9.75, "high": 10.3, "low": 9.7, "close": 10.2, "volume": 130, "time": 3},
-        {"open": 10.2, "high": 10.25, "low": 10.1, "close": 10.22, "volume": 90, "time": 4},
+        {"open": 10.1, "high": 10.25, "low": 9.95, "close": 10.15, "volume": 100, "time": 2},
+        {"open": 10.15, "high": 10.2, "low": 9.75, "close": 9.8, "volume": 100, "time": 3},
+        {"open": 9.75, "high": 10.3, "low": 9.7, "close": 10.22, "volume": 130, "time": 4},
     ]
     found = _candles(bars, 0.3)
     assert any(item["name"] == "BULLISH_ENGULFING" for item in found)
@@ -65,3 +65,19 @@ def test_chart_pattern_flat_trendline_checks_receive_atr():
     ]
     found = _chart_patterns(bars, pivots, 0.5)
     assert any(item["name"] == "ASCENDING_TRIANGLE" for item in found)
+
+
+def test_pivot_detector_requires_actual_prominence():
+    bars = [
+        {"time": 0, "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0, "volume": 100},
+        {"time": 1, "open": 100.0, "high": 100.8, "low": 99.6, "close": 100.2, "volume": 100},
+        {"time": 2, "open": 100.2, "high": 100.82, "low": 99.7, "close": 100.1, "volume": 100},
+        {"time": 3, "open": 100.1, "high": 100.79, "low": 99.65, "close": 100.0, "volume": 100},
+        {"time": 4, "open": 100.0, "high": 100.6, "low": 99.55, "close": 99.9, "volume": 100},
+    ]
+    pivots = _pivots(bars, window=2, atr=1.0)
+    assert not any(p["type"] == "H" and p["index"] == 2 for p in pivots)
+
+    bars[2]["high"] = 101.25
+    pivots = _pivots(bars, window=2, atr=1.0)
+    assert any(p["type"] == "H" and p["index"] == 2 for p in pivots)
