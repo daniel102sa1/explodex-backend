@@ -9,6 +9,7 @@ analysis stack fail the deployment instead of reaching users.
 
 from app.services import paper_portfolio
 from app.services.impulse_pullback_confirmation import build_impulse_pullback_confirmation
+from app.services.historical_market_brain import POLICY as HISTORICAL_POLICY, _distance as historical_distance, _feature_vector as historical_feature_vector, _similarity as historical_similarity
 from app.services.paper_unified_heart_executor import _sarpon_leverage_policy
 from app.services.prediction_engine import build_pre_move_prediction as build_raw_pre_move_prediction
 from app.services.prediction_guarded import build_pre_move_prediction as build_guarded_pre_move_prediction
@@ -171,7 +172,30 @@ def run() -> None:
     )
     assert pump["can_create_entry"] is False
 
-    # 6) Central risk/leverage invariants.
+    # 6) Historical replay invariants: point-in-time features must ignore future candles.
+    hist_rows = []
+    hist_price = 100.0
+    for i in range(520):
+        o = hist_price
+        c = hist_price + (0.03 if (i // 40) % 2 == 0 else -0.015) + ((i % 7) - 3) * 0.005
+        h = max(o, c) + 0.18
+        l = min(o, c) - 0.18
+        hist_rows.append([i * 300_000, o, h, l, c, 100000 + (i % 13) * 2500])
+        hist_price = c
+    btc_rows = [list(row) for row in hist_rows]
+    btc_times = [int(row[0]) for row in btc_rows]
+    hist_idx = 220
+    hist_before = historical_feature_vector(hist_rows, hist_idx, btc_rows=btc_rows, btc_times=btc_times)
+    for i in range(hist_idx + 1, len(hist_rows)):
+        hist_rows[i][4] *= 4
+        hist_rows[i][5] *= 20
+    hist_after = historical_feature_vector(hist_rows, hist_idx, btc_rows=btc_rows, btc_times=btc_times)
+    assert hist_before == hist_after
+    assert historical_similarity(historical_distance(hist_before, hist_before)) == 100.0
+    assert HISTORICAL_POLICY["can_create_entry"] is False
+    assert HISTORICAL_POLICY["can_raise_leverage"] is False
+
+    # 7) Central risk/leverage invariants.
     sized = paper_portfolio.size_position(1000.0, 100.0, 99.0, 200)
     assert sized["risk_usdt"] <= sized["risk_budget_usdt"]
     assert sized["margin"] <= 300.0 + 1e-9
