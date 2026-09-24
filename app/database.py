@@ -155,3 +155,34 @@ async def ensure_runtime_schema() -> None:
         )
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_microstructure_symbol_time ON microstructure_snapshots(symbol, observed_at DESC)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_microstructure_time ON microstructure_snapshots(observed_at DESC)"))
+
+        # Historical Market Brain: compact, point-in-time OHLCV replay memory.
+        # Each row is generated using only candles known at observed_at; future
+        # candles are used solely for labels stored in outcomes.
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS historical_market_replay (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(32) NOT NULL,
+                    observed_at TIMESTAMPTZ NOT NULL,
+                    interval VARCHAR(8) NOT NULL DEFAULT '5m',
+                    source VARCHAR(40) NOT NULL,
+                    feature_version VARCHAR(80) NOT NULL,
+                    features JSONB NOT NULL,
+                    outcomes JSONB NOT NULL,
+                    sample_stride INTEGER NOT NULL DEFAULT 6,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(symbol, observed_at, interval, feature_version)
+                )
+                """
+            )
+        )
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_hist_replay_symbol_time "
+            "ON historical_market_replay(symbol, observed_at DESC)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_hist_replay_version_time "
+            "ON historical_market_replay(feature_version, observed_at DESC)"
+        ))
