@@ -105,12 +105,18 @@ def _sarpon_leverage_policy(
     )
     pump_stage = str(_d(pump_state).get("state") or "UNAVAILABLE").upper()
     pump_leverage_safe = pump_stage not in {"DERIVATIVE_SQUEEZE", "EXHAUSTION", "REVERSAL_CONFIRMED"}
+    history_status = str(lane.get("shadow_calibration_status") or "").upper()
+    history_sample = int(_f(lane.get("shadow_calibration_sample"), 0.0))
+    history_boost_safe = history_status == "USABLE" and history_sample >= 60
+    history_high_safe = history_status == "USABLE" and history_sample >= 100
+    history_max_safe = history_status == "USABLE" and history_sample >= 200
     quality_safe = (
         quant_multiplier >= 0.85
         and council_multiplier >= 0.85
         and shadow_risk_multiplier >= 0.85
         and fundamental_multiplier >= 0.80
         and pump_leverage_safe
+        and history_boost_safe
     )
     full_green = bool(
         not defensive
@@ -127,14 +133,14 @@ def _sarpon_leverage_policy(
     reason = "base_cap"
     tier_name = "BASE"
 
-    if full_green and lane_name == "TACTICAL" and tier == "MAX_CONVICTION":
-        selected, reason, tier_name = 20, "max_conviction_full_arsenal", "MAX_20X"
-    elif full_green and lane_name == "TACTICAL" and tier == "HIGH":
-        selected, reason, tier_name = 10, "high_conviction_full_arsenal", "HIGH_10X"
-    elif full_green and lane_name == "SWING_PAPER" and tier in {"HIGH", "MAX_CONVICTION", "HIGH_SWING_CAPPED"}:
-        selected, reason, tier_name = 8, "swing_full_arsenal", "SWING_8X"
-    elif full_green and tier in {"NORMAL_PLUS", "NORMAL"}:
-        selected, reason, tier_name = max(base_cap, 5), "confirmed_arsenal", "CONFIRMED_5X"
+    if full_green and lane_name == "TACTICAL" and tier == "MAX_CONVICTION" and history_max_safe:
+        selected, reason, tier_name = 20, "max_conviction_full_arsenal_oos_sample", "MAX_20X"
+    elif full_green and lane_name == "TACTICAL" and tier in {"HIGH", "MAX_CONVICTION"} and history_high_safe:
+        selected, reason, tier_name = 10, "high_conviction_full_arsenal_oos_sample", "HIGH_10X"
+    elif full_green and lane_name == "SWING_PAPER" and tier in {"HIGH", "MAX_CONVICTION", "HIGH_SWING_CAPPED"} and history_high_safe:
+        selected, reason, tier_name = 8, "swing_full_arsenal_oos_sample", "SWING_8X"
+    elif full_green and tier in {"MAX_CONVICTION", "HIGH", "NORMAL_PLUS", "NORMAL"}:
+        selected, reason, tier_name = max(base_cap, 5), "confirmed_arsenal_minimum_history", "CONFIRMED_5X"
 
     return {
         "eligible": full_green,
@@ -154,6 +160,10 @@ def _sarpon_leverage_policy(
             "quant_safe": quant_multiplier >= 0.85,
             "council_safe": council_multiplier >= 0.85,
             "history_calibration_safe": shadow_risk_multiplier >= 0.85,
+            "history_boost_sample_safe": history_boost_safe,
+            "history_high_sample_safe": history_high_safe,
+            "history_max_sample_safe": history_max_safe,
+            "history_sample": history_sample,
             "fundamental_risk_safe": fundamental_multiplier >= 0.80,
             "pump_state_safe_for_leverage_escalation": pump_leverage_safe,
             "pump_state": pump_stage,
@@ -174,6 +184,7 @@ def _shadow_calibration_risk_multiplier(
     increase size until the real VNext execution cohort is mature.
     """
     status = str(lane.get("shadow_calibration_status") or "").upper()
+    sample = int(_f(lane.get("shadow_calibration_sample"), 0.0))
     if status != "USABLE":
         return 1.0
     adjustment = _f(lane.get("shadow_conviction_adjustment"))
@@ -182,7 +193,9 @@ def _shadow_calibration_risk_multiplier(
         return 0.55
     if adjustment <= -2.5:
         return 0.75
-    if validation_probation or downside_only:
+    if validation_probation or downside_only or sample < 200:
+        # Positive historical evidence is shadow-only until a materially larger
+        # sample exists. Small cohorts may reduce risk but cannot increase it.
         return 1.0
     if adjustment >= 5.0:
         return 1.10
