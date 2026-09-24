@@ -245,6 +245,7 @@ def build_pre_move_prediction(
     pro_aggregate = dict(professional.get("aggregate") or {})
     pro_pump = dict(professional.get("pump_hunter") or {})
     pro_patterns = list((professional.get("patterns") or {}).get("patterns") or [])
+    pro_impulse_pullback = dict(professional.get("impulse_pullback_confirmation") or {})
     pro_momentum = dict(professional.get("momentum") or {})
     pro_adx = dict(pro_momentum.get("adx") or {})
 
@@ -274,6 +275,27 @@ def build_pre_move_prediction(
         elif name == "BREAKDOWN_RETEST_SHORT":
             short_breakdown += 6
             short_breakdown_conf.append("breakdown + retest confirmado")
+
+    impulse_phase = str(pro_impulse_pullback.get("phase") or "NO_SETUP").upper()
+    impulse_direction = str(pro_impulse_pullback.get("direction") or "NEUTRAL").upper()
+    impulse_quality = _f(pro_impulse_pullback.get("quality_score"))
+    if impulse_phase == "CONFIRMED" and impulse_quality >= 68:
+        if impulse_direction == "LONG":
+            long_breakout += 7
+            long_breakout_conf.append("impulso + BOS + retroceso a zona + reacción alcista confirmada")
+        elif impulse_direction == "SHORT":
+            short_breakdown += 7
+            short_breakdown_conf.append("impulso + BOS + retroceso a zona + reacción bajista confirmada")
+    elif impulse_phase in {"WAIT_PULLBACK", "WAIT_PULLBACK_NO_CHASE", "ZONE_TOUCHED_WAIT_CONFIRMATION"}:
+        if impulse_direction == "LONG":
+            long_breakout_conflicts.append("impulso alcista detectado: esperar retroceso/reacción, no perseguir")
+        elif impulse_direction == "SHORT":
+            short_breakdown_conflicts.append("impulso bajista detectado: esperar retroceso/reacción, no perseguir")
+    elif impulse_phase == "INVALIDATED":
+        if impulse_direction == "LONG":
+            long_breakout_conflicts.append("zona del impulso alcista invalidada")
+        elif impulse_direction == "SHORT":
+            short_breakdown_conflicts.append("zona del impulso bajista invalidada")
 
     if str(pro_adx.get("trend_strength") or "") == "STRONG":
         if pro_adx.get("bias") == "LONG":
@@ -574,6 +596,7 @@ def build_pre_move_prediction(
         "conflicts": conflicts[:10],
         "sarpon_compression": sarpon_compression,
         "professional_arsenal": professional,
+        "impulse_pullback_confirmation": pro_impulse_pullback,
         "sequence": {
             "compressed": compressed or compression_stage in {"ARMED_EARLY", "BUILDING", "SQUEEZE_NEUTRAL"},
             "compression_priority_stage": compression_stage,
@@ -592,11 +615,17 @@ def build_pre_move_prediction(
             "distance_to_low_atr": round(dist_low_atr, 3),
             "chase_distance_atr": round(chase_distance_atr, 3),
             "chase_risk": chase_risk,
+            "impulse_pullback_phase": impulse_phase,
+            "impulse_pullback_direction": impulse_direction,
+            "impulse_pullback_quality": round(impulse_quality, 1),
+            "impulse_pullback_waiting_retest": impulse_phase in {"WAIT_PULLBACK", "WAIT_PULLBACK_NO_CHASE", "ZONE_TOUCHED_WAIT_CONFIRMATION"},
+            "impulse_pullback_confirmed": impulse_phase == "CONFIRMED",
             "range_high_48": round(high_48, 12),
             "range_low_48": round(low_48, 12),
         },
         "message": (
             "Predicción de fase previa basada en precio/estructura/liquidez, compresión SARPON, volumen, CVD, OI/funding y contexto profesional. "
-            "La compresión puede adelantar la vigilancia, pero no autoriza por sí sola una entrada ni garantiza ruptura."
+            "El motor también distingue impulso/BOS, zona pendiente, retroceso y reacción para evitar perseguir velas extendidas. "
+            "Ninguna de estas piezas autoriza por sí sola una entrada ni garantiza continuación."
         ),
     }
