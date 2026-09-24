@@ -36,6 +36,7 @@ def _geometry_ok(side: str, entry: float, stop: float, target: float) -> bool:
 
 
 async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk_multiplier: float, btc_overlay: dict[str, Any] | None = None) -> dict[str, Any]:
+    await base.acquire_paper_open_lock(db)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
     if open_count >= base.MAX_OPEN_POSITIONS:
         return {"version": VERSION, "opened": 0, "reason": "max_open_positions", "rejected": {}}
