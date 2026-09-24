@@ -81,19 +81,26 @@ async def run_scanner(db: AsyncSession, deep_limit: int = 20) -> dict[str, Any]:
             try:
                 result[key] = await fn(db, run_id)
             except Exception as exc:
+                # A failed SQL statement leaves PostgreSQL transactions aborted.
+                # Roll back before continuing so one module cannot poison the rest
+                # of the Scanner -> Heart -> PAPER pipeline.
+                await db.rollback()
                 result[key] = {"version": f"{version}_v1", "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
 
         try:
             result["shadow_forecast_evaluation"] = await evaluate_shadow_forecasts(db, limit=80)
         except Exception as exc:
+            await db.rollback()
             result["shadow_forecast_evaluation"] = {"version": "shadow_forecast_memory_v1", "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
         try:
             result["shadow_calibration"] = await persist_shadow_calibration_for_run(db, run_id)
         except Exception as exc:
+            await db.rollback()
             result["shadow_calibration"] = {"version": "shadow_forecast_memory_v1", "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
         try:
             result["shadow_forecast_capture"] = await capture_shadow_forecasts_for_run(db, run_id)
         except Exception as exc:
+            await db.rollback()
             result["shadow_forecast_capture"] = {"version": "shadow_forecast_memory_v1", "status": "ERROR", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
     return result
 
