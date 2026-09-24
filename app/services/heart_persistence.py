@@ -386,6 +386,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         # audited later without allowing an unvalidated feature to manufacture a
         # direction or entry.
         fundamental = _json(reason.get("fundamental_intelligence"))
+        catalyst_context = _json(reason.get("catalyst_context"))
         pump_state = _json(reason.get("pump_state_machine"))
 
         if allowed:
@@ -416,6 +417,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             "higher_timeframe_context": htf,
             "higher_timeframe_alignment": htf_alignment,
             "fundamental_intelligence": fundamental,
+            "catalyst_context": catalyst_context,
             "pump_state_machine": pump_state,
             "prediction_phase": prediction.get("phase"),
             "prediction_type": prediction.get("type"),
@@ -443,6 +445,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
                 "fundamental_shadow_only": True,
                 "pump_state_shadow_only": True,
                 "fundamental_can_create_entry": False,
+                "catalyst_can_create_entry": False,
                 "pump_state_can_create_entry": False,
             },
             "score_is_probability": False,
