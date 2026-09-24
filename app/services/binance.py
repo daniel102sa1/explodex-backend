@@ -473,6 +473,98 @@ class BinancePublicClient:
             loader=load,
         )
 
+    async def historical_funding_rates(self, symbol: str, days: int = 90) -> dict[str, Any]:
+        """Best-effort point-in-time Binance Futures funding history."""
+        symbol = symbol.upper()
+        safe_days = max(1, min(int(days), 365))
+        now_ms = int(time.time() * 1000)
+        cursor = now_ms - safe_days * 86_400_000
+        rows: list[dict[str, Any]] = []
+        try:
+            while cursor < now_ms:
+                batch = await self._prefer_binance(
+                    "/fapi/v1/fundingRate",
+                    {"symbol": symbol, "startTime": cursor, "endTime": now_ms, "limit": 1000},
+                )
+                if not isinstance(batch, list) or not batch:
+                    break
+                rows.extend(dict(item) for item in batch if isinstance(item, dict))
+                last = max(int(item.get("fundingTime") or 0) for item in batch if isinstance(item, dict))
+                if last <= cursor:
+                    break
+                cursor = last + 1
+                if len(batch) < 1000:
+                    break
+                await asyncio.sleep(0)
+        except Exception as exc:
+            return {
+                "symbol": symbol,
+                "available": False,
+                "source": "BINANCE_FUTURES_HISTORY",
+                "rows": [],
+                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
+        dedup = {int(item.get("fundingTime") or 0): item for item in rows if int(item.get("fundingTime") or 0) > 0}
+        ordered = [dedup[key] for key in sorted(dedup)]
+        return {
+            "symbol": symbol,
+            "available": bool(ordered),
+            "source": "BINANCE_FUTURES_HISTORY",
+            "days_requested": safe_days,
+            "rows": ordered,
+        }
+
+    async def historical_open_interest(self, symbol: str, days: int = 30, period: str = "5m") -> dict[str, Any]:
+        """Best-effort OI history. Binance normally exposes only a limited recent window."""
+        symbol = symbol.upper()
+        safe_days = max(1, min(int(days), 30))
+        period_ms = {
+            "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+            "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+            "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000,
+        }.get(period, 300_000)
+        wanted = max(2, int(safe_days * 86_400_000 / period_ms))
+        rows: list[dict[str, Any]] = []
+        end_time: int | None = None
+        try:
+            while len(rows) < wanted:
+                batch_limit = min(500, wanted - len(rows))
+                params: dict[str, Any] = {
+                    "symbol": symbol,
+                    "period": period,
+                    "limit": batch_limit,
+                }
+                if end_time is not None:
+                    params["endTime"] = end_time
+                batch = await self._prefer_binance("/futures/data/openInterestHist", params)
+                if not isinstance(batch, list) or not batch:
+                    break
+                rows = [dict(item) for item in batch if isinstance(item, dict)] + rows
+                first = min(int(item.get("timestamp") or 0) for item in batch if isinstance(item, dict))
+                if first <= 0:
+                    break
+                end_time = first - 1
+                if len(batch) < batch_limit:
+                    break
+                await asyncio.sleep(0)
+        except Exception as exc:
+            return {
+                "symbol": symbol,
+                "available": False,
+                "source": "BINANCE_FUTURES_HISTORY",
+                "rows": [],
+                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
+        dedup = {int(item.get("timestamp") or 0): item for item in rows if int(item.get("timestamp") or 0) > 0}
+        ordered = [dedup[key] for key in sorted(dedup)][-wanted:]
+        return {
+            "symbol": symbol,
+            "available": bool(ordered),
+            "source": "BINANCE_FUTURES_HISTORY",
+            "days_requested": safe_days,
+            "rows": ordered,
+        }
+
     async def order_book(self, symbol: str, limit: int = 20) -> dict[str, Any]:
         if self._binance_available():
             try:
