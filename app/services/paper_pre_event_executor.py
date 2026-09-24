@@ -13,7 +13,7 @@ from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_pre_event_executor_v1"
+VERSION = "paper_pre_event_executor_v2_horizon_stop_guard"
 MAX_NEW = 1
 
 
@@ -81,6 +81,9 @@ async def execute_pre_event_contracts(db: AsyncSession, *, defensive: bool, risk
         btc_side_multiplier, btc_side_reason = btc_side_risk_multiplier(side, btc_overlay)
         if btc_side_multiplier <= 0: reject(btc_side_reason or "btc_direction_block"); continue
         survival = build_stop_survival_plan(heart=heart, lane_name="PRE_EVENT_PAPER", lane=lane, entry=fill, btc_context=btc_overlay)
+        if bool(survival.get("entry_should_be_rejected")):
+            reject(str(survival.get("rejection_reason") or survival.get("reason") or "horizon_stop_not_viable"))
+            continue
         hard_stop = _f(survival.get("hard_stop"), stop) if survival.get("enabled") else stop
         live_target = _f(survival.get("target_price"), target) if survival.get("enabled") else target
         if not _geometry_ok(side, fill, hard_stop, live_target): reject("invalid_survival_geometry"); continue
