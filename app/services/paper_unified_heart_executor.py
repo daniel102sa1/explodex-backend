@@ -14,7 +14,7 @@ from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v8_horizon_stop_guard"
+VERSION = "paper_unified_heart_executor_v9_fundamental_risk_context"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -75,6 +75,8 @@ def _sarpon_leverage_policy(
     council_multiplier: float = 1.0,
     shadow_risk_multiplier: float = 1.0,
     btc_side_multiplier: float = 1.0,
+    fundamental_multiplier: float = 1.0,
+    pump_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Choose PAPER leverage from confluence without increasing stop-risk.
 
@@ -101,7 +103,15 @@ def _sarpon_leverage_policy(
         and not bool(_d(monitor.get("btc")).get("hard_conflict"))
         and btc_side_multiplier >= 0.85
     )
-    quality_safe = quant_multiplier >= 0.85 and council_multiplier >= 0.85 and shadow_risk_multiplier >= 0.85
+    pump_stage = str(_d(pump_state).get("state") or "UNAVAILABLE").upper()
+    pump_leverage_safe = pump_stage not in {"DERIVATIVE_SQUEEZE", "EXHAUSTION", "REVERSAL_CONFIRMED"}
+    quality_safe = (
+        quant_multiplier >= 0.85
+        and council_multiplier >= 0.85
+        and shadow_risk_multiplier >= 0.85
+        and fundamental_multiplier >= 0.80
+        and pump_leverage_safe
+    )
     full_green = bool(
         not defensive
         and lane_name in {"TACTICAL", "SWING_PAPER"}
@@ -144,6 +154,9 @@ def _sarpon_leverage_policy(
             "quant_safe": quant_multiplier >= 0.85,
             "council_safe": council_multiplier >= 0.85,
             "history_calibration_safe": shadow_risk_multiplier >= 0.85,
+            "fundamental_risk_safe": fundamental_multiplier >= 0.80,
+            "pump_state_safe_for_leverage_escalation": pump_leverage_safe,
+            "pump_state": pump_stage,
             "not_defensive": not defensive,
         },
     }
@@ -356,6 +369,14 @@ async def execute_unified_heart_contracts(
             lane,
             validation_probation=validation_probation,
         )
+        fundamental = _d(heart.get("fundamental_intelligence"))
+        fundamental_risk = _d(fundamental.get("risk"))
+        fundamental_multiplier = (
+            max(0.65, min(1.0, _f(fundamental_risk.get("risk_multiplier_cap"), 1.0)))
+            if bool(fundamental.get("available"))
+            else 1.0
+        )
+        pump_state = _d(heart.get("pump_state_machine"))
         leverage_policy = _sarpon_leverage_policy(
             lane_name=lane_name,
             lane=lane,
@@ -367,6 +388,8 @@ async def execute_unified_heart_contracts(
             council_multiplier=council_multiplier,
             shadow_risk_multiplier=shadow_risk_multiplier,
             btc_side_multiplier=btc_side_multiplier,
+            fundamental_multiplier=fundamental_multiplier,
+            pump_state=pump_state,
         )
         lane_leverage = 1 if validation_probation else int(leverage_policy["selected_leverage"])
         sizing = base.size_position(balance, fill, hard_stop, lane_leverage)
@@ -382,6 +405,7 @@ async def execute_unified_heart_contracts(
             * quant_multiplier
             * council_multiplier
             * shadow_risk_multiplier
+            * fundamental_multiplier
         )
         for key in ("quantity", "notional", "margin", "risk_usdt"):
             sizing[key] = round(_f(sizing.get(key)) * scale, 10)
@@ -420,6 +444,11 @@ async def execute_unified_heart_contracts(
             "shadow_calibration_horizon": lane.get("shadow_calibration_horizon"),
             "shadow_conviction_adjustment": lane.get("shadow_conviction_adjustment"),
             "shadow_risk_multiplier": shadow_risk_multiplier,
+            "fundamental_intelligence": fundamental,
+            "fundamental_risk_multiplier": fundamental_multiplier,
+            "pump_state_machine": pump_state,
+            "fundamental_is_shadow_context": True,
+            "pump_state_is_shadow_context": True,
             "target_account_risk_pct_before_portfolio_brakes": round(base.RISK_PER_TRADE * 100.0 * conviction_multiplier, 4),
             "actual_stop_risk_usdt": sizing.get("risk_usdt"),
             "stop_survival": survival,
