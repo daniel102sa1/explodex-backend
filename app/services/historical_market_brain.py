@@ -27,7 +27,7 @@ POLICY = {
     "can_create_entry": False,
     "can_change_direction": False,
     "can_raise_leverage": False,
-    "derivatives_history_included": False,
+    "derivatives_history_included": "BEST_EFFORT_FUNDING_AND_OI",
     "score_is_probability": False,
 }
 
@@ -102,12 +102,53 @@ def _btc_features(btc_rows: list[list[float]], btc_times: list[int], ts: int) ->
     return {"btc_1h_pct": round(ch1, 5), "btc_4h_pct": round(ch4, 5), "btc_regime": regime}
 
 
+def _derivative_features(
+    *,
+    ts: int,
+    funding_rows: list[dict[str, Any]] | None = None,
+    funding_times: list[int] | None = None,
+    oi_rows: list[dict[str, Any]] | None = None,
+    oi_times: list[int] | None = None,
+) -> dict[str, Any]:
+    funding_rows = funding_rows or []
+    funding_times = funding_times or []
+    oi_rows = oi_rows or []
+    oi_times = oi_times or []
+
+    funding_rate = None
+    if funding_rows and funding_times:
+        pos = bisect_right(funding_times, ts) - 1
+        if pos >= 0:
+            funding_rate = _f(funding_rows[pos].get("fundingRate"), None)
+
+    oi_change_1h = None
+    if oi_rows and oi_times:
+        pos = bisect_right(oi_times, ts) - 1
+        prev = bisect_right(oi_times, ts - 3_600_000) - 1
+        if pos >= 0 and prev >= 0 and prev < pos:
+            now_row = oi_rows[pos]
+            prev_row = oi_rows[prev]
+            now_val = _f(now_row.get("sumOpenInterestValue"), _f(now_row.get("sumOpenInterest")))
+            prev_val = _f(prev_row.get("sumOpenInterestValue"), _f(prev_row.get("sumOpenInterest")))
+            if prev_val > 0:
+                oi_change_1h = (now_val - prev_val) / prev_val * 100.0
+
+    return {
+        "funding_rate": round(funding_rate, 8) if funding_rate is not None else None,
+        "oi_change_1h_pct": round(oi_change_1h, 6) if oi_change_1h is not None else None,
+    }
+
+
 def _feature_vector(
     rows: list[list[float]],
     idx: int,
     *,
     btc_rows: list[list[float]],
     btc_times: list[int],
+    funding_rows: list[dict[str, Any]] | None = None,
+    funding_times: list[int] | None = None,
+    oi_rows: list[dict[str, Any]] | None = None,
+    oi_times: list[int] | None = None,
 ) -> dict[str, Any]:
     current = rows[idx][4]
     atr = _atr_abs(rows, idx)
@@ -159,7 +200,15 @@ def _feature_vector(
     top = list(price_action.get("top_patterns") or [])
     top_pattern = top[0] if top and isinstance(top[0], dict) else {}
     cycle = price_action.get("market_cycle") if isinstance(price_action.get("market_cycle"), dict) else {}
-    btc = _btc_features(btc_rows, btc_times, int(rows[idx][0]))
+    ts = int(rows[idx][0])
+    btc = _btc_features(btc_rows, btc_times, ts)
+    derivatives = _derivative_features(
+        ts=ts,
+        funding_rows=funding_rows,
+        funding_times=funding_times,
+        oi_rows=oi_rows,
+        oi_times=oi_times,
+    )
 
     return {
         "change_5m_pct": round(_change(rows, idx, 1), 6),
@@ -185,6 +234,7 @@ def _feature_vector(
         "impulse_direction": impulse.get("direction"),
         "impulse_quality": impulse.get("quality_score"),
         **btc,
+        **derivatives,
     }
 
 
@@ -246,16 +296,31 @@ async def backfill_symbol(
     safe_days = max(7, min(int(days or settings.historical_market_backfill_days), 365))
     stride = max(1, min(int(stride_bars or settings.historical_market_stride_bars), 72))
 
-    symbol_payload, btc_payload = await asyncio.gather(
-        binance_client.historical_spot_klines(symbol, settings.historical_market_interval, safe_days),
-        binance_client.historical_spot_klines("BTCUSDT", settings.historical_market_interval, safe_days),
+    symbol_payload = await binance_client.historical_spot_klines(
+        symbol, settings.historical_market_interval, safe_days
     )
+    btc_payload = (
+        symbol_payload
+        if symbol == "BTCUSDT"
+        else await binance_client.historical_spot_klines(
+            "BTCUSDT", settings.historical_market_interval, safe_days
+        )
+    )
+    funding_payload, oi_payload = await asyncio.gather(
+        binance_client.historical_funding_rates(symbol, safe_days),
+        binance_client.historical_open_interest(symbol, min(safe_days, 30), "5m"),
+    )
+
     rows = _normalize(list(symbol_payload.get("rows") or []))
     btc_rows = _normalize(list(btc_payload.get("rows") or []))
     if len(rows) < 500 or len(btc_rows) < 500:
         raise RuntimeError(f"insufficient historical rows for {symbol}: symbol={len(rows)} btc={len(btc_rows)}")
 
     btc_times = [int(row[0]) for row in btc_rows]
+    funding_rows = [dict(row) for row in list(funding_payload.get("rows") or []) if isinstance(row, dict)]
+    funding_times = [int(row.get("fundingTime") or 0) for row in funding_rows]
+    oi_rows = [dict(row) for row in list(oi_payload.get("rows") or []) if isinstance(row, dict)]
+    oi_times = [int(row.get("timestamp") or 0) for row in oi_rows]
     max_horizon = max(HORIZON_BARS.values())
     start = 120
     stop = len(rows) - max_horizon - 1
@@ -264,7 +329,16 @@ async def backfill_symbol(
 
     records: list[dict[str, Any]] = []
     for idx in range(start, stop, stride):
-        features = _feature_vector(rows, idx, btc_rows=btc_rows, btc_times=btc_times)
+        features = _feature_vector(
+            rows,
+            idx,
+            btc_rows=btc_rows,
+            btc_times=btc_times,
+            funding_rows=funding_rows,
+            funding_times=funding_times,
+            oi_rows=oi_rows,
+            oi_times=oi_times,
+        )
         outcomes = _outcomes(rows, idx)
         if not outcomes:
             continue
@@ -310,6 +384,13 @@ async def backfill_symbol(
         "interval": settings.historical_market_interval,
         "stride_bars": stride,
         "raw_rows": len(rows),
+        "derivatives_history": {
+            "funding_available": bool(funding_payload.get("available")),
+            "funding_rows": len(funding_rows),
+            "oi_available": bool(oi_payload.get("available")),
+            "oi_rows": len(oi_rows),
+            "oi_window_days_max": 30,
+        },
         "replay_rows_written": written,
         "first_observation": records[0]["observed_at"].isoformat() if records else None,
         "last_observation": records[-1]["observed_at"].isoformat() if records else None,
@@ -358,6 +439,8 @@ def _current_features(scored: dict[str, Any], prediction: dict[str, Any]) -> dic
         "impulse_direction": impulse.get("direction"),
         "btc_1h_pct": metrics.get("btc_change_1h_pct"),
         "btc_regime": metrics.get("btc_trend"),
+        "funding_rate": metrics.get("funding_rate"),
+        "oi_change_1h_pct": metrics.get("oi_change_pct"),
     }
 
 
@@ -374,6 +457,8 @@ _NUMERIC_SCALES = {
     "distance_prior_high_atr": 1.4,
     "distance_prior_low_atr": 1.4,
     "btc_1h_pct": 2.5,
+    "funding_rate": 0.0008,
+    "oi_change_1h_pct": 2.0,
 }
 
 
