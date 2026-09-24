@@ -49,10 +49,19 @@ def _book_state(book: dict[str, Any], current_price: float, futures_delta: float
         return None
     if bid_price <= 0 or ask_price <= 0 or ask_price < bid_price:
         return None
-    bid_depth = sum(_f(row[0]) * _f(row[1]) for row in bids[:10] if len(row) >= 2)
-    ask_depth = sum(_f(row[0]) * _f(row[1]) for row in asks[:10] if len(row) >= 2)
-    depth = bid_depth + ask_depth
     mid = (bid_price + ask_price) / 2.0
+    # Persist depth inside a fixed 25 bps band rather than a fixed number of
+    # levels. Ten levels can represent wildly different price distances across
+    # altcoins; bps-normalized depth is more comparable and matches the scanner.
+    pct = 25.0 / 10_000.0
+    bid_floor = mid * (1.0 - pct)
+    ask_ceiling = mid * (1.0 + pct)
+    bid_depth = sum(_f(row[0]) * _f(row[1]) for row in bids if len(row) >= 2 and _f(row[0]) >= bid_floor)
+    ask_depth = sum(_f(row[0]) * _f(row[1]) for row in asks if len(row) >= 2 and _f(row[0]) <= ask_ceiling)
+    if bid_depth + ask_depth <= 0:
+        bid_depth = sum(_f(row[0]) * _f(row[1]) for row in bids[:10] if len(row) >= 2)
+        ask_depth = sum(_f(row[0]) * _f(row[1]) for row in asks[:10] if len(row) >= 2)
+    depth = bid_depth + ask_depth
     return {
         "ts": time(), "bid_price": bid_price, "ask_price": ask_price,
         "bid_size": bid_size, "ask_size": ask_size, "bid_depth": bid_depth,
@@ -136,6 +145,9 @@ def _metrics(history: deque[dict[str, Any]]) -> dict[str, Any]:
         "liquidity_speed": round(liquidity_speed, 5) if liquidity_speed is not None else None,
         "imbalance_speed_per_sec": round(imbalance_speed, 6) if imbalance_speed is not None else None,
         "sequential_absorption": absorption, "sequential_absorption_label": absorption_label,
+        "depth_band_bps": 25,
+        "ofi_method": "TOP_OF_BOOK_EVENT_PROXY",
+        "ofi_is_full_l2_event_stream": False,
     }
 
 
@@ -239,7 +251,7 @@ def observe_sequential_microstructure(symbol: str, book: dict[str, Any], current
     result["persistent_history"] = key in _HYDRATED
     result["persistence_queue"] = len(_PENDING)
     result["data_note"] = (
-        "Sequential L2 uses real snapshots only. PostgreSQL restores recent history after restart; "
-        "new observations are queued for persistent storage."
+        "Sequential microstructure uses real snapshots. Depth/imbalance are normalized to a 25 bps band; "
+        "OFI is a top-of-book event proxy, not a complete exchange L2 event stream. PostgreSQL restores recent history after restart."
     )
     return result
