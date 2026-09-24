@@ -352,6 +352,10 @@ async def backfill_symbol(
             "outcomes": json.dumps(outcomes),
             "sample_stride": stride,
         })
+        # Thousands of historical pattern calculations run inside the API
+        # process. Yield regularly so scanner/PAPER/live requests are not starved.
+        if len(records) % 25 == 0:
+            await asyncio.sleep(0)
 
     written = 0
     statement = text("""
