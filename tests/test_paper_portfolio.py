@@ -22,6 +22,14 @@ def test_position_sizing_caps_margin():
     assert sized["notional"] <= 1200.0
 
 
+def test_position_sizing_clamps_leverage_and_reports_actual_risk_pct():
+    sized = size_position(1000.0, 100.0, 99.0, 200)
+    assert sized["notional"] <= 6000.0
+    assert sized["margin"] <= 300.0
+    assert sized["risk_usdt"] <= sized["risk_budget_usdt"]
+    assert sized["risk_pct_of_balance"] <= 3.0
+
+
 def test_long_pnl_deducts_costs():
     opened = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
     closed = opened + timedelta(hours=2)
