@@ -12,6 +12,7 @@ from app.services.binance import binance_client
 STARTING_BALANCE = 1000.0
 RISK_PER_TRADE = 0.03
 MAX_OPEN_POSITIONS = 3
+MAX_PAPER_LEVERAGE = 20
 TAKER_FEE_RATE = 0.0005
 SLIPPAGE_RATE = 0.0002
 FUNDING_ESTIMATE_8H = 0.0001
@@ -67,7 +68,7 @@ def size_position(balance: float, entry: float, stop: float, leverage: int) -> d
     balance = _f(balance)
     entry = _f(entry)
     stop = _f(stop)
-    leverage = max(1, int(_f(leverage, 1.0)))
+    leverage = max(1, min(MAX_PAPER_LEVERAGE, int(_f(leverage, 1.0))))
     stop_distance = abs(entry - stop)
     if balance <= 0 or entry <= 0 or stop_distance <= 0:
         return {
@@ -377,6 +378,7 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
         "assumptions": {
             "risk_per_trade_pct": RISK_PER_TRADE * 100,
             "max_open_positions": MAX_OPEN_POSITIONS,
+            "max_paper_leverage": MAX_PAPER_LEVERAGE,
             "taker_fee_pct_per_side": TAKER_FEE_RATE * 100,
             "slippage_pct_per_side": SLIPPAGE_RATE * 100,
             "funding_estimate_pct_per_8h": FUNDING_ESTIMATE_8H * 100,
