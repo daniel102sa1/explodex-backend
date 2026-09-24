@@ -10,7 +10,8 @@ analysis stack fail the deployment instead of reaching users.
 from app.services import paper_portfolio
 from app.services.impulse_pullback_confirmation import build_impulse_pullback_confirmation
 from app.services.paper_unified_heart_executor import _sarpon_leverage_policy
-from app.services.prediction_engine import build_pre_move_prediction
+from app.services.prediction_engine import build_pre_move_prediction as build_raw_pre_move_prediction
+from app.services.prediction_guarded import build_pre_move_prediction as build_guarded_pre_move_prediction
 from app.services.price_action_pattern_vision import detect_price_action_patterns
 from app.services.pump_state_machine import classify_pump_state
 from app.services.scoring import _order_book_metrics
@@ -114,9 +115,14 @@ def run() -> None:
         "spot_trades": [],
         "premium": {},
     }
-    prediction = build_pre_move_prediction(scored, snapshot, {})
-    assert isinstance(prediction, dict)
-    assert prediction.get("type") is not None
+    raw_prediction = build_raw_pre_move_prediction(scored, snapshot, {})
+    assert isinstance(raw_prediction, dict)
+    assert raw_prediction.get("type") is not None
+
+    guarded_prediction = build_guarded_pre_move_prediction(scored, snapshot, {})
+    assert isinstance(guarded_prediction, dict)
+    assert guarded_prediction.get("type") is not None
+    assert "technical_arsenal" in guarded_prediction
 
     # 5) Pump-state classifier is descriptive only.
     pump = classify_pump_state(
