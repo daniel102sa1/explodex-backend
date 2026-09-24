@@ -58,6 +58,24 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
         return await _run_fast_paper_cycle_unlocked(db)
 
 
+async def run_paper_exit_management(db: AsyncSession) -> dict[str, Any]:
+    """Manage canonical PAPER exits under the same execution lock."""
+    if _PAPER_CYCLE_LOCK.locked():
+        return {
+            "version": VERSION,
+            "closed": 0,
+            "actions": [],
+            "reason": "paper_cycle_already_running",
+            "single_paper_authority": True,
+        }
+    async with _PAPER_CYCLE_LOCK:
+        result = await close_due_positions(db)
+        result["version"] = VERSION
+        result["reason"] = "canonical_exit_management"
+        result["single_paper_authority"] = True
+        return result
+
+
 async def _run_fast_paper_cycle_unlocked(db: AsyncSession) -> dict[str, Any]:
     """Visible PAPER portfolio driven only by lanes emitted by the unified Heart."""
     global _LAST_FAST_CYCLE_RESULT
