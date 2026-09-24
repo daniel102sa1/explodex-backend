@@ -14,10 +14,14 @@ def _green_heart():
 
 def _policy(*, tier="HIGH", lane_name="TACTICAL", defensive=False, btc_stress="NORMAL",
             quant=1.0, council=1.0, shadow=1.0, btc_side=1.0, fundamental=1.0,
-            pump_stage="NORMAL", heart=None):
+            pump_stage="NORMAL", history_sample=250, history_status="USABLE", heart=None):
     return _sarpon_leverage_policy(
         lane_name=lane_name,
-        lane={"max_leverage": 3 if lane_name == "TACTICAL" else 2},
+        lane={
+            "max_leverage": 3 if lane_name == "TACTICAL" else 2,
+            "shadow_calibration_status": history_status,
+            "shadow_calibration_sample": history_sample,
+        },
         heart=heart or _green_heart(),
         conviction={"tier": tier, "horizon_conflict": False},
         defensive=defensive,
@@ -87,3 +91,19 @@ def test_high_fundamental_risk_or_unvalidated_pump_exhaustion_blocks_leverage_bo
     assert exhausted["eligible"] is False
     assert exhausted["selected_leverage"] == 3
     assert exhausted["requires"]["pump_state_safe_for_leverage_escalation"] is False
+
+
+def test_leverage_escalation_waits_for_history_sample():
+    immature = _policy(tier="MAX_CONVICTION", history_sample=20)
+    assert immature["eligible"] is False
+    assert immature["selected_leverage"] == 3
+
+    learning = _policy(tier="MAX_CONVICTION", history_sample=80)
+    assert learning["eligible"] is True
+    assert learning["selected_leverage"] == 5
+
+    high_ready = _policy(tier="HIGH", history_sample=120)
+    assert high_ready["selected_leverage"] == 10
+
+    max_ready = _policy(tier="MAX_CONVICTION", history_sample=220)
+    assert max_ready["selected_leverage"] == 20
