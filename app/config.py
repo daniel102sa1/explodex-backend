@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     historical_market_worker_interval_seconds: int = 3600
     historical_market_min_analog_sample: int = 30
     historical_market_max_analog_rows: int = 12000
+    historical_market_backfill_token: str = ""
 
     coingecko_base_url: str = "https://api.coingecko.com/api/v3"
     coingecko_demo_api_key: str = ""
