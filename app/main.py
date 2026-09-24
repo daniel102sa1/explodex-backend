@@ -15,6 +15,7 @@ from app.services.dashboard import live_event_feed, live_predictions, prediction
 from app.services.explodex_heart import run_explodex_heart
 from app.services.market_context import market_context
 from app.services.fundamental_intelligence import fundamental_context_for_symbol
+from app.services.historical_market_brain import analog_context as historical_analog_context, backfill_symbol as historical_backfill_symbol, coverage as historical_coverage
 from app.services.news_context import news_context_for_symbol
 from app.services.pump_state_machine import classify_pump_state
 from app.services.opportunities import calibration_by_score, ranked_opportunities
@@ -193,6 +194,37 @@ async def symbol_fundamentals(symbol: str):
         raise HTTPException(status_code=502, detail=f"Fundamental context failed: {exc}") from exc
 
 
+@app.get("/api/v1/history/coverage")
+async def history_coverage(db: AsyncSession = Depends(get_db)):
+    try:
+        return await historical_coverage(db)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Historical coverage unavailable: {exc}") from exc
+
+
+@app.post("/api/v1/history/backfill/{symbol}")
+async def history_backfill(
+    symbol: str,
+    token: str = Query(default=""),
+    days: int = Query(default=60, ge=7, le=365),
+    stride_bars: int = Query(default=6, ge=1, le=72),
+    db: AsyncSession = Depends(get_db),
+):
+    expected = str(settings.historical_market_backfill_token or "")
+    if not expected or token != expected:
+        raise HTTPException(status_code=403, detail="Historical backfill is protected")
+    try:
+        return await historical_backfill_symbol(
+            db,
+            _safe_symbol(symbol),
+            days=days,
+            stride_bars=stride_bars,
+        )
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(status_code=502, detail=f"Historical backfill failed: {exc}") from exc
+
+
 @app.get("/api/v1/market/price/{symbol}")
 async def market_price(symbol: str):
     try:
@@ -275,9 +307,31 @@ async def live_symbol_analysis(
             prediction=prediction,
             fundamental=fundamental,
         )
+        try:
+            historical_analog = await historical_analog_context(
+                db,
+                symbol=safe_symbol,
+                scored=scored,
+                prediction=prediction,
+            )
+        except Exception as exc:
+            await db.rollback()
+            historical_analog = {
+                "version": "historical_market_brain_v1_ohlcv_replay",
+                "available": False,
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                "policy": {
+                    "paper_only": True,
+                    "shadow_only": True,
+                    "can_create_entry": False,
+                    "can_raise_leverage": False,
+                },
+            }
         heart["fundamental_intelligence"] = fundamental
         heart["catalyst_context"] = catalyst_context
         heart["pump_state_machine"] = pump_state
+        heart["historical_analog"] = historical_analog
 
         availability = {
             "price_structure": bool(snapshot.get("klines")),
@@ -325,6 +379,7 @@ async def live_symbol_analysis(
             "fundamental_intelligence": fundamental,
             "catalyst_context": catalyst_context,
             "pump_state_machine": pump_state,
+            "historical_analog": historical_analog,
             "explodex_heart": heart,
             "prediction": prediction,
             "current_open_interest": _float(snapshot.get("open_interest", {}).get("openInterest")),

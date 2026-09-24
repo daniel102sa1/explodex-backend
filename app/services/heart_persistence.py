@@ -14,7 +14,7 @@ from app.services.liquidity_target_engine import build_liquidity_targets
 from app.services.trade_thesis import apply_trade_thesis, apply_thesis_to_score
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-HEART_PERSISTENCE_VERSION = "heart_persistence_v7_fundamental_pump_context"
+HEART_PERSISTENCE_VERSION = "heart_persistence_v8_historical_analog_context"
 
 
 def _json(value: Any) -> dict[str, Any]:
@@ -388,6 +388,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
         fundamental = _json(reason.get("fundamental_intelligence"))
         catalyst_context = _json(reason.get("catalyst_context"))
         pump_state = _json(reason.get("pump_state_machine"))
+        historical_analog = _json(reason.get("historical_analog"))
 
         if allowed:
             score["state"] = "READY"
@@ -419,6 +420,7 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
             "fundamental_intelligence": fundamental,
             "catalyst_context": catalyst_context,
             "pump_state_machine": pump_state,
+            "historical_analog": historical_analog,
             "prediction_phase": prediction.get("phase"),
             "prediction_type": prediction.get("type"),
             "thesis": thesis,
@@ -444,6 +446,12 @@ async def canonicalize_scanner_run(db: AsyncSession, run_id: str) -> dict[str, A
                 "expectancy_policy": expectancy_policy,
                 "fundamental_shadow_only": True,
                 "pump_state_shadow_only": True,
+                "historical_analog_shadow_only": True,
+                "historical_analog_can_create_entry": False,
+                "historical_analog_can_raise_leverage": False,
+                "historical_analog_sample": historical_analog.get("sample"),
+                "historical_analog_status": historical_analog.get("status"),
+                "historical_analog_oos_status": _json(historical_analog.get("out_of_sample")).get("status"),
                 "fundamental_can_create_entry": False,
                 "catalyst_can_create_entry": False,
                 "pump_state_can_create_entry": False,

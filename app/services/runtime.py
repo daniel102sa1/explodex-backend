@@ -10,6 +10,7 @@ from app.database import SessionLocal
 from app.services.edge_engine import capture_recent_signals, label_due_observations
 from app.services.explosion_intelligence import enrich_verdict_features, load_timing_model
 from app.services.final_explosion_labels import finalize_explosion_outcomes
+from app.services.historical_market_brain import backfill_next_liquid_symbol, coverage as historical_coverage
 from app.services.multi_horizon_outcomes import update_multi_horizon_outcomes
 from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
 from app.services.paper_fast_cycle import VERSION as PAPER_EXECUTION_VERSION, run_fast_paper_cycle
@@ -53,12 +54,17 @@ class RuntimeState:
         self.last_microstructure_memory_ok: bool | None = None
         self.last_microstructure_memory_error: str | None = None
         self.last_microstructure_memory_result: dict[str, Any] | None = None
+        self.last_historical_market_at: datetime | None = None
+        self.last_historical_market_ok: bool | None = None
+        self.last_historical_market_error: str | None = None
+        self.last_historical_market_result: dict[str, Any] | None = None
         self.scanner_running = False
         self.paper_manage_running = False
         self.paper_sync_running = False
         self.edge_running = False
         self.verdict_memory_running = False
         self.microstructure_memory_running = False
+        self.historical_market_running = False
 
     def as_dict(self) -> dict[str, Any]:
         def iso(value: datetime | None) -> str | None:
@@ -124,6 +130,18 @@ class RuntimeState:
                 "last_ok": self.last_microstructure_memory_ok,
                 "last_error": self.last_microstructure_memory_error,
                 "last_result": self.last_microstructure_memory_result,
+            },
+            "historical_market_brain": {
+                "running": self.historical_market_running,
+                "enabled": settings.historical_market_enabled,
+                "interval_seconds": settings.historical_market_worker_interval_seconds,
+                "backfill_days": settings.historical_market_backfill_days,
+                "stride_bars": settings.historical_market_stride_bars,
+                "max_symbols": settings.historical_market_max_symbols,
+                "last_run_at": iso(self.last_historical_market_at),
+                "last_ok": self.last_historical_market_ok,
+                "last_error": self.last_historical_market_error,
+                "last_result": self.last_historical_market_result,
             },
         }
 
@@ -280,6 +298,31 @@ async def _run_microstructure_memory_once(*, hydrate: bool = False, prune: bool 
         runtime_state.microstructure_memory_running = False
 
 
+async def _run_historical_market_once() -> None:
+    if runtime_state.historical_market_running or not settings.historical_market_enabled:
+        return
+    runtime_state.historical_market_running = True
+    try:
+        async with SessionLocal() as db:
+            backfill = await backfill_next_liquid_symbol(db)
+            cov = await historical_coverage(db)
+        runtime_state.last_historical_market_result = {
+            "backfill": backfill,
+            "symbols_covered": cov.get("symbols_covered"),
+            "total_samples": cov.get("total_samples"),
+            "top_coverage": (cov.get("symbols") or [])[:8],
+        }
+        runtime_state.last_historical_market_ok = True
+        runtime_state.last_historical_market_error = None
+    except Exception as exc:
+        logger.exception("Historical Market Brain cycle failed")
+        runtime_state.last_historical_market_ok = False
+        runtime_state.last_historical_market_error = str(exc)[:1000]
+    finally:
+        runtime_state.last_historical_market_at = datetime.now(timezone.utc)
+        runtime_state.historical_market_running = False
+
+
 async def _scanner_loop() -> None:
     await asyncio.sleep(8)
     while True:
@@ -318,6 +361,14 @@ async def _microstructure_memory_loop() -> None:
         await _run_microstructure_memory_once(prune=(cycles % 120 == 0))
 
 
+async def _historical_market_loop() -> None:
+    # Delay the first archive job so live scanner/PAPER startup wins resources.
+    await asyncio.sleep(90)
+    while True:
+        await _run_historical_market_once()
+        await asyncio.sleep(max(900, int(settings.historical_market_worker_interval_seconds)))
+
+
 async def start_runtime() -> list[asyncio.Task[Any]]:
     runtime_state.started_at = datetime.now(timezone.utc)
     if not settings.scheduler_enabled:
@@ -328,6 +379,7 @@ async def start_runtime() -> list[asyncio.Task[Any]]:
         asyncio.create_task(_edge_loop(), name="explodex-edge-loop"),
         asyncio.create_task(_verdict_memory_loop(), name="explodex-verdict-memory-loop"),
         asyncio.create_task(_microstructure_memory_loop(), name="explodex-microstructure-memory-loop"),
+        asyncio.create_task(_historical_market_loop(), name="explodex-historical-market-loop"),
     ]
 
 
