@@ -58,20 +58,43 @@ def choose_leverage(grade: str | None, fingerprint_score: float, catalyst_state:
 
 
 def size_position(balance: float, entry: float, stop: float, leverage: int) -> dict[str, float]:
+    """Size PAPER positions from structural stop risk, then cap by margin.
+
+    Leverage changes required margin only; it never increases the approved stop
+    risk budget. Keep the full sizing payload here so every executor uses the
+    same implementation without runtime monkey-patching.
+    """
+    balance = _f(balance)
+    entry = _f(entry)
+    stop = _f(stop)
+    leverage = max(1, int(_f(leverage, 1.0)))
     stop_distance = abs(entry - stop)
     if balance <= 0 or entry <= 0 or stop_distance <= 0:
-        return {"target_risk_usdt": 0.0, "risk_usdt": 0.0, "quantity": 0.0, "notional": 0.0, "margin": 0.0}
-    target_risk_usdt = balance * RISK_PER_TRADE
-    quantity_by_risk = target_risk_usdt / stop_distance
+        return {
+            "risk_budget_usdt": 0.0,
+            "target_risk_usdt": 0.0,
+            "risk_usdt": 0.0,
+            "risk_pct_of_balance": 0.0,
+            "quantity": 0.0,
+            "notional": 0.0,
+            "margin": 0.0,
+        }
+
+    risk_budget_usdt = balance * RISK_PER_TRADE
+    quantity_by_risk = risk_budget_usdt / stop_distance
     max_margin = balance * 0.30
-    max_notional = max_margin * max(1, leverage)
-    quantity = min(quantity_by_risk, max_notional / entry)
+    max_notional = max_margin * leverage
+    quantity_by_margin = max_notional / entry
+    quantity = max(0.0, min(quantity_by_risk, quantity_by_margin))
     notional = quantity * entry
-    margin = notional / max(1, leverage)
+    margin = notional / leverage
     actual_risk_usdt = quantity * stop_distance
+
     return {
-        "target_risk_usdt": round(target_risk_usdt, 6),
+        "risk_budget_usdt": round(risk_budget_usdt, 6),
+        "target_risk_usdt": round(risk_budget_usdt, 6),
         "risk_usdt": round(actual_risk_usdt, 6),
+        "risk_pct_of_balance": round(actual_risk_usdt / balance * 100.0, 6),
         "quantity": round(quantity, 10),
         "notional": round(notional, 6),
         "margin": round(margin, 6),
