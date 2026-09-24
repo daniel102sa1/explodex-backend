@@ -205,10 +205,14 @@ async def history_coverage(db: AsyncSession = Depends(get_db)):
 @app.post("/api/v1/history/backfill/{symbol}")
 async def history_backfill(
     symbol: str,
+    token: str = Query(default=""),
     days: int = Query(default=60, ge=7, le=365),
     stride_bars: int = Query(default=6, ge=1, le=72),
     db: AsyncSession = Depends(get_db),
 ):
+    expected = str(settings.historical_market_backfill_token or "")
+    if not expected or token != expected:
+        raise HTTPException(status_code=403, detail="Historical backfill is protected")
     try:
         return await historical_backfill_symbol(
             db,
