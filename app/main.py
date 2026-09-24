@@ -16,8 +16,7 @@ from app.services.explodex_heart import run_explodex_heart
 from app.services.market_context import market_context
 from app.services.news_context import news_context_for_symbol
 from app.services.opportunities import calibration_by_score, ranked_opportunities
-from app.services.paper_fast_cycle import VERSION as PAPER_EXECUTION_VERSION, run_fast_paper_cycle
-from app.services.paper_horizon_manager import close_due_positions
+from app.services.paper_fast_cycle import VERSION as PAPER_EXECUTION_VERSION, run_fast_paper_cycle, run_paper_exit_management
 from app.services.paper_portfolio import ARSENAL_DISPLAY_START, paper_arsenal_summary, paper_history as canonical_paper_history, paper_performance_summary, paper_summary
 from app.services.paper_reset import maybe_repair_current_arsenal_positions
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
@@ -447,7 +446,7 @@ async def paper_sync(db: AsyncSession = Depends(get_db)):
 async def paper_manage(db: AsyncSession = Depends(get_db)):
     """Compatibility endpoint: manage exits only, never open legacy trades."""
     try:
-        result = await close_due_positions(db)
+        result = await run_paper_exit_management(db)
         result["compatibility_route"] = "/api/v1/paper/manage"
         result["authority"] = "paper_positions"
         result["legacy_trades_table_write_disabled"] = True
