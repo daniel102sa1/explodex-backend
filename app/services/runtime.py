@@ -12,7 +12,7 @@ from app.services.explosion_intelligence import enrich_verdict_features, load_ti
 from app.services.final_explosion_labels import finalize_explosion_outcomes
 from app.services.multi_horizon_outcomes import update_multi_horizon_outcomes
 from app.services.outcome_shadow_model import build_tp1_stop_shadow_report
-from app.services.paper_fast_cycle import run_fast_paper_cycle
+from app.services.paper_fast_cycle import VERSION as PAPER_EXECUTION_VERSION, run_fast_paper_cycle
 from app.services.scanner_guarded import run_scanner
 from app.services.sequential_microstructure import flush_pending_snapshots, hydrate_recent_histories, prune_persistent_history
 from app.services.verdict_memory import capture_enter_verdicts, resolve_verdict_outcomes, verdict_memory_stats
@@ -88,7 +88,7 @@ class RuntimeState:
             },
             "paper_sync": {
                 "running": self.paper_sync_running,
-                "engine": "paper_fast_cycle_v5_unified_heart_only",
+                "engine": PAPER_EXECUTION_VERSION,
                 "portfolio": "paper_positions_visible_in_/paper",
                 "single_authority": True,
                 "interval_seconds": PAPER_HEART_LOOP_SECONDS,
