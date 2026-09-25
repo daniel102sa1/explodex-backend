@@ -18,17 +18,17 @@ VERSION = "paper_unified_heart_executor_v9_fundamental_risk_context"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
-DEFENSIVE_MAX_NEW_POSITIONS = 1
+DEFENSIVE_MAX_NEW_POSITIONS = base.MAX_OPEN_POSITIONS
 DEFENSIVE_TACTICAL_MAX_RISK_SCORE = 65.0
 DEFENSIVE_SWING_MAX_RISK_SCORE = 60.0
 DEFENSIVE_SWING_MIN_SCORE = 68.0
 DEFENSIVE_SWING_MIN_EDGE = 16.0
 
 # VNext probation exists only so a bad legacy cohort cannot permanently prevent
-# the new PAPER generation from collecting any real execution outcomes. It is
-# intentionally tiny, one-position-at-a-time, and 1x leverage.
+# the new PAPER generation from collecting any real execution outcomes. PAPER
+# capacity is unlimited; probation still keeps reduced risk and 1x leverage.
 PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP = 0.10
-PROBATION_MAX_NEW_POSITIONS = 1
+PROBATION_MAX_NEW_POSITIONS = base.MAX_OPEN_POSITIONS
 PROBATION_MAX_RISK_SCORE = 48.0
 PROBATION_SWING_MIN_SCORE = 70.0
 PROBATION_SWING_MIN_EDGE = 18.0
