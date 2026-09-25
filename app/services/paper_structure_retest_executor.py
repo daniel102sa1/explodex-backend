@@ -64,8 +64,7 @@ async def execute_structure_retest_contracts(
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
     slots = max(0, base.MAX_OPEN_POSITIONS - open_count)
-    if defensive:
-        slots = min(slots, 1)
+    # Defensive mode may reduce quality/risk, but it does not cap PAPER order count.
     if slots <= 0:
         return {"version": VERSION, "opened": 0, "reason": "max_open_positions", "trades": [], "rejected": {}}
 
