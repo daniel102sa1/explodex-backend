@@ -14,7 +14,7 @@ from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
 VERSION = "paper_pre_event_executor_v2_horizon_stop_guard"
-MAX_NEW = 1
+MAX_NEW = base.MAX_OPEN_POSITIONS
 
 
 def _d(value: Any) -> dict[str, Any]:
