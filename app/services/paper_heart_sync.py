@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.services.binance import binance_client
+from app.services import paper_portfolio as base
 from app.services.paper_trading import (
     DEFAULT_PAPER_ACCOUNT,
     DEFAULT_SCANNER_SETTINGS,
@@ -70,7 +71,7 @@ async def sync_heart_paper_signals(db: AsyncSession) -> dict[str, Any]:
 
     This replaces the automatic legacy READY sync. It intentionally does not
     re-apply the old min_setup/max_risk entry gates after the Heart has already
-    made an ENTER decision. Portfolio limits and live entry-zone checks remain.
+    made an ENTER decision. PAPER capacity is unlimited; live entry-zone checks remain.
     """
     if not settings.paper_trading_only:
         return {
@@ -99,7 +100,7 @@ async def sync_heart_paper_signals(db: AsyncSession) -> dict[str, Any]:
     open_count = int((await db.execute(text(
         "SELECT COUNT(*) FROM trades WHERE mode='PAPER' AND status IN ('OPEN','PARTIAL')"
     ))).scalar_one() or 0)
-    max_open = int(scanner_cfg.get("max_open_trades") or 2)
+    max_open = base.MAX_OPEN_POSITIONS if base.PAPER_UNLIMITED_OPEN_POSITIONS else int(scanner_cfg.get("max_open_trades") or 2)
     available_slots = max(0, max_open - open_count)
     if available_slots <= 0:
         return {
