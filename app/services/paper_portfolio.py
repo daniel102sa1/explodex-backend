@@ -11,7 +11,10 @@ from app.services.binance import binance_client
 
 STARTING_BALANCE = 1000.0
 RISK_PER_TRADE = 0.03
-MAX_OPEN_POSITIONS = 3
+PAPER_UNLIMITED_OPEN_POSITIONS = True
+# Keep an integer sentinel so legacy PAPER executors that do arithmetic with
+# MAX_OPEN_POSITIONS remain compatible. This is not a practical trading cap.
+MAX_OPEN_POSITIONS = 1_000_000_000 if PAPER_UNLIMITED_OPEN_POSITIONS else 3
 MAX_PAPER_LEVERAGE = 20
 TAKER_FEE_RATE = 0.0005
 SLIPPAGE_RATE = 0.0002
@@ -382,7 +385,8 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
         "win_rate_pct": round((int(stats["winners"] or 0) / closed * 100.0), 2) if closed else None,
         "assumptions": {
             "risk_per_trade_pct": RISK_PER_TRADE * 100,
-            "max_open_positions": MAX_OPEN_POSITIONS,
+            "max_open_positions": None if PAPER_UNLIMITED_OPEN_POSITIONS else MAX_OPEN_POSITIONS,
+            "open_positions_unlimited": PAPER_UNLIMITED_OPEN_POSITIONS,
             "max_paper_leverage": MAX_PAPER_LEVERAGE,
             "taker_fee_pct_per_side": TAKER_FEE_RATE * 100,
             "slippage_pct_per_side": SLIPPAGE_RATE * 100,
