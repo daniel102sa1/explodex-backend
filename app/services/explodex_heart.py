@@ -441,8 +441,8 @@ async def run_explodex_heart(
         prediction=prediction,
         plan=plan,
         deterministic_decision=decision,
-        hard_safety=hard_safety,
         market_event=market_event,
+        snapshot=snapshot,
         coinglass=cg,
     )
     deterministic_execution_allowed = bool(decision["should_enter"])
