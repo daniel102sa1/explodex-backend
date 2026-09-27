@@ -4,6 +4,8 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.services.ai_brain import evaluate_candidate
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.trade_thesis import apply_thesis_to_score, apply_trade_thesis
 
@@ -380,7 +382,39 @@ async def run_explodex_heart(
 
     decision = _action_decision(canonical=canonical, prediction=prediction, thesis=thesis, plan=plan)
     market_event = _market_event(canonical, prediction)
-    execution_allowed = bool(decision["should_enter"])
+
+    ai_brain = await evaluate_candidate(
+        symbol=symbol,
+        scored=canonical,
+        prediction=prediction,
+        plan=plan,
+        deterministic_decision=decision,
+        market_event=market_event,
+        coinglass=cg,
+    )
+    deterministic_execution_allowed = bool(decision["should_enter"])
+    ai_gate_applied = bool(settings.ai_brain_enabled and not settings.ai_brain_shadow_only)
+    execution_allowed = (
+        deterministic_execution_allowed
+        if not ai_gate_applied
+        else deterministic_execution_allowed
+        and bool(ai_brain.get("available"))
+        and bool(ai_brain.get("allow_entry"))
+    )
+
+    final_decision = dict(decision)
+    final_decision["deterministic_should_enter"] = deterministic_execution_allowed
+    final_decision["ai_gate_applied"] = ai_gate_applied
+    final_decision["ai_state"] = ai_brain.get("state")
+    final_decision["should_enter"] = execution_allowed
+    if ai_gate_applied and deterministic_execution_allowed and not execution_allowed:
+        ai_state = str(ai_brain.get("state") or "NO_TRADE")
+        final_decision["action"] = "ESPERAR" if ai_state in {
+            "PRE_ALERT_LONG", "PRE_ALERT_SHORT", "ARMED", "COOLING"
+        } else "NO_ENTRAR"
+        final_decision["reason"] = (
+            f"Terra no confirmó entrada inmediata ({ai_state}); el Risk Guard determinista sigue mandando."
+        )
 
     heart = {
         "version": HEART_VERSION,
@@ -389,8 +423,9 @@ async def run_explodex_heart(
         "direction": canonical.get("direction"),
         "state": canonical.get("state"),
         "execution_allowed": execution_allowed,
-        "action_decision": decision,
+        "action_decision": final_decision,
         "market_event": market_event,
+        "ai_brain": ai_brain,
         "plan": plan,
         "thesis": thesis,
         "prediction_phase": prediction.get("phase"),
@@ -403,6 +438,7 @@ async def run_explodex_heart(
         "market_event": market_event,
         "plan": plan,
         "execution_allowed": execution_allowed,
-        "action_decision": decision,
+        "action_decision": final_decision,
+        "ai_brain": ai_brain,
     }
     return {"score": canonical, "prediction": prediction, "heart": heart}
