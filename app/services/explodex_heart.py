@@ -4,10 +4,12 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.services.ai_brain import evaluate_candidate
 from app.services.prediction_guarded import build_pre_move_prediction
 from app.services.trade_thesis import apply_thesis_to_score, apply_trade_thesis
 
-HEART_VERSION = "explodex_heart_v2_actionable"
+HEART_VERSION = "explodex_heart_v3_terra_primary"
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -298,6 +300,57 @@ def _price_in_plan(current: float, plan: dict[str, Any]) -> bool:
     return current > 0 and low > 0 and high > 0 and min(low, high) <= current <= max(low, high)
 
 
+def _hard_safety_gate(*, canonical: dict[str, Any], prediction: dict[str, Any], thesis: dict[str, Any] | None, plan: dict[str, Any]) -> dict[str, Any]:
+    """Non-negotiable safety boundary.
+
+    Terra owns the decision, but it cannot bypass structural invalidation,
+    no-chase, cooldown/terminal thesis state, Risk Guard, or the fixed entry zone.
+    This gate deliberately does NOT require the legacy READY/timing decision.
+    """
+    direction = str(canonical.get("direction") or prediction.get("direction") or "").upper()
+    plan_direction = str(plan.get("direction") or "").upper()
+    current = _f(canonical.get("current_price"))
+    sequence = _dict(prediction.get("sequence"))
+    decision_guard = _dict(prediction.get("decision_guard"))
+    stack = _dict(prediction.get("prediction_stack_v5"))
+    risk_veto = _dict(stack.get("risk_veto"))
+
+    in_zone = _price_in_plan(current, plan)
+    terminal = bool(thesis and str(thesis.get("status") or "") in {"INVALIDATED", "EXPIRED", "CLOSED"})
+    cooldown = bool(thesis and str(thesis.get("action") or "") == "COOLDOWN_NO_CAMBIAR_DE_LADO")
+    chase = (
+        bool(sequence.get("chase_risk"))
+        or bool(risk_veto.get("chase"))
+        or str(thesis.get("status") if thesis else "") == "NO_CHASE"
+    )
+    hard_block = (
+        bool(risk_veto.get("blocked"))
+        or bool(risk_veto.get("invalidated"))
+        or bool(risk_veto.get("hard_block"))
+    )
+    risk_guard_pass = bool(sequence.get("risk_guard_pass", decision_guard.get("risk_guard_pass", True)))
+    direction_match = direction in {"LONG", "SHORT"} and plan_direction == direction
+
+    checks = {
+        "risk_guard_pass": risk_guard_pass,
+        "not_hard_blocked": not hard_block,
+        "not_chasing": not chase,
+        "not_terminal": not terminal,
+        "not_cooldown": not cooldown,
+        "price_in_entry_zone": in_zone,
+        "direction_matches_fixed_plan": direction_match,
+    }
+    blockers = [name for name, ok in checks.items() if not ok]
+    return {
+        "pass": all(checks.values()),
+        "direction": direction,
+        "plan_direction": plan_direction,
+        "price_in_entry_zone": in_zone,
+        "checks": checks,
+        "blockers": blockers,
+    }
+
+
 def _action_decision(*, canonical: dict[str, Any], prediction: dict[str, Any], thesis: dict[str, Any] | None, plan: dict[str, Any]) -> dict[str, Any]:
     direction = str(canonical.get("direction") or prediction.get("direction") or "").upper()
     current = _f(canonical.get("current_price"))
@@ -379,18 +432,78 @@ async def run_explodex_heart(
         canonical["state"] = "READY"
 
     decision = _action_decision(canonical=canonical, prediction=prediction, thesis=thesis, plan=plan)
+    hard_safety = _hard_safety_gate(canonical=canonical, prediction=prediction, thesis=thesis, plan=plan)
     market_event = _market_event(canonical, prediction)
-    execution_allowed = bool(decision["should_enter"])
+
+    ai_brain = await evaluate_candidate(
+        symbol=symbol,
+        scored=canonical,
+        prediction=prediction,
+        plan=plan,
+        deterministic_decision=decision,
+        market_event=market_event,
+        snapshot=snapshot,
+        coinglass=cg,
+    )
+    deterministic_execution_allowed = bool(decision["should_enter"])
+    terra_primary_applied = bool(settings.ai_brain_enabled and not settings.ai_brain_shadow_only)
+
+    if terra_primary_applied:
+        # Terra is the principal decision-maker. Legacy timing is advisory only.
+        # Failure/timeout is fail-closed: no PAPER entry.
+        execution_allowed = (
+            bool(ai_brain.get("available"))
+            and bool(ai_brain.get("allow_entry"))
+            and bool(hard_safety.get("pass"))
+        )
+    else:
+        # Shadow mode preserves current PAPER behavior while recording exactly
+        # what Terra would have done as the future primary brain.
+        execution_allowed = deterministic_execution_allowed
+
+    ai_state = str(ai_brain.get("state") or "NO_TRADE")
+    ai_direction = str(ai_brain.get("direction") or "NONE").upper()
+
+    final_decision = dict(decision)
+    final_decision["deterministic_should_enter"] = deterministic_execution_allowed
+    final_decision["terra_primary_applied"] = terra_primary_applied
+    final_decision["ai_gate_applied"] = terra_primary_applied
+    final_decision["ai_state"] = ai_state
+    final_decision["terra_would_enter"] = bool(
+        ai_brain.get("available") and ai_brain.get("allow_entry") and hard_safety.get("pass")
+    )
+    final_decision["hard_safety"] = hard_safety
+    final_decision["decision_owner"] = "TERRA_PRIMARY" if terra_primary_applied else "DETERMINISTIC_SHADOW"
+    final_decision["should_enter"] = execution_allowed
+
+    if terra_primary_applied:
+        if execution_allowed:
+            final_decision["action"] = "ENTRAR_LONG" if ai_direction == "LONG" else "ENTRAR_SHORT"
+            final_decision["direction"] = ai_direction
+            final_decision["reason"] = (
+                "Terra confirmó la entrada y todos los límites duros de seguridad permanecen válidos."
+            )
+        else:
+            final_decision["action"] = "ESPERAR" if ai_state in {
+                "PRE_ALERT_LONG", "PRE_ALERT_SHORT", "ARMED", "COOLING"
+            } else "NO_ENTRAR"
+            final_decision["reason"] = (
+                f"Terra es el decisor principal y no autorizó entrada ({ai_state}), "
+                "o el límite duro de seguridad la bloqueó."
+            )
 
     heart = {
         "version": HEART_VERSION,
         "symbol": symbol,
-        "mission": "detectar la próxima expansión y dar una decisión clara de entrar o no entrar",
-        "direction": canonical.get("direction"),
-        "state": canonical.get("state"),
+        "mission": "Terra decide estado y timing; ExplodeX aporta sensores y un Risk Guard inviolable",
+        "decision_owner": "TERRA_PRIMARY" if terra_primary_applied else "DETERMINISTIC_SHADOW",
+        "direction": ai_direction if terra_primary_applied and ai_direction in {"LONG", "SHORT"} else canonical.get("direction"),
+        "state": ai_state if terra_primary_applied else canonical.get("state"),
         "execution_allowed": execution_allowed,
-        "action_decision": decision,
+        "action_decision": final_decision,
         "market_event": market_event,
+        "ai_brain": ai_brain,
+        "hard_safety": hard_safety,
         "plan": plan,
         "thesis": thesis,
         "prediction_phase": prediction.get("phase"),
@@ -403,6 +516,8 @@ async def run_explodex_heart(
         "market_event": market_event,
         "plan": plan,
         "execution_allowed": execution_allowed,
-        "action_decision": decision,
+        "action_decision": final_decision,
+        "ai_brain": ai_brain,
+        "hard_safety": hard_safety,
     }
     return {"score": canonical, "prediction": prediction, "heart": heart}

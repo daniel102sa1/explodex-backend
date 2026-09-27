@@ -21,6 +21,16 @@ class Settings(BaseSettings):
 
     paper_trading_only: bool = True
 
+    # OpenAI AI Brain. Starts in shadow mode: Terra evaluates candidates but
+    # cannot authorize PAPER entries until representative evals are reviewed.
+    openai_api_key: str = ""
+    openai_model: str = "gpt-5.6-terra"
+    ai_brain_enabled: bool = True
+    ai_brain_shadow_only: bool = True
+    ai_brain_timeout_seconds: float = 20.0
+    ai_brain_reasoning_effort: str = "low"
+    ai_brain_max_output_tokens: int = 700
+
     # CoinGlass is a confirmation layer, never a single-source trade trigger.
     coinglass_enabled: bool = True
     coinglass_api_key: str = ""

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import check_database, ensure_runtime_schema, get_db
 from app.services.binance import binance_client
+from app.services.ai_brain import status as ai_brain_status
 from app.services.coinglass import coinglass_client
 from app.services.coinglass_confirmation import apply_coinglass_confirmation
 from app.services.dashboard import live_event_feed, live_predictions, prediction_history
@@ -98,6 +99,7 @@ async def root():
             "require_for_ready": settings.coinglass_require_for_ready,
         },
         "prediction_engine": "explodex-heart-v1",
+        "ai_brain": ai_brain_status(),
         "paper_execution_engine": PAPER_EXECUTION_VERSION,
         "paper_authority": "UNIFIED_HEART_CONTRACT_ONLY",
         "legacy_paper_writes_disabled": True,
@@ -117,6 +119,7 @@ async def health():
         "market_data_source": binance_client.active_source,
         "provider_warning": binance_client.last_primary_error,
         "prediction_engine": "explodex-heart-v1",
+        "ai_brain": ai_brain_status(),
         "paper_execution_engine": PAPER_EXECUTION_VERSION,
         "paper_authority": "UNIFIED_HEART_CONTRACT_ONLY",
         "legacy_paper_writes_disabled": True,
@@ -132,6 +135,7 @@ async def runtime_status():
     payload["provider_warning"] = binance_client.last_primary_error
     payload["coinglass"] = coinglass_client.status()
     payload["prediction_engine"] = "explodex-heart-v1"
+    payload["ai_brain"] = ai_brain_status()
     payload["ready_policy"] = READY_POLICY
     return payload
 
