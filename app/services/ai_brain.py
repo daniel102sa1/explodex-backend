@@ -28,6 +28,7 @@ _DECISION_SCHEMA: dict[str, Any] = {
         "tp3": {"type": "number"},
         "leverage": {"type": "number"},
         "risk_pct": {"type": "number"},
+        "capital_allocation_pct": {"type": "number"},
         "max_hold_minutes": {"type": "integer"},
         "evidence_strength": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
         "reasons": {"type": "array", "items": {"type": "string"}},
@@ -38,7 +39,7 @@ _DECISION_SCHEMA: dict[str, Any] = {
     "required": [
         "state", "direction", "action", "allow_entry",
         "entry_low", "entry_high", "stop_loss", "tp1", "tp2", "tp3",
-        "leverage", "risk_pct", "max_hold_minutes",
+        "leverage", "risk_pct", "capital_allocation_pct", "max_hold_minutes",
         "evidence_strength", "reasons", "risks", "continuation_checks", "summary",
     ],
     "additionalProperties": False,
@@ -90,6 +91,7 @@ def _fallback(reason: str) -> dict[str, Any]:
         "tp3": 0.0,
         "leverage": 0.0,
         "risk_pct": 0.0,
+        "capital_allocation_pct": 0.0,
         "max_hold_minutes": 0,
         "evidence_strength": "LOW",
         "reasons": [],
@@ -203,7 +205,11 @@ async def evaluate_candidate(
         "Every legacy module is only a sensor or opinion. None of its states, risk scores, vetoes, "
         "entry zones, stops, targets, no-chase flags or timing decisions are binding on you. "
         "You decide whether there is a trade, LONG or SHORT, when to enter, the entry zone, stop loss, "
-        "TP1/TP2/TP3, leverage, risk percentage and maximum hold time. You may disagree with all legacy outputs. "
+        "TP1/TP2/TP3, leverage, risk percentage, capital allocation percentage and maximum hold time. "
+        "Size dynamically: when the setup has exceptional multi-source coherence, strong liquidity and clean immediate continuation, "
+        "you may allocate more simulated capital and use more leverage; for ordinary or less certain setups use less capital and low leverage; "
+        "for weak, noisy or conflicting evidence choose NO_TRADE rather than forcing size. Leverage must follow evidence quality, volatility, liquidity "
+        "and stop distance, not excitement or a fast candle. You may disagree with all legacy outputs. "
         "Use the raw multi-timeframe candles, futures and spot aggressive trades, order book, open interest, "
         "funding/premium, long-short positioning, top-trader positioning, CoinGlass context and all derived sensors together. "
         "Do not treat any score as a calibrated probability. Prefer NO_TRADE when the evidence is not coherent. "
@@ -253,6 +259,7 @@ async def evaluate_candidate(
             "tp3": _f(decision.get("tp3")),
             "leverage": _f(decision.get("leverage")),
             "risk_pct": _f(decision.get("risk_pct")),
+            "capital_allocation_pct": _f(decision.get("capital_allocation_pct")),
             "max_hold_minutes": int(decision.get("max_hold_minutes") or 0),
             "do_not_recalculate": True,
         }
@@ -286,6 +293,7 @@ async def evaluate_candidate(
             "tp3": plan_out["tp3"],
             "leverage": plan_out["leverage"],
             "risk_pct": plan_out["risk_pct"],
+            "capital_allocation_pct": plan_out["capital_allocation_pct"],
             "max_hold_minutes": plan_out["max_hold_minutes"],
             "evidence_strength": decision.get("evidence_strength"),
             "reasons": list(decision.get("reasons") or [])[:10],
