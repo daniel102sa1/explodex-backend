@@ -21,6 +21,10 @@ async def check_database() -> bool:
 async def ensure_runtime_schema() -> None:
     """Keep the live Railway schema compatible with current ExplodeX engines."""
     async with engine.begin() as conn:
+        # New structural exit labels can exceed the legacy VARCHAR(24) column.
+        # Widening is backward-compatible and prevents PAPER sync from crashing.
+        await conn.execute(text("ALTER TABLE paper_positions ALTER COLUMN exit_reason TYPE VARCHAR(64)"))
+
         await conn.execute(text("ALTER TABLE alerts DROP CONSTRAINT IF EXISTS alerts_severity_check"))
         await conn.execute(
             text(
