@@ -21,7 +21,7 @@ from app.services.pump_state_machine import classify_pump_state
 from app.services.opportunities import calibration_by_score, ranked_opportunities
 from app.services.paper_fast_cycle import VERSION as PAPER_EXECUTION_VERSION, run_fast_paper_cycle, run_paper_exit_management
 from app.services.paper_portfolio import ARSENAL_DISPLAY_START, paper_arsenal_summary, paper_history as canonical_paper_history, paper_performance_summary, paper_summary
-from app.services.paper_reset import maybe_repair_current_arsenal_positions
+from app.services.paper_reset import maybe_repair_current_arsenal_positions, maybe_reset_full_paper_baseline
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
 from app.services.scanner_progress import scanner_progress
@@ -34,7 +34,8 @@ READY_POLICY = "ExplodeX Heart: guarded prediction + fixed thesis + no_chase + r
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await ensure_runtime_schema()
-    app.state.paper_reset_result = await maybe_repair_current_arsenal_positions()
+    app.state.paper_reset_result = await maybe_reset_full_paper_baseline()
+    app.state.paper_repair_result = await maybe_repair_current_arsenal_positions()
     tasks = await start_runtime()
     app.state.runtime_tasks = tasks
     try:
