@@ -62,6 +62,7 @@ def _fallback(reason: str, *, eligible: bool) -> dict[str, Any]:
         "eligible": eligible,
         "model": settings.openai_model,
         "shadow_only": bool(settings.ai_brain_shadow_only),
+        "role": "PRIMARY_DECIDER",
         "state": "NO_TRADE",
         "direction": "NONE",
         "allow_entry": False,
@@ -81,6 +82,7 @@ def _packet(
     prediction: dict[str, Any],
     plan: dict[str, Any],
     deterministic_decision: dict[str, Any],
+    hard_safety: dict[str, Any],
     market_event: dict[str, Any],
     coinglass: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -119,6 +121,7 @@ def _packet(
             )
         },
         "deterministic_decision": deterministic_decision,
+        "hard_safety": hard_safety,
         "market_event": market_event,
         "metrics": {key: metrics.get(key) for key in metric_keys if key in metrics},
         "coinglass": {
@@ -140,7 +143,10 @@ async def evaluate_candidate(
 ) -> dict[str, Any]:
     state = str(scored.get("state") or "")
     phase = str(prediction.get("phase") or "")
-    eligible = state in {"PREPARING", "READY"} or phase in {
+    # Terra starts thinking one stage earlier than the legacy entry gate.
+    # Cheap deterministic filters still protect cost by keeping obvious NO_TRADE
+    # symbols away from the model.
+    eligible = state in {"WATCH", "PREPARING", "READY"} or phase in {
         "PREACTIVACION", "VIGILAR_CONFIRMACION", "ACTIVADO", "ESPERAR_RETEST",
     }
 
@@ -159,6 +165,7 @@ async def evaluate_candidate(
         prediction=prediction,
         plan=plan,
         deterministic_decision=deterministic_decision,
+        hard_safety=hard_safety,
         market_event=market_event,
         coinglass=coinglass,
     )
@@ -237,6 +244,7 @@ async def evaluate_candidate(
             "eligible": True,
             "model": response.model,
             "shadow_only": bool(settings.ai_brain_shadow_only),
+            "role": "PRIMARY_DECIDER",
             "response_id": response.id,
             "state": ai_state,
             "direction": direction,
