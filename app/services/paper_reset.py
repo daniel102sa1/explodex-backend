@@ -9,6 +9,8 @@ from sqlalchemy import text
 from app.database import engine
 from app.services.paper_portfolio import ARSENAL_DISPLAY_START
 
+FULL_RESET_ENV = "EXPLODEX_PAPER_RESET_TOKEN"
+FULL_RESET_PREFIX = "FULL_PAPER_BASELINE"
 OPEN_RESET_ENV = "EXPLODEX_OPEN_PAPER_RESET_TOKEN"
 MARKER_TABLE = "system_reset_markers"
 MARKER_PREFIX = "OPEN_PAPER_ONLY"
@@ -23,6 +25,123 @@ def _reset_marker_key(token: str) -> str:
 def _is_open_position_reset_target(name: str) -> bool:
     """Guardrail: an open-position reset may touch only the canonical PAPER ledger."""
     return str(name or "").strip().lower() == "paper_positions"
+
+
+async def maybe_reset_full_paper_baseline() -> dict[str, Any]:
+    """One-shot destructive reset of the visible PAPER simulation only.
+
+    Clears simulated positions/orders/equity history and restores the PAPER
+    account to exactly 1,000 USDT. Market/scanner/model-learning tables are not
+    touched so research memory remains available for the new experiment.
+    """
+    token = str(os.getenv(FULL_RESET_ENV, "") or "").strip()
+    if not token:
+        return {"requested": False, "applied": False, "reason": "no_full_reset_token"}
+
+    marker_key = f"{FULL_RESET_PREFIX}::{token}"
+    async with engine.begin() as conn:
+        await conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {MARKER_TABLE} (
+                token TEXT PRIMARY KEY,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                details JSONB NOT NULL DEFAULT '{{}}'::jsonb
+            )
+        """))
+
+        seen = await conn.execute(
+            text(f"SELECT 1 FROM {MARKER_TABLE} WHERE token=:token"),
+            {"token": marker_key},
+        )
+        if seen.scalar_one_or_none():
+            return {
+                "requested": True,
+                "applied": False,
+                "reason": "full_reset_token_already_applied",
+            }
+
+        positions_exists = bool((await conn.execute(
+            text("SELECT to_regclass('public.paper_positions')")
+        )).scalar_one_or_none())
+        account_exists = bool((await conn.execute(
+            text("SELECT to_regclass('public.paper_accounts')")
+        )).scalar_one_or_none())
+        curve_exists = bool((await conn.execute(
+            text("SELECT to_regclass('public.paper_equity_curve')")
+        )).scalar_one_or_none())
+        orders_exists = bool((await conn.execute(
+            text("SELECT to_regclass('public.paper_orders')")
+        )).scalar_one_or_none())
+
+        if not positions_exists or not account_exists:
+            return {
+                "requested": True,
+                "applied": False,
+                "reason": "paper_ledger_not_ready",
+            }
+
+        positions_before = int((await conn.execute(
+            text("SELECT COUNT(*) FROM paper_positions")
+        )).scalar_one() or 0)
+        open_before = int((await conn.execute(
+            text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'")
+        )).scalar_one() or 0)
+        orders_before = int((await conn.execute(
+            text("SELECT COUNT(*) FROM paper_orders")
+        )).scalar_one() or 0) if orders_exists else 0
+        curve_before = int((await conn.execute(
+            text("SELECT COUNT(*) FROM paper_equity_curve")
+        )).scalar_one() or 0) if curve_exists else 0
+
+        # Orders reference positions, so clear the PAPER order ledger first.
+        if orders_exists:
+            await conn.execute(text("DELETE FROM paper_orders"))
+        await conn.execute(text("DELETE FROM paper_positions"))
+        if curve_exists:
+            await conn.execute(text("DELETE FROM paper_equity_curve"))
+
+        updated = await conn.execute(text("""
+            UPDATE paper_accounts
+            SET starting_balance=1000,
+                cash_balance=1000,
+                realized_pnl=0,
+                total_fees=0,
+                updated_at=NOW()
+            WHERE id=1
+        """))
+        if int(updated.rowcount or 0) == 0:
+            await conn.execute(text("""
+                INSERT INTO paper_accounts (
+                    id, starting_balance, cash_balance, realized_pnl, total_fees,
+                    created_at, updated_at
+                ) VALUES (1, 1000, 1000, 0, 0, NOW(), NOW())
+            """))
+
+        details = {
+            "mode": "FULL_PAPER_BASELINE_1000",
+            "positions_deleted": positions_before,
+            "open_positions_deleted": open_before,
+            "orders_deleted": orders_before,
+            "equity_points_deleted": curve_before,
+            "starting_balance": 1000,
+            "cash_balance": 1000,
+            "realized_pnl": 0,
+            "total_fees": 0,
+            "signals_preserved": True,
+            "market_history_preserved": True,
+            "learning_preserved": True,
+            "paper_only": True,
+        }
+        await conn.execute(
+            text(f"INSERT INTO {MARKER_TABLE} (token, details) VALUES (:token, CAST(:details AS JSONB))"),
+            {"token": marker_key, "details": json.dumps(details)},
+        )
+
+    return {
+        "requested": True,
+        "applied": True,
+        "reason": "full_paper_baseline_reset_to_1000",
+        **details,
+    }
 
 
 async def maybe_reset_open_paper_positions() -> dict[str, Any]:
