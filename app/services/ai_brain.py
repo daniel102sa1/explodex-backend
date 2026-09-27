@@ -8,7 +8,7 @@ from openai import AsyncOpenAI
 from app.config import settings
 
 
-AI_BRAIN_VERSION = "terra_confirmation_v1"
+AI_BRAIN_VERSION = "terra_primary_decider_v2"
 
 _DECISION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -40,7 +40,7 @@ def status() -> dict[str, Any]:
         "configured": bool(settings.openai_api_key),
         "model": settings.openai_model,
         "shadow_only": bool(settings.ai_brain_shadow_only),
-        "reasoning_effort": settings.ai_brain_reasoning_effort,
+        "reasoning_effort": settings.ai_brain_reasoning_effort,\n        "role": "PRIMARY_DECIDER",
     }
 
 
@@ -163,14 +163,18 @@ async def evaluate_candidate(
         coinglass=coinglass,
     )
     instructions = (
-        "You are ExplodeX Terra Confirmation Brain for PAPER trading. Be extremely selective. "
-        "The deterministic engine owns the fixed entry, stop, targets and hard risk guard. "
-        "Never invent or change trade levels, never override invalidation, chase, direction conflict "
-        "or a failed risk guard, and never interpret setup scores as probabilities. "
-        "Confirm only when the supplied structure and flow support immediate continuation. "
+        "You are ExplodeX Terra Primary Decision Brain for PAPER trading. Be extremely selective. "
+        "You own market-state interpretation, direction confirmation and final timing. "
+        "The deterministic modules are sensors/advisors: they propose a candidate plan and expose hard safety facts, "
+        "but their legacy timing decision is not authoritative. "
+        "The hard safety gate is non-negotiable: never override failed risk guard, invalidation, chase, terminal/cooldown, "
+        "price outside the fixed entry zone, or a direction mismatch with the fixed plan. "
+        "Never invent or change entry, stop, targets, leverage or position size, and never interpret setup scores as probabilities. "
+        "You may reject a deterministic entry, and you may confirm before the legacy timing gate if the supplied structure, "
+        "flow and microstructure clearly support immediate continuation and hard_safety.pass is true. "
         "If evidence is missing, mixed or weak, prefer ARMED, PRE_ALERT or NO_TRADE. "
-        "allow_entry may be true only if the deterministic decision already allows entry and your "
-        "state is LONG_CONFIRMED or SHORT_CONFIRMED with the same direction."
+        "allow_entry may be true only when your state is LONG_CONFIRMED or SHORT_CONFIRMED, your direction matches the fixed plan, "
+        "and hard_safety.pass is true."
     )
 
     try:
@@ -203,17 +207,20 @@ async def evaluate_candidate(
         ai_state = str(decision.get("state") or "NO_TRADE").upper()
         allow_entry = bool(decision.get("allow_entry"))
 
-        deterministic_direction = str(scored.get("direction") or "").upper()
-        deterministic_allowed = bool(deterministic_decision.get("should_enter"))
+        plan_direction = str(plan.get("direction") or scored.get("direction") or "").upper()
+        hard_safe = bool(hard_safety.get("pass"))
         confirmed = (
             (ai_state == "LONG_CONFIRMED" and direction == "LONG")
             or (ai_state == "SHORT_CONFIRMED" and direction == "SHORT")
         )
         blockers = list(decision.get("blockers") or [])
-        if direction not in {"NONE", deterministic_direction}:
+        if direction not in {"NONE", plan_direction}:
             allow_entry = False
-            blockers.append("AI direction conflicts with deterministic direction")
-        if not deterministic_allowed or not confirmed:
+            blockers.append("Terra direction conflicts with the fixed candidate plan")
+        if not hard_safe:
+            allow_entry = False
+            blockers.extend(list(hard_safety.get("blockers") or []))
+        if not confirmed:
             allow_entry = False
 
         usage = {}
