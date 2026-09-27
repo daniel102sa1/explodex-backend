@@ -289,7 +289,7 @@ class BinancePublicClient:
 
     async def klines(self, symbol: str, interval: str = "5m", limit: int = 120) -> list[list[Any]]:
         symbol = symbol.upper()
-        ttl_map = {"1m": 5.0, "3m": 8.0, "5m": 18.0, "15m": 40.0, "30m": 60.0, "1h": 90.0, "2h": 120.0, "4h": 180.0, "1d": 300.0}
+        ttl_map = {"1m": 5.0, "3m": 8.0, "5m": 18.0, "15m": 40.0, "30m": 60.0, "1h": 90.0, "2h": 120.0, "4h": 180.0, "1d": 300.0, "1w": 900.0, "1M": 1800.0}
         ttl = ttl_map.get(interval, 20.0)
 
         async def load() -> list[list[Any]]:
@@ -302,7 +302,7 @@ class BinancePublicClient:
                 except Exception:
                     pass
 
-            bar_map = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1D"}
+            bar_map = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1D", "1w": "1W", "1M": "1M"}
             bar = bar_map.get(interval, interval)
             payload = await self._okx_get(
                 "/api/v5/market/candles",
@@ -743,8 +743,13 @@ class BinancePublicClient:
         )
 
         extras = await asyncio.gather(
-            self.klines(symbol, "15m", 80),
-            self.klines(symbol, "1h", 80),
+            self.klines(symbol, "1m", 120),
+            self.klines(symbol, "15m", 96),
+            self.klines(symbol, "1h", 96),
+            self.klines(symbol, "4h", 84),
+            self.klines(symbol, "1d", 120),
+            self.klines(symbol, "1w", 60),
+            self.klines(symbol, "1M", 36),
             self.order_book(symbol, 20),
             self.agg_trades(symbol, 250),
             self.top_long_short_account_ratio(symbol, "5m", 8),
@@ -752,15 +757,23 @@ class BinancePublicClient:
             self.spot_agg_trades(symbol, 250),
             return_exceptions=True,
         )
-        klines_15m, klines_1h, order_book, agg_trades, top_accounts, top_positions, spot_agg_trades = extras
+        (
+            klines_1m, klines_15m, klines_1h, klines_4h, klines_1d, klines_1w, klines_1M,
+            order_book, agg_trades, top_accounts, top_positions, spot_agg_trades,
+        ) = extras
 
         return {
             "symbol": symbol,
             "source": self.active_source,
             "provider_warning": self.last_primary_error if self.active_source != "BINANCE_FUTURES" else None,
             "klines": klines,
+            "klines_1m": self._optional_value(klines_1m, []),
             "klines_15m": self._optional_value(klines_15m, []),
             "klines_1h": self._optional_value(klines_1h, []),
+            "klines_4h": self._optional_value(klines_4h, []),
+            "klines_1d": self._optional_value(klines_1d, []),
+            "klines_1w": self._optional_value(klines_1w, []),
+            "klines_1M": self._optional_value(klines_1M, []),
             "open_interest": oi,
             "open_interest_history": oi_hist,
             "taker": taker,

@@ -8,7 +8,7 @@ from openai import AsyncOpenAI
 from app.config import settings
 
 
-AI_BRAIN_VERSION = "terra_full_control_paper_v1"
+AI_BRAIN_VERSION = "terra_full_control_paper_v2_all_timeframes"
 
 _DECISION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -121,9 +121,21 @@ def _compact_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         "symbol": snapshot.get("symbol"),
         "source": snapshot.get("source"),
         "provider_warning": snapshot.get("provider_warning"),
-        "klines_5m": _tail(snapshot.get("klines"), 36),
-        "klines_15m": _tail(snapshot.get("klines_15m"), 24),
-        "klines_1h": _tail(snapshot.get("klines_1h"), 24),
+        "timeframe_coverage": {
+            "trigger": ["1m", "5m"],
+            "setup": ["15m", "1h"],
+            "regime": ["4h", "1d"],
+            "macro": ["1w", "1M"],
+            "year_context": "52 weekly candles ~= 1 year",
+        },
+        "klines_1m": _tail(snapshot.get("klines_1m"), 60),
+        "klines_5m": _tail(snapshot.get("klines"), 48),
+        "klines_15m": _tail(snapshot.get("klines_15m"), 32),
+        "klines_1h": _tail(snapshot.get("klines_1h"), 36),
+        "klines_4h": _tail(snapshot.get("klines_4h"), 42),
+        "klines_1d": _tail(snapshot.get("klines_1d"), 60),
+        "klines_1w": _tail(snapshot.get("klines_1w"), 52),
+        "klines_1M": _tail(snapshot.get("klines_1M"), 24),
         "open_interest": snapshot.get("open_interest"),
         "open_interest_history": _tail(snapshot.get("open_interest_history"), 12),
         "taker": _tail(snapshot.get("taker"), 8),
@@ -212,6 +224,10 @@ async def evaluate_candidate(
         "and stop distance, not excitement or a fast candle. You may disagree with all legacy outputs. "
         "Use the raw multi-timeframe candles, futures and spot aggressive trades, order book, open interest, "
         "funding/premium, long-short positioning, top-trader positioning, CoinGlass context and all derived sensors together. "
+        "Read timeframes top-down: monthly and weekly define the broad structural/macro context (52 weekly candles give about one year), "
+        "daily and 4h define regime and major structure, 1h and 15m define the setup, and 5m plus 1m define timing and immediate continuation. "
+        "Explicitly notice agreement or conflict between horizons. A higher-timeframe conflict should normally reduce capital/leverage or require "
+        "stronger short-term confirmation, not mechanically forbid every shorter trade. Do not let a 1m candle override a weak daily/weekly context. "
         "Do not treat any score as a calibrated probability. Prefer NO_TRADE when the evidence is not coherent. "
         "For ENTER decisions, produce internally coherent numeric levels for the chosen direction. "
         "This is simulation only; do not assume or claim guaranteed profit."
