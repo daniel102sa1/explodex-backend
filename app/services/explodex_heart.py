@@ -495,13 +495,15 @@ async def run_explodex_heart(
     heart = {
         "version": HEART_VERSION,
         "symbol": symbol,
-        "mission": "detectar la próxima expansión y dar una decisión clara de entrar o no entrar",
-        "direction": canonical.get("direction"),
-        "state": canonical.get("state"),
+        "mission": "Terra decide estado y timing; ExplodeX aporta sensores y un Risk Guard inviolable",
+        "decision_owner": "TERRA_PRIMARY" if terra_primary_applied else "DETERMINISTIC_SHADOW",
+        "direction": ai_direction if terra_primary_applied and ai_direction in {"LONG", "SHORT"} else canonical.get("direction"),
+        "state": ai_state if terra_primary_applied else canonical.get("state"),
         "execution_allowed": execution_allowed,
         "action_decision": final_decision,
         "market_event": market_event,
         "ai_brain": ai_brain,
+        "hard_safety": hard_safety,
         "plan": plan,
         "thesis": thesis,
         "prediction_phase": prediction.get("phase"),
@@ -516,5 +518,6 @@ async def run_explodex_heart(
         "execution_allowed": execution_allowed,
         "action_decision": final_decision,
         "ai_brain": ai_brain,
+        "hard_safety": hard_safety,
     }
     return {"score": canonical, "prediction": prediction, "heart": heart}
