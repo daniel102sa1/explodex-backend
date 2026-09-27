@@ -7,14 +7,17 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.services import paper_portfolio as base
+from app.services.ai_brain import evaluate_candidate
+from app.services.binance import binance_client
 from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v9_fundamental_risk_context"
+VERSION = "paper_unified_heart_executor_v10_terra_adaptive_paper"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -327,6 +330,178 @@ async def execute_unified_heart_contracts(
         original_stop = _f(lane.get("stop_loss"))
         original_target = _f(lane.get("target_price"))
         fill = await base._latest_price(symbol)
+
+        terra_primary = bool(
+            settings.paper_trading_only
+            and settings.ai_brain_enabled
+            and not settings.ai_brain_shadow_only
+        )
+        if terra_primary:
+            reason_bundle = _d(row.get("reason"))
+            prediction = _d(reason_bundle.get("prediction"))
+            terra_score = {
+                "current_price": fill,
+                "direction": heart.get("direction") or side,
+                "state": heart.get("state") or "WATCH",
+                "setup_score": row.get("setup_score"),
+                "risk_score": row.get("risk_score"),
+                "metrics": _d(reason_bundle.get("metrics")),
+                "components": _d(reason_bundle.get("components")),
+            }
+            terra_plan_hint = {
+                "direction": side,
+                "entry_low": entry_low,
+                "entry_high": entry_high,
+                "stop_loss": original_stop,
+                "tp1": _f(lane.get("tp1")),
+                "tp2": _f(lane.get("tp2")),
+                "tp3": _f(lane.get("tp3")),
+            }
+            try:
+                snapshot = await binance_client.deep_snapshot(symbol)
+                terra = await evaluate_candidate(
+                    symbol=symbol,
+                    scored=terra_score,
+                    prediction=prediction,
+                    plan=terra_plan_hint,
+                    deterministic_decision=_d(heart.get("action_decision")),
+                    market_event=_d(heart.get("market_event")),
+                    snapshot=snapshot,
+                    coinglass=_d(reason_bundle.get("coinglass")),
+                )
+            except Exception as exc:
+                reject(f"terra_error_{type(exc).__name__}")
+                continue
+
+            if not bool(terra.get("available")):
+                reject("terra_unavailable")
+                continue
+            if not bool(terra.get("allow_entry")) or str(terra.get("action") or "").upper() != "ENTER":
+                reject(f"terra_{str(terra.get('state') or 'no_trade').lower()}")
+                continue
+
+            terra_plan = _d(terra.get("plan"))
+            side = str(terra.get("direction") or terra_plan.get("direction") or "").upper()
+            entry_low = _f(terra_plan.get("entry_low"))
+            entry_high = _f(terra_plan.get("entry_high"))
+            hard_stop = _f(terra_plan.get("stop_loss"))
+            tp1 = _f(terra_plan.get("tp1"))
+            tp2 = _f(terra_plan.get("tp2"))
+            tp3 = _f(terra_plan.get("tp3"))
+            target = tp2 if tp2 > 0 else (tp1 if tp1 > 0 else tp3)
+            leverage = int(max(1, min(20, round(_f(terra_plan.get("leverage"), 1.0)))))
+            risk_pct = max(0.01, min(100.0, _f(terra_plan.get("risk_pct"), 0.01)))
+            allocation_pct = max(0.01, min(100.0, _f(terra_plan.get("capital_allocation_pct"), 0.01)))
+            max_hold_minutes = int(max(1, _f(terra_plan.get("max_hold_minutes"), 60.0)))
+
+            if side not in {"LONG", "SHORT"}:
+                reject("terra_invalid_side")
+                continue
+            if min(fill, entry_low, entry_high, hard_stop, target) <= 0:
+                reject("terra_invalid_geometry")
+                continue
+            lo, hi = min(entry_low, entry_high), max(entry_low, entry_high)
+            if not (lo <= fill <= hi):
+                reject("terra_wait_entry_zone")
+                continue
+            if not _geometry_ok(side, fill, hard_stop, target):
+                reject("terra_invalid_stop_target_geometry")
+                continue
+
+            stop_distance = abs(fill - hard_stop)
+            risk_budget = balance * (risk_pct / 100.0)
+            capital_budget = balance * (allocation_pct / 100.0)
+            quantity_by_risk = risk_budget / stop_distance if stop_distance > 0 else 0.0
+            max_notional = capital_budget * leverage
+            quantity_by_capital = max_notional / fill if fill > 0 else 0.0
+            quantity = min(quantity_by_risk, quantity_by_capital)
+            notional = quantity * fill
+            margin = notional / leverage if leverage > 0 else 0.0
+            actual_risk = quantity * stop_distance
+            if quantity <= 0 or margin <= 0:
+                reject("terra_position_size_zero")
+                continue
+
+            terra_metadata = {
+                "execution_version": VERSION,
+                "evaluation_generation": EVALUATION_GENERATION,
+                "canonical_source": "TERRA_FULL_CONTROL_PAPER",
+                "paper_only": True,
+                "terra_decision": terra,
+                "terra_evidence_strength": terra.get("evidence_strength"),
+                "terra_risk_pct": risk_pct,
+                "terra_capital_allocation_pct": allocation_pct,
+                "terra_leverage": leverage,
+                "terra_max_hold_minutes": max_hold_minutes,
+                "legacy_heart_advisory_only": heart,
+                "frozen_plan": {
+                    "entry": fill,
+                    "side": side,
+                    "structural_stop": hard_stop,
+                    "target": target,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "tp3": tp3,
+                    "leverage": leverage,
+                    "risk_pct": risk_pct,
+                    "capital_allocation_pct": allocation_pct,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+                "max_hold_minutes": max_hold_minutes,
+            }
+
+            result = await db.execute(text("""
+                INSERT INTO paper_positions (
+                    signal_id, symbol, side, grade, fingerprint_score, leverage,
+                    entry_price, stop_loss, take_profit, quantity, notional,
+                    margin_used, risk_usdt, opened_at, metadata
+                ) VALUES (
+                    CAST(:signal_id AS UUID), :symbol, :side, 'TERRA', :score, :leverage,
+                    :entry, :stop, :target, :quantity, :notional,
+                    :margin, :risk_usdt, :opened_at, CAST(:metadata AS JSONB)
+                ) ON CONFLICT (signal_id) DO NOTHING
+            """), {
+                "signal_id": row["signal_id"],
+                "symbol": symbol,
+                "side": side,
+                "score": _f(row.get("setup_score")),
+                "leverage": leverage,
+                "entry": fill,
+                "stop": hard_stop,
+                "target": target,
+                "quantity": quantity,
+                "notional": notional,
+                "margin": margin,
+                "risk_usdt": actual_risk,
+                "opened_at": datetime.now(timezone.utc),
+                "metadata": json.dumps(terra_metadata),
+            })
+            if not result.rowcount:
+                reject("duplicate_signal")
+                continue
+
+            opened_items.append({
+                "symbol": symbol,
+                "lane": "TERRA",
+                "side": side,
+                "entry": fill,
+                "hard_stop": hard_stop,
+                "target": target,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "risk_usdt": round(actual_risk, 10),
+                "risk_pct_requested": risk_pct,
+                "capital_allocation_pct": allocation_pct,
+                "leverage": leverage,
+                "margin_used": round(margin, 10),
+                "notional": round(notional, 10),
+                "max_hold_minutes": max_hold_minutes,
+                "terra_state": terra.get("state"),
+                "terra_evidence_strength": terra.get("evidence_strength"),
+                "terra_summary": terra.get("summary"),
+            })
+            continue
 
         if min(fill, entry_low, entry_high, original_stop, original_target) <= 0:
             reject("invalid_contract_geometry")
