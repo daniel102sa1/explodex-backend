@@ -66,6 +66,26 @@ async def check_database() -> bool:
 
 
 async def ensure_runtime_schema() -> None:
+    """Apply runtime schema fixes, retrying short Railway/Postgres resets."""
+    last_error: BaseException | None = None
+
+    for attempt in range(_DB_CONNECT_RETRIES):
+        try:
+            await _ensure_runtime_schema_once()
+            return
+        except (DBAPIError, ConnectionError, OSError) as exc:
+            last_error = exc
+            # Drop any half-open pooled connections before the next attempt.
+            await engine.dispose()
+            if attempt + 1 < _DB_CONNECT_RETRIES:
+                await asyncio.sleep(_DB_RETRY_BASE_SECONDS * (attempt + 1))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unable to apply runtime database schema")
+
+
+async def _ensure_runtime_schema_once() -> None:
     """Keep the live Railway schema compatible with current ExplodeX engines."""
     async with engine.begin() as conn:
         # New structural exit labels can exceed the legacy VARCHAR(24) column.
