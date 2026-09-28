@@ -60,17 +60,15 @@ async def get_db():
 
 
 async def check_database() -> bool:
-    """Liveness-friendly DB probe: retry short proxy resets and never crash /health."""
-    for attempt in range(_DB_CONNECT_RETRIES):
-        try:
+    """Fast liveness probe. Database readiness must never block Railway health."""
+    try:
+        async with asyncio.timeout(1.5):
             async with engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
-            return True
-        except (DBAPIError, ConnectionError, OSError):
-            await engine.dispose()
-            if attempt + 1 < _DB_CONNECT_RETRIES:
-                await asyncio.sleep(_DB_RETRY_BASE_SECONDS * (attempt + 1))
-    return False
+        return True
+    except (DBAPIError, ConnectionError, OSError, TimeoutError):
+        await engine.dispose()
+        return False
 
 
 async def ensure_runtime_schema() -> None:
