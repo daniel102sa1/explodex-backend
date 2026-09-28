@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 async def _initialize_runtime(app: FastAPI) -> None:
     """Own DB reconnection until the PAPER runtime is fully ready."""
     target = make_url(settings.async_database_url)
-    logger.info(
+    logger.warning(
         "PostgreSQL target host=%s port=%s database=%s user=%s",
         target.host,
         target.port,
