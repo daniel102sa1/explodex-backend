@@ -53,3 +53,10 @@ Swagger: `http://localhost:8000/docs`
 ## Seguridad
 
 No agregues API keys privadas al repositorio. Esta etapa usa datos públicos y no necesita permisos de trading ni retiros.
+
+
+## Railway database resilience
+
+The API liveness is intentionally decoupled from PostgreSQL readiness. Database-backed
+runtime initialization retries transient connection failures in the background so a
+short Railway database proxy reset does not crash-loop the API container.
