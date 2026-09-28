@@ -71,7 +71,7 @@ def evaluate_risk(
         "tier": tier,
         "evidence_score": round(evidence, 2),
         "leverage": leverage,
-        "capital_allocation_pct": round(capital, 2),
+        "capital_allocation_pct": round(capital, 2),\n        "risk_pct": risk_pct,
         "reason": [
             "Leverage depends on evidence alignment, not a single indicator",
             "Stop distance reduces position size when risk increases",
