@@ -1,15 +1,62 @@
+import asyncio
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from app.config import settings
 
-engine = create_async_engine(settings.async_database_url, pool_pre_ping=True)
+
+# Railway can briefly reset TCP connections when a database/service wakes or
+# its proxy rotates. Keep pooled connections short-lived, validate them before
+# use, and disable SQLAlchemy/asyncpg prepared-statement caching because this
+# application performs backward-compatible runtime DDL migrations.
+engine = create_async_engine(
+    settings.async_database_url,
+    pool_pre_ping=True,
+    pool_recycle=120,
+    pool_timeout=15,
+    pool_size=5,
+    max_overflow=5,
+    connect_args={
+        "prepared_statement_cache_size": 0,
+        "timeout": 10,
+    },
+)
 SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+_DB_CONNECT_RETRIES = 4
+_DB_RETRY_BASE_SECONDS = 0.15
+
+
+async def _open_healthy_session() -> AsyncSession:
+    """Open and validate a DB session, absorbing short Railway proxy resets."""
+    last_error: BaseException | None = None
+
+    for attempt in range(_DB_CONNECT_RETRIES):
+        session = SessionLocal()
+        try:
+            # Force connection checkout here so transient connect errors happen
+            # before FastAPI starts executing the endpoint body.
+            await session.execute(text("SELECT 1"))
+            return session
+        except (DBAPIError, ConnectionError, OSError) as exc:
+            last_error = exc
+            await session.close()
+            if attempt + 1 < _DB_CONNECT_RETRIES:
+                await asyncio.sleep(_DB_RETRY_BASE_SECONDS * (attempt + 1))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unable to open a healthy database session")
 
 
 async def get_db():
-    async with SessionLocal() as session:
+    session = await _open_healthy_session()
+    try:
         yield session
+    finally:
+        await session.close()
 
 
 async def check_database() -> bool:
