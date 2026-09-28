@@ -25,8 +25,8 @@ engine = create_async_engine(
 )
 SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
-_DB_CONNECT_RETRIES = 4
-_DB_RETRY_BASE_SECONDS = 0.15
+_DB_CONNECT_RETRIES = 8
+_DB_RETRY_BASE_SECONDS = 0.5
 
 
 async def _open_healthy_session() -> AsyncSession:
@@ -60,9 +60,17 @@ async def get_db():
 
 
 async def check_database() -> bool:
-    async with engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
-    return True
+    """Liveness-friendly DB probe: retry short proxy resets and never crash /health."""
+    for attempt in range(_DB_CONNECT_RETRIES):
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            return True
+        except (DBAPIError, ConnectionError, OSError):
+            await engine.dispose()
+            if attempt + 1 < _DB_CONNECT_RETRIES:
+                await asyncio.sleep(_DB_RETRY_BASE_SECONDS * (attempt + 1))
+    return False
 
 
 async def ensure_runtime_schema() -> None:
