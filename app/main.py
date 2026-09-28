@@ -283,13 +283,36 @@ async def live_symbol_analysis(
 ):
     safe_symbol = _safe_symbol(symbol)
     try:
-        snapshot, btc_klines = await asyncio.gather(
-            binance_client.deep_snapshot(safe_symbol),
-            binance_client.klines("BTCUSDT", interval="5m", limit=120),
-        )
+        async def _optional_context(awaitable, fallback, timeout_seconds: float):
+            try:
+                return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
+            except Exception:
+                return fallback
+
+        # These sources are independent. Start them together so the user-facing
+        # analysis route does not pay for several network waves in series.
+        snapshot_task = asyncio.create_task(binance_client.deep_snapshot(safe_symbol))
+        btc_task = asyncio.create_task(binance_client.klines("BTCUSDT", interval="5m", limit=120))
+        cg_task = asyncio.create_task(_optional_context(
+            coinglass_client.enrich_symbol(safe_symbol),
+            {"available": False, "errors": ["timeout_or_unavailable"]},
+            1.6,
+        ))
+        fundamental_task = asyncio.create_task(_optional_context(
+            fundamental_context_for_symbol(safe_symbol),
+            {"available": False, "error": "timeout_or_unavailable"},
+            1.6,
+        ))
+        news_task = asyncio.create_task(_optional_context(
+            news_context_for_symbol(safe_symbol),
+            {"enabled": False, "sentiment": "UNAVAILABLE", "structured_events": []},
+            1.6,
+        ))
+
+        snapshot, btc_klines = await asyncio.gather(snapshot_task, btc_task)
         btc_context = build_btc_context(btc_klines)
         local_scored = score_snapshot(snapshot, btc_context=btc_context)
-        cg = await coinglass_client.enrich_symbol(safe_symbol)
+        cg = await cg_task
         confirmed = apply_coinglass_confirmation(local_scored, cg)
         heart_result = await run_explodex_heart(
             db,
@@ -304,8 +327,8 @@ async def live_symbol_analysis(
         heart = dict(heart_result["heart"])
 
         fundamental, catalyst_context = await asyncio.gather(
-            fundamental_context_for_symbol(safe_symbol),
-            news_context_for_symbol(safe_symbol),
+            fundamental_task,
+            news_task,
         )
         pump_state = classify_pump_state(
             score=scored,
@@ -313,11 +336,14 @@ async def live_symbol_analysis(
             fundamental=fundamental,
         )
         try:
-            historical_analog = await historical_analog_context(
-                db,
-                symbol=safe_symbol,
-                scored=scored,
-                prediction=prediction,
+            historical_analog = await asyncio.wait_for(
+                historical_analog_context(
+                    db,
+                    symbol=safe_symbol,
+                    scored=scored,
+                    prediction=prediction,
+                ),
+                timeout=0.8,
             )
         except Exception as exc:
             await db.rollback()
