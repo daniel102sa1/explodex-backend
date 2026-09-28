@@ -48,6 +48,7 @@ async def _safe_component(
 @router.get("/summary")
 async def summary(
     scope: str = Query(default="arsenal"),
+    details: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
 ):
     await _ensure_paper_dependencies(db)
@@ -88,18 +89,23 @@ async def summary(
             "status": "WAITING_FIRST_CYCLE",
             "rejected": {},
         }
-    result["orders"] = await _safe_component(db, "orders", paper_order_stats)
-    result["range_micro"] = await _safe_component(db, "range_micro", range_summary)
-    result["micro_scalp"] = await _safe_component(db, "micro_scalp", micro_summary)
-    result["loss_autopsy"] = await _safe_component(db, "loss_autopsy", lambda session: loss_autopsy_report(session, days=30))
-    result["quant_risk_guard"] = await _safe_component(db, "quant_risk_guard", paper_quant_risk_guard)
-    result["quant_brain"] = await _safe_component(db, "quant_brain", quant_brain_report)
-    result["chati_sarpon_612_monitor"] = await _safe_component(db, "chati_sarpon_612_monitor", open_monitor_report)
-    result["sarpon_knowledge"] = sarpon_knowledge_registry()
-    result["formula_brain"] = await _safe_component(db, "formula_brain", formula_brain_calibration_report)
-    result["macro_cycle"] = await _safe_component(db, "macro_cycle", macro_cycle_report)
-    result["trade_audit"] = await _safe_component(db, "trade_audit", paper_trade_audit_report)
-    result["vnext_evaluation"] = await _safe_component(db, "vnext_evaluation", vnext_evaluation_report)
+    # The dashboard needs balance/open positions quickly. Heavy research and
+    # audit reports are opt-in because calculating all of them on every refresh
+    # previously made this endpoint take ~30 seconds.
+    result["details_included"] = bool(details)
+    if details:
+        result["orders"] = await _safe_component(db, "orders", paper_order_stats)
+        result["range_micro"] = await _safe_component(db, "range_micro", range_summary)
+        result["micro_scalp"] = await _safe_component(db, "micro_scalp", micro_summary)
+        result["loss_autopsy"] = await _safe_component(db, "loss_autopsy", lambda session: loss_autopsy_report(session, days=30))
+        result["quant_risk_guard"] = await _safe_component(db, "quant_risk_guard", paper_quant_risk_guard)
+        result["quant_brain"] = await _safe_component(db, "quant_brain", quant_brain_report)
+        result["chati_sarpon_612_monitor"] = await _safe_component(db, "chati_sarpon_612_monitor", open_monitor_report)
+        result["sarpon_knowledge"] = sarpon_knowledge_registry()
+        result["formula_brain"] = await _safe_component(db, "formula_brain", formula_brain_calibration_report)
+        result["macro_cycle"] = await _safe_component(db, "macro_cycle", macro_cycle_report)
+        result["trade_audit"] = await _safe_component(db, "trade_audit", paper_trade_audit_report)
+        result["vnext_evaluation"] = await _safe_component(db, "vnext_evaluation", vnext_evaluation_report)
     return result
 
 
