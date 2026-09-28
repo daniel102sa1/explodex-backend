@@ -6,9 +6,10 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services.pattern_engine import analyze_pattern_context
 
 
-AI_BRAIN_VERSION = "terra_full_control_paper_v2_all_timeframes"
+AI_BRAIN_VERSION = "terra_full_control_paper_v3_patterns_risk"
 
 _DECISION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -167,6 +168,7 @@ def _packet(
         "symbol": symbol,
         "current_price": _f(scored.get("current_price")),
         "market_data": _compact_snapshot(snapshot),
+        "pattern_analysis": analyze_pattern_context(snapshot),
         "coinglass": _dict(coinglass),
         "legacy_sensors": {
             "state": scored.get("state"),
@@ -228,6 +230,8 @@ async def evaluate_candidate(
         "daily and 4h define regime and major structure, 1h and 15m define the setup, and 5m plus 1m define timing and immediate continuation. "
         "Explicitly notice agreement or conflict between horizons. A higher-timeframe conflict should normally reduce capital/leverage or require "
         "stronger short-term confirmation, not mechanically forbid every shorter trade. Do not let a 1m candle override a weak daily/weekly context. "
+        "Treat detected chart patterns such as triangles, compression, higher lows/lower highs, breakouts and retests only as evidence, never as automatic entries. "
+        "A valid stop must be derived from technical invalidation/structure and checked against current volatility and liquidity; never invent a fixed-percent stop just to fit sizing. "
         "Do not treat any score as a calibrated probability. Prefer NO_TRADE when the evidence is not coherent. "
         "For ENTER decisions, produce internally coherent numeric levels for the chosen direction. "
         "This is simulation only; do not assume or claim guaranteed profit."
