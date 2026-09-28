@@ -13,13 +13,14 @@ from app.services.ai_brain import evaluate_candidate
 from app.services.binance import binance_client
 from app.services.pattern_engine import analyze_pattern_context
 from app.services.terra_controller import apply_adaptive_risk, build_terra_context, derive_market_context
+from app.services.terra_learning import build_learning_snapshot, downside_adjustment
 from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v11_terra_v3_integrated"
+VERSION = "paper_unified_heart_executor_v12_terra_memory_guard"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -266,6 +267,16 @@ async def execute_unified_heart_contracts(
     if slots <= 0:
         return {"version": VERSION, "opened": 0, "reason": "max_open_positions", "rejected": {}, "defensive": defensive, "defensive_learning_enabled": defensive}
 
+    learning_rows = [dict(r) for r in (await db.execute(text("""
+        SELECT net_pnl, risk_usdt, metadata
+        FROM paper_positions
+        WHERE status='CLOSED'
+          AND metadata->>'canonical_source'='TERRA_FULL_CONTROL_PAPER'
+        ORDER BY closed_at DESC
+        LIMIT 300
+    """))).mappings().all()]
+    terra_learning_snapshot = build_learning_snapshot(learning_rows)
+
     rows = (await db.execute(text("""
         SELECT DISTINCT ON (s.symbol_id)
                s.id::text AS signal_id, sy.symbol, s.created_at, s.setup_score,
@@ -430,9 +441,13 @@ async def execute_unified_heart_contracts(
                 reject(f"terra_controller_{str(adaptive.get('action') or 'wait').lower()}")
                 continue
 
-            leverage = int(max(1, min(20, round(_f(adaptive.get("leverage"), 1.0)))))
-            risk_pct = max(0.01, min(2.0, _f(adaptive.get("risk_pct"), 0.20)))
-            allocation_pct = max(0.01, min(30.0, _f(adaptive.get("capital_allocation_pct"), 3.0)))
+            risk_tier = str(adaptive.get("risk_tier") or "LOW").upper()
+            terra_downside_learning = downside_adjustment(terra_learning_snapshot, risk_tier)
+            learning_multiplier = max(0.25, min(1.0, _f(terra_downside_learning.get("multiplier"), 1.0)))
+
+            leverage = int(max(1, min(20, round(_f(adaptive.get("leverage"), 1.0) * learning_multiplier))))
+            risk_pct = max(0.01, min(2.0, _f(adaptive.get("risk_pct"), 0.20) * learning_multiplier))
+            allocation_pct = max(0.01, min(30.0, _f(adaptive.get("capital_allocation_pct"), 3.0) * learning_multiplier))
 
             # Revalidate after the model returns. A stale pre-AI price must never
             # be used to force an entry.
@@ -474,6 +489,8 @@ async def execute_unified_heart_contracts(
                 "terra_adaptive_risk": _d(terra_context.get("adaptive_risk")),
                 "terra_risk_tier": adaptive.get("risk_tier"),
                 "terra_risk_evidence_score": adaptive.get("risk_evidence_score"),
+                "terra_downside_learning": terra_downside_learning,
+                "terra_learning_sample": terra_learning_snapshot.get("sample"),
                 "terra_risk_pct": risk_pct,
                 "terra_capital_allocation_pct": allocation_pct,
                 "terra_leverage": leverage,
