@@ -317,7 +317,19 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
 
         stop_repaired = abs(row_stop - hard_stop) > max(1e-12, abs(hard_stop) * 1e-10)
         profit_lock = _d(metadata.get("profit_lock"))
-        if bool(profit_lock.get("enabled")) or str(profit_lock.get("stage") or "") != "IMMUTABLE_STRUCTURAL_STOP":
+        if terra_managed:
+            profit_lock.update({
+                "enabled": True,
+                "stage": str(profit_lock.get("stage") or "STRUCTURAL"),
+                "active_stop": hard_stop,
+                "rule": "TP1_TO_BREAKEVEN_PLUS_COSTS__TP2_TO_TP1__POST_TP2_TRAIL_1R",
+            })
+            metadata["profit_lock"] = profit_lock
+            metadata["hard_stop"] = hard_stop
+            metadata["stop_policy"] = "TERRA_ADAPTIVE_PROTECTION"
+            metadata["stop_can_tighten_after_entry"] = True
+            metadata["stop_can_widen_after_entry"] = False
+        elif bool(profit_lock.get("enabled")) or str(profit_lock.get("stage") or "") != "IMMUTABLE_STRUCTURAL_STOP":
             profit_lock.update({
                 "enabled": False,
                 "stage": "IMMUTABLE_STRUCTURAL_STOP",
@@ -463,8 +475,13 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
             "stop_survival_enabled": survival_enabled,
             "soft_invalidation_stop": soft_stop,
             "hard_stop": hard_stop,
-            "profit_lock_stage": "IMMUTABLE_STRUCTURAL_STOP",
-            "stop_policy": "IMMUTABLE_STRUCTURAL_STOP",
+            "profit_lock_stage": (
+                "TRAILING_AFTER_TP2" if terra_managed and terra_tp2_reached
+                else "BREAKEVEN_AFTER_TP1" if terra_managed and terra_tp1_reached
+                else "STRUCTURAL"
+            ),
+            "active_stop": terra_effective_stop if terra_managed else hard_stop,
+            "stop_policy": "TERRA_ADAPTIVE_PROTECTION" if terra_managed else "IMMUTABLE_STRUCTURAL_STOP",
             "confirmation_minutes": confirmation_minutes if survival_enabled else None,
         })
 
