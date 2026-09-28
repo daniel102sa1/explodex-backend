@@ -20,7 +20,7 @@ from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v12_terra_memory_guard"
+VERSION = "paper_unified_heart_executor_v13_terra_discovery_lane"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -38,6 +38,13 @@ PROBATION_MAX_NEW_POSITIONS = base.MAX_OPEN_POSITIONS
 PROBATION_MAX_RISK_SCORE = 48.0
 PROBATION_SWING_MIN_SCORE = 70.0
 PROBATION_SWING_MIN_EDGE = 18.0
+
+# PAPER-only discovery lane: lets Terra inspect fresh scanner signals even when
+# the legacy Heart did not emit an executable lane. It never forces an entry.
+TERRA_DISCOVERY_MIN_SETUP_SCORE = 58.0
+TERRA_DISCOVERY_MAX_RISK_SCORE = 55.0
+TERRA_DISCOVERY_MAX_RISK_PCT = 0.20
+TERRA_DISCOVERY_MAX_ALLOCATION_PCT = 3.0
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -67,6 +74,91 @@ def _geometry_ok(side: str, entry: float, stop: float, target: float) -> bool:
     if side == "SHORT":
         return target < entry < stop
     return False
+
+
+def _terra_primary_enabled() -> bool:
+    return bool(
+        settings.paper_trading_only
+        and settings.ai_brain_enabled
+        and not settings.ai_brain_shadow_only
+    )
+
+
+def _terra_portfolio_risk_multiplier(
+    risk_multiplier: float,
+    *,
+    defensive: bool,
+    validation_probation: bool,
+) -> float:
+    """Bound Terra by the same portfolio brakes as every other PAPER lane."""
+    value = max(0.0, min(1.0, _f(risk_multiplier, 0.0)))
+    if validation_probation:
+        return min(value, PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP)
+    if defensive:
+        return min(value, DEFENSIVE_RISK_CAP)
+    return value
+
+
+def _build_terra_discovery_lane(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Create a tiny PAPER-only candidate lane for Terra to judge.
+
+    This is deliberately not an entry signal. It only makes a fresh scanner
+    observation reachable by Terra when the legacy Heart has no eligible lane.
+    Terra must still return ENTER, pass its controller, remain inside its own
+    entry zone, and satisfy geometry/risk checks before PAPER execution.
+    """
+    state = str(row.get("state") or "").upper()
+    side = str(row.get("direction") or "").upper()
+    setup_score = _f(row.get("setup_score"))
+    risk_score = _f(row.get("risk_score"), 100.0)
+    entry_low = _f(row.get("entry_low"))
+    entry_high = _f(row.get("entry_high"))
+    stop = _f(row.get("stop_loss"))
+    tp1 = _f(row.get("tp1"))
+    tp2 = _f(row.get("tp2"))
+    tp3 = _f(row.get("tp3"))
+
+    if state not in {"WATCH", "PREPARING", "READY"}:
+        return None
+    if side not in {"LONG", "SHORT"}:
+        return None
+    if setup_score < TERRA_DISCOVERY_MIN_SETUP_SCORE or risk_score > TERRA_DISCOVERY_MAX_RISK_SCORE:
+        return None
+    if min(entry_low, entry_high, stop) <= 0:
+        return None
+
+    target = tp3 if tp3 > 0 else (tp2 if tp2 > 0 else tp1)
+    if target <= 0:
+        return None
+
+    lo, hi = min(entry_low, entry_high), max(entry_low, entry_high)
+    midpoint = (lo + hi) / 2.0
+    if midpoint <= 0 or not _geometry_ok(side, midpoint, stop, target):
+        return None
+
+    return {
+        "lane": "TACTICAL",
+        "eligible": True,
+        "direction": side,
+        "entry_low": lo,
+        "entry_high": hi,
+        "stop_loss": stop,
+        "target_price": target,
+        "target_name": "TP3" if tp3 > 0 else "TP2" if tp2 > 0 else "TP1",
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "ignition_score": setup_score,
+        "trajectory_score": setup_score,
+        "direction_edge": max(0.0, setup_score - 50.0),
+        "max_leverage": 1,
+        "max_hold_minutes": 120,
+        "horizon": "TERRA_DISCOVERY",
+        "trade_profile": "TERRA_DISCOVERY_PAPER",
+        "paper_only": True,
+        "terra_discovery": True,
+        "_candidate_priority": 9,
+    }
 
 
 def _sarpon_leverage_policy(
@@ -280,7 +372,8 @@ async def execute_unified_heart_contracts(
     rows = (await db.execute(text("""
         SELECT DISTINCT ON (s.symbol_id)
                s.id::text AS signal_id, sy.symbol, s.created_at, s.setup_score,
-               s.risk_score, s.reason
+               s.risk_score, s.direction, s.state, s.entry_low, s.entry_high,
+               s.stop_loss, s.tp1, s.tp2, s.tp3, s.reason
         FROM signals s
         JOIN symbols sy ON sy.id=s.symbol_id
         WHERE s.is_active=TRUE
@@ -308,13 +401,28 @@ async def execute_unified_heart_contracts(
         heart = _d(reason.get("explodex_heart")) or _d(prediction.get("explodex_heart"))
         contract = _d(heart.get("execution_contract"))
         lane_name = str(contract.get("permitted_paper_lane") or "")
-        if lane_name not in LANE_PRIORITY:
-            reject("heart_no_permitted_lane")
-            continue
-        lane_key = {"TACTICAL": "tactical", "AGGRESSIVE_PAPER": "aggressive_paper", "SWING_PAPER": "swing_paper"}[lane_name]
-        lane = _d(_d(contract.get("lanes")).get(lane_key))
-        if not lane.get("eligible"):
-            reject(f"{lane_name.lower()}_not_eligible")
+        lane: dict[str, Any] = {}
+        heart_lane_rejection: str | None = None
+
+        if lane_name in LANE_PRIORITY:
+            lane_key = {"TACTICAL": "tactical", "AGGRESSIVE_PAPER": "aggressive_paper", "SWING_PAPER": "swing_paper"}[lane_name]
+            lane = _d(_d(contract.get("lanes")).get(lane_key))
+            if not lane.get("eligible"):
+                heart_lane_rejection = f"{lane_name.lower()}_not_eligible"
+                lane = {}
+        else:
+            heart_lane_rejection = "heart_no_permitted_lane"
+
+        # Terra is the primary PAPER brain. The legacy Heart remains useful
+        # context, but absence of a Heart lane must not prevent Terra from even
+        # seeing a clean fresh scanner signal.
+        if not lane and _terra_primary_enabled():
+            lane = _build_terra_discovery_lane(row) or {}
+            if lane:
+                lane_name = str(lane.get("lane") or "TACTICAL")
+
+        if not lane:
+            reject(heart_lane_rejection or "no_candidate_lane")
             continue
         if validation_probation:
             allowed, probation_reason = _probation_lane_check(lane_name=lane_name, lane=lane, row=row)
@@ -327,7 +435,8 @@ async def execute_unified_heart_contracts(
                 reject(defensive_reason or "defensive_rejected")
                 continue
         quality = _f(lane.get("trajectory_score")) if lane_name == "SWING_PAPER" else _f(lane.get("ignition_score"), _f(row.get("setup_score")))
-        candidates.append((LANE_PRIORITY[lane_name], -quality, _f(row.get("risk_score"), 100.0), row, heart, lane))
+        candidate_priority = int(_f(lane.get("_candidate_priority"), LANE_PRIORITY.get(lane_name, 9)))
+        candidates.append((candidate_priority, -quality, _f(row.get("risk_score"), 100.0), row, heart, lane))
 
     candidates.sort(key=lambda item: (item[0], item[1], item[2]))
     opened_items: list[dict[str, Any]] = []
@@ -344,18 +453,14 @@ async def execute_unified_heart_contracts(
         original_target = _f(lane.get("target_price"))
         fill = await base._latest_price(symbol)
 
-        terra_primary = bool(
-            settings.paper_trading_only
-            and settings.ai_brain_enabled
-            and not settings.ai_brain_shadow_only
-        )
+        terra_primary = _terra_primary_enabled()
         if terra_primary:
             reason_bundle = _d(row.get("reason"))
             prediction = _d(reason_bundle.get("prediction"))
             terra_score = {
                 "current_price": fill,
-                "direction": heart.get("direction") or side,
-                "state": heart.get("state") or "WATCH",
+                "direction": heart.get("direction") or row.get("direction") or side,
+                "state": heart.get("state") or row.get("state") or "WATCH",
                 "setup_score": row.get("setup_score"),
                 "risk_score": row.get("risk_score"),
                 "metrics": _d(reason_bundle.get("metrics")),
@@ -445,9 +550,32 @@ async def execute_unified_heart_contracts(
             terra_downside_learning = downside_adjustment(terra_learning_snapshot, risk_tier)
             learning_multiplier = max(0.25, min(1.0, _f(terra_downside_learning.get("multiplier"), 1.0)))
 
+            portfolio_multiplier = _terra_portfolio_risk_multiplier(
+                risk_multiplier,
+                defensive=defensive,
+                validation_probation=validation_probation,
+            )
+            if portfolio_multiplier <= 0:
+                reject("terra_portfolio_risk_block")
+                continue
+
             leverage = int(max(1, min(20, round(_f(adaptive.get("leverage"), 1.0) * learning_multiplier))))
-            risk_pct = max(0.01, min(2.0, _f(adaptive.get("risk_pct"), 0.20) * learning_multiplier))
-            allocation_pct = max(0.01, min(30.0, _f(adaptive.get("capital_allocation_pct"), 3.0) * learning_multiplier))
+            risk_pct = max(
+                0.005,
+                min(2.0, _f(adaptive.get("risk_pct"), 0.20) * learning_multiplier * portfolio_multiplier),
+            )
+            allocation_pct = max(
+                0.05,
+                min(30.0, _f(adaptive.get("capital_allocation_pct"), 3.0) * learning_multiplier * portfolio_multiplier),
+            )
+
+            # Discovery exists to collect real PAPER evidence, not to take large
+            # bets. Until the normal Heart lane agrees, Terra gets only 1x and a
+            # tiny account-risk/allocation cap.
+            if bool(lane.get("terra_discovery")):
+                leverage = 1
+                risk_pct = min(risk_pct, TERRA_DISCOVERY_MAX_RISK_PCT)
+                allocation_pct = min(allocation_pct, TERRA_DISCOVERY_MAX_ALLOCATION_PCT)
 
             # Revalidate after the model returns. A stale pre-AI price must never
             # be used to force an entry.
@@ -494,6 +622,9 @@ async def execute_unified_heart_contracts(
                 "terra_risk_pct": risk_pct,
                 "terra_capital_allocation_pct": allocation_pct,
                 "terra_leverage": leverage,
+                "terra_portfolio_risk_multiplier": portfolio_multiplier,
+                "terra_discovery": bool(lane.get("terra_discovery")),
+                "terra_discovery_source_state": row.get("state"),
                 "terra_max_hold_minutes": max_hold_minutes,
                 "pre_ai_price": pre_ai_fill,
                 "execution_price_revalidated": fill,
@@ -546,7 +677,8 @@ async def execute_unified_heart_contracts(
 
             opened_items.append({
                 "symbol": symbol,
-                "lane": "TERRA",
+                "lane": "TERRA_DISCOVERY" if bool(lane.get("terra_discovery")) else "TERRA",
+                "trade_profile": lane.get("trade_profile") or "TERRA",
                 "side": side,
                 "entry": fill,
                 "hard_stop": hard_stop,
@@ -869,5 +1001,11 @@ async def execute_unified_heart_contracts(
             "independent_evidence_council_risk": True,
             "shadow_calibration_adjusts_size_only": True,
             "shadow_calibration_cannot_raise_probation_risk": True,
+            "terra_discovery_enabled": _terra_primary_enabled(),
+            "terra_discovery_min_setup_score": TERRA_DISCOVERY_MIN_SETUP_SCORE,
+            "terra_discovery_max_risk_score": TERRA_DISCOVERY_MAX_RISK_SCORE,
+            "terra_discovery_forces_1x": True,
+            "terra_discovery_max_risk_pct": TERRA_DISCOVERY_MAX_RISK_PCT,
+            "terra_obeys_portfolio_brakes": True,
         },
     }
