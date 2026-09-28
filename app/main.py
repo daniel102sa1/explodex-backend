@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 
+from sqlalchemy.engine import make_url
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,6 +38,14 @@ logger = logging.getLogger(__name__)
 
 async def _initialize_runtime(app: FastAPI) -> None:
     """Own DB reconnection until the PAPER runtime is fully ready."""
+    target = make_url(settings.async_database_url)
+    logger.info(
+        "PostgreSQL target host=%s port=%s database=%s user=%s",
+        target.host,
+        target.port,
+        target.database,
+        target.username,
+    )
     attempt = 0
     while True:
         try:
