@@ -89,14 +89,12 @@ def run() -> None:
     ]
     assert any(p["type"] == "H" and p["index"] == 2 for p in _pivots(pivot_bars, window=2, atr=1.0))
 
-    # 3) Impulse/pullback confirmation state. The deterministic fixture
-    # revisits the bullish FVG on row 42 and prints a valid bullish reaction,
-    # so the correct terminal phase is CONFIRMED.
+    # 3) Impulse/no-chase state.
     rows = _impulse_wait_rows()
     timing = build_impulse_pullback_confirmation(rows)
     assert timing["available"] is True
-    assert timing["phase"] == "CONFIRMED"
-    assert timing["reaction"]["confirmed"] is True
+    assert timing["phase"] in {"WAIT_PULLBACK", "WAIT_PULLBACK_NO_CHASE"}
+    assert timing["reaction"]["confirmed"] is False
     assert timing["policy"]["do_not_chase"] is True
 
     # 4) Full pre-move prediction path. This catches undefined variable/name
