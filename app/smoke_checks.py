@@ -94,6 +94,7 @@ def run() -> None:
     timing = build_impulse_pullback_confirmation(rows)
     assert timing["available"] is True
     assert timing["phase"] in {"WAIT_PULLBACK", "WAIT_PULLBACK_NO_CHASE"}
+    assert timing["reaction"]["confirmed"] is False
     assert timing["policy"]["do_not_chase"] is True
 
     # 4) Full pre-move prediction path. This catches undefined variable/name

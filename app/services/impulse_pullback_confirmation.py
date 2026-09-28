@@ -181,11 +181,14 @@ def build_impulse_pullback_confirmation(rows: list[list[Any]]) -> dict[str, Any]
     i = int(candidate["impulse_index"])
     zone_low = float(candidate["zone_low"])
     zone_high = float(candidate["zone_high"])
-    after = closed[i + 1:]
+    # For an FVG, the i+1 candle helps DEFINE the gap and therefore
+    # cannot count as its own retest. A real retest must happen later.
+    search_start = i + 2 if candidate["zone_type"] in {"BULLISH_FVG", "BEARISH_FVG"} else i + 1
+    after = closed[search_start:]
     touch_index: int | None = None
     invalidated = False
 
-    for j, bar in enumerate(after, start=i + 1):
+    for j, bar in enumerate(after, start=search_start):
         touches = bar["low"] <= zone_high and bar["high"] >= zone_low
         if touches and touch_index is None:
             touch_index = j

@@ -1,4 +1,5 @@
 from app.services.paper_fast_cycle import _probation_risk_multiplier
+from app.services.paper_portfolio import MAX_OPEN_POSITIONS, PAPER_UNLIMITED_OPEN_POSITIONS
 from app.services.paper_unified_heart_executor import (
     PROBATION_MAX_NEW_POSITIONS,
     PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP,
@@ -12,7 +13,8 @@ def test_probation_risk_is_tiny_and_never_exceeds_ten_percent_of_normal_multipli
     assert _probation_risk_multiplier(0.5) == 0.05
     assert _probation_risk_multiplier(0.0) == 0.0
     assert PROBATION_PORTFOLIO_RISK_MULTIPLIER_CAP == 0.10
-    assert PROBATION_MAX_NEW_POSITIONS == 1
+    assert PAPER_UNLIMITED_OPEN_POSITIONS is True
+    assert PROBATION_MAX_NEW_POSITIONS == MAX_OPEN_POSITIONS
 
 
 def test_probation_disables_aggressive_lane():

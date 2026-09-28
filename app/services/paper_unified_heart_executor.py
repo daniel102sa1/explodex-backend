@@ -11,13 +11,15 @@ from app.config import settings
 from app.services import paper_portfolio as base
 from app.services.ai_brain import evaluate_candidate
 from app.services.binance import binance_client
+from app.services.pattern_engine import analyze_pattern_context
+from app.services.terra_controller import apply_adaptive_risk, build_terra_context, derive_market_context
 from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v10_terra_adaptive_paper"
+VERSION = "paper_unified_heart_executor_v11_terra_v3_integrated"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -376,9 +378,6 @@ async def execute_unified_heart_contracts(
             if not bool(terra.get("available")):
                 reject("terra_unavailable")
                 continue
-            if not bool(terra.get("allow_entry")) or str(terra.get("action") or "").upper() != "ENTER":
-                reject(f"terra_{str(terra.get('state') or 'no_trade').lower()}")
-                continue
 
             terra_plan = _d(terra.get("plan"))
             side = str(terra.get("direction") or terra_plan.get("direction") or "").upper()
@@ -388,10 +387,7 @@ async def execute_unified_heart_contracts(
             tp1 = _f(terra_plan.get("tp1"))
             tp2 = _f(terra_plan.get("tp2"))
             tp3 = _f(terra_plan.get("tp3"))
-            target = tp2 if tp2 > 0 else (tp1 if tp1 > 0 else tp3)
-            leverage = int(max(1, min(20, round(_f(terra_plan.get("leverage"), 1.0)))))
-            risk_pct = max(0.01, min(100.0, _f(terra_plan.get("risk_pct"), 0.01)))
-            allocation_pct = max(0.01, min(100.0, _f(terra_plan.get("capital_allocation_pct"), 0.01)))
+            target = tp3 if tp3 > 0 else (tp2 if tp2 > 0 else tp1)
             max_hold_minutes = int(max(1, _f(terra_plan.get("max_hold_minutes"), 60.0)))
 
             if side not in {"LONG", "SHORT"}:
@@ -400,9 +396,53 @@ async def execute_unified_heart_contracts(
             if min(fill, entry_low, entry_high, hard_stop, target) <= 0:
                 reject("terra_invalid_geometry")
                 continue
+
+            # Terra must earn exposure from independent evidence. Pattern analysis
+            # is a sensor, not an entry trigger.
+            pattern_context = analyze_pattern_context(snapshot)
+            evidence_strength = str(terra.get("evidence_strength") or "LOW").upper()
+            confidence_score = {"LOW": 45.0, "MEDIUM": 68.0, "HIGH": 86.0}.get(evidence_strength, 45.0)
+            initial_mid = (entry_low + entry_high) / 2.0 if entry_low > 0 and entry_high > 0 else fill
+            stop_distance_pct = abs(initial_mid - hard_stop) / initial_mid * 100.0 if initial_mid > 0 else 100.0
+            btc_stress = str(_d(btc_overlay).get("stress") or "NORMAL").upper()
+            btc_context_score = 75.0 if btc_stress == "NORMAL" else 55.0 if btc_stress in {"ELEVATED", "CAUTION"} else 30.0
+            controller_decision = {
+                "action": str(terra.get("action") or "").upper(),
+                "allow_entry": bool(terra.get("allow_entry")),
+                "direction": side,
+                "confidence_score": confidence_score,
+                "stop_distance_pct": stop_distance_pct,
+                "risk_pct": _f(terra_plan.get("risk_pct"), 0.20),
+            }
+            market_context = derive_market_context(
+                pattern=pattern_context,
+                decision=controller_decision,
+                snapshot=snapshot,
+                btc_context_score=btc_context_score,
+            )
+            terra_context = build_terra_context(
+                pattern=pattern_context,
+                market=market_context,
+                decision=controller_decision,
+            )
+            adaptive = apply_adaptive_risk(terra_context)
+            if not bool(adaptive.get("allow_entry")) or str(adaptive.get("action") or "").upper() != "ENTER":
+                reject(f"terra_controller_{str(adaptive.get('action') or 'wait').lower()}")
+                continue
+
+            leverage = int(max(1, min(20, round(_f(adaptive.get("leverage"), 1.0)))))
+            risk_pct = max(0.01, min(2.0, _f(adaptive.get("risk_pct"), 0.20)))
+            allocation_pct = max(0.01, min(30.0, _f(adaptive.get("capital_allocation_pct"), 3.0)))
+
+            # Revalidate after the model returns. A stale pre-AI price must never
+            # be used to force an entry.
+            pre_ai_fill = fill
+            refreshed_fill = await base._latest_price(symbol)
+            if refreshed_fill > 0:
+                fill = refreshed_fill
             lo, hi = min(entry_low, entry_high), max(entry_low, entry_high)
             if not (lo <= fill <= hi):
-                reject("terra_wait_entry_zone")
+                reject("terra_revalidation_price_left_entry_zone")
                 continue
             if not _geometry_ok(side, fill, hard_stop, target):
                 reject("terra_invalid_stop_target_geometry")
@@ -429,10 +469,17 @@ async def execute_unified_heart_contracts(
                 "paper_only": True,
                 "terra_decision": terra,
                 "terra_evidence_strength": terra.get("evidence_strength"),
+                "terra_pattern_context": pattern_context,
+                "terra_market_context": market_context,
+                "terra_adaptive_risk": _d(terra_context.get("adaptive_risk")),
+                "terra_risk_tier": adaptive.get("risk_tier"),
+                "terra_risk_evidence_score": adaptive.get("risk_evidence_score"),
                 "terra_risk_pct": risk_pct,
                 "terra_capital_allocation_pct": allocation_pct,
                 "terra_leverage": leverage,
                 "terra_max_hold_minutes": max_hold_minutes,
+                "pre_ai_price": pre_ai_fill,
+                "execution_price_revalidated": fill,
                 "legacy_heart_advisory_only": heart,
                 "frozen_plan": {
                     "entry": fill,
