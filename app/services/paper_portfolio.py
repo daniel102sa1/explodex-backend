@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -347,10 +348,25 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
     await ensure_paper_schema(db)
     account = dict((await db.execute(text("SELECT * FROM paper_accounts WHERE id=1"))).mappings().one())
     open_rows = [dict(r) for r in (await db.execute(text("SELECT * FROM paper_positions WHERE status='OPEN' ORDER BY opened_at DESC"))).mappings().all()]
+
+    # Price lookups are network I/O. Doing them serially made /paper-trading/summary
+    # scale linearly with the number of open positions (tens of seconds with many
+    # positions). Deduplicate symbols and resolve all marks concurrently.
+    symbols = sorted({str(row.get("symbol") or "") for row in open_rows if row.get("symbol")})
+
+    async def _bounded_mark(symbol: str) -> float:
+        try:
+            return await asyncio.wait_for(_latest_price(symbol), timeout=1.25)
+        except Exception:
+            return 0.0
+
+    marks_list = await asyncio.gather(*(_bounded_mark(symbol) for symbol in symbols)) if symbols else []
+    marks = dict(zip(symbols, marks_list))
+
     unrealized = 0.0
     positions = []
     for row in open_rows:
-        mark = await _latest_price(row["symbol"])
+        mark = _f(marks.get(str(row["symbol"]), 0.0))
         qty, entry = _f(row["quantity"]), _f(row["entry_price"])
         mark_stale = mark <= 0
         if mark_stale:
@@ -401,7 +417,7 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
     """))).mappings().one())
     closed = int(stats["closed_trades"] or 0)
     return {
-        "version": "paper_portfolio_v1",
+        "version": "paper_portfolio_v2_parallel_marks",
         "paper_only": True,
         "starting_balance": _f(account["starting_balance"]),
         "cash_balance": round(cash, 6),
