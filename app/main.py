@@ -29,7 +29,7 @@ from app.services.scanner_progress import scanner_progress
 from app.services.scoring import build_btc_context, score_snapshot
 
 
-READY_POLICY = "ExplodeX Heart: guarded prediction + fixed thesis + no_chase + risk guard"
+READY_POLICY = "Terra V3: multi-timeframe + pattern + derivatives/fundamental context + adaptive risk + fresh-price revalidation"
 
 
 @asynccontextmanager
@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.14.0",
+    version="0.15.0",
     description=(
         "ExplodeX unified market heart for pre-explosion detection, "
         "fixed trade theses and paper-only risk management"
@@ -85,11 +85,19 @@ def _float(value, default: float = 0.0) -> float:
         return default
 
 
+def _paper_authority() -> str:
+    return (
+        "TERRA_PRIMARY_PAPER"
+        if settings.paper_trading_only and settings.ai_brain_enabled and not settings.ai_brain_shadow_only
+        else "UNIFIED_HEART_CONTRACT_ONLY"
+    )
+
+
 @app.get("/")
 async def root():
     return {
         "name": settings.app_name,
-        "version": "0.14.0",
+        "version": "0.15.0",
         "mode": "paper" if settings.paper_trading_only else "live-enabled",
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
@@ -101,10 +109,10 @@ async def root():
         "prediction_engine": "explodex-heart-v1",
         "ai_brain": ai_brain_status(),
         "paper_execution_engine": PAPER_EXECUTION_VERSION,
-        "paper_authority": "UNIFIED_HEART_CONTRACT_ONLY",
+        "paper_authority": _paper_authority(),
         "legacy_paper_writes_disabled": True,
         "ready_policy": READY_POLICY,
-        "message": "ExplodeX unified heart online",
+        "message": "ExplodeX Terra V3 PAPER brain online",
     }
 
 
@@ -121,7 +129,7 @@ async def health():
         "prediction_engine": "explodex-heart-v1",
         "ai_brain": ai_brain_status(),
         "paper_execution_engine": PAPER_EXECUTION_VERSION,
-        "paper_authority": "UNIFIED_HEART_CONTRACT_ONLY",
+        "paper_authority": _paper_authority(),
         "legacy_paper_writes_disabled": True,
         "ready_policy": READY_POLICY,
         "coinglass": coinglass_client.status(),
@@ -136,6 +144,7 @@ async def runtime_status():
     payload["coinglass"] = coinglass_client.status()
     payload["prediction_engine"] = "explodex-heart-v1"
     payload["ai_brain"] = ai_brain_status()
+    payload["paper_authority"] = _paper_authority()
     payload["ready_policy"] = READY_POLICY
     return payload
 
