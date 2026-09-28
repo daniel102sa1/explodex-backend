@@ -145,10 +145,13 @@ async def root():
 
 @app.get("/health")
 async def health():
-    db_ok = await check_database()
+    # Railway liveness must not depend on a cross-project database proxy.
+    # DB/runtime readiness is exposed separately so a short DB reset does not
+    # cause the entire API container to be replaced.
     return {
-        "status": "ok" if db_ok else "degraded",
-        "database": db_ok,
+        "status": "ok",
+        "runtime_ready": bool(getattr(app.state, "runtime_ready", False)),
+        "runtime_error": getattr(app.state, "runtime_error", None),
         "paper_trading_only": settings.paper_trading_only,
         "scheduler_enabled": settings.scheduler_enabled,
         "market_data_source": binance_client.active_source,
