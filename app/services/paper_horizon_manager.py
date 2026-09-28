@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import paper_portfolio as base
 from app.services.binance import binance_client
 
-VERSION = "paper_horizon_manager_v5_immutable_structural_stop"
+VERSION = "paper_horizon_manager_v6_terra_protective_stop"
 DEFAULT_MAX_HOLD_MINUTES = 120
 PROFIT_LOCK_COST_BUFFER_RATE = 0.0018
 PRE_TP1_ARM_PROGRESS = 0.85
@@ -306,7 +306,12 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
         )
         hard_stop = _f(original_structural_stop, row_stop)
         soft_stop = _f(metadata.get("soft_invalidation_stop"), hard_stop)
-        tp_value = _f(row.get("take_profit"))
+        frozen = _d(metadata.get("frozen_plan"))
+        terra_managed = str(metadata.get("canonical_source") or "").startswith("TERRA")
+        tp1 = _f(frozen.get("tp1"), _f(metadata.get("tp1")))
+        tp2 = _f(frozen.get("tp2"), _f(metadata.get("tp2")))
+        tp3 = _f(frozen.get("tp3"), _f(metadata.get("tp3"), _f(row.get("take_profit"))))
+        tp_value = tp3 if terra_managed and tp3 > 0 else _f(row.get("take_profit"))
         side = str(row.get("side") or "").upper()
         entry = _f(row.get("entry_price"))
 
@@ -336,8 +341,61 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
                 "metadata": json.dumps(metadata),
             })
 
+        terra_effective_stop = hard_stop
+        terra_best_favorable = entry
+        terra_tp1_reached = False
+        terra_tp2_reached = False
+        terra_risk_distance = abs(entry - hard_stop)
+
         for candle in future:
             high, low, close = _f(candle[2]), _f(candle[3]), _f(candle[4])
+
+            if terra_managed:
+                stop_hit = low <= terra_effective_stop if side == "LONG" else high >= terra_effective_stop
+                target_hit = high >= tp_value if side == "LONG" else low <= tp_value
+                if stop_hit and target_hit:
+                    exit_price, exit_reason = terra_effective_stop, "TERRA_AMBIGUOUS_PROTECTED_STOP"
+                    break
+                if stop_hit:
+                    exit_price = terra_effective_stop
+                    if abs(terra_effective_stop - entry) <= max(1e-12, entry * 1e-8):
+                        exit_reason = "TERRA_BREAK_EVEN"
+                    elif terra_effective_stop != hard_stop:
+                        exit_reason = "TERRA_PROFIT_LOCK"
+                    else:
+                        exit_reason = "TERRA_HARD_STOP"
+                    break
+                if target_hit:
+                    exit_price, exit_reason = tp_value, "TERRA_TP3"
+                    break
+
+                if side == "LONG":
+                    terra_best_favorable = max(terra_best_favorable, high)
+                else:
+                    terra_best_favorable = min(terra_best_favorable, low)
+
+                if tp1 > 0 and _touched(side, high, low, tp1):
+                    terra_tp1_reached = True
+                if terra_tp1_reached:
+                    terra_effective_stop = breakeven_profit_lock_stop(
+                        side=side, entry=entry, tp1=tp1, current_stop=terra_effective_stop
+                    )
+
+                if tp2 > 0 and _touched(side, high, low, tp2):
+                    terra_tp2_reached = True
+                if terra_tp2_reached and tp1 > 0:
+                    terra_effective_stop = tp2_profit_lock_stop(
+                        side=side, tp1=tp1, current_stop=terra_effective_stop
+                    )
+                    if terra_risk_distance > 0:
+                        trail = (
+                            terra_best_favorable - terra_risk_distance
+                            if side == "LONG"
+                            else terra_best_favorable + terra_risk_distance
+                        )
+                        terra_effective_stop = _tighten_only(side, terra_effective_stop, trail)
+                continue
+
             exit_price, exit_reason = evaluate_survival_candle(
                 side=side,
                 high=high,
