@@ -98,8 +98,11 @@ def build_terra_context(
 
     setup_score = _f(market.get("setup_score"))
     confidence = _confidence_from_decision(decision, setup_score)
-    alignment = _f(pattern.get("agreement_pct"), 0.0)
-    pattern_score = _f(pattern.get("score"), 0.0)
+    directional_frames = int(_f(pattern.get("directional_timeframes"), 0.0))
+    alignment = _f(pattern.get("agreement_pct"), 50.0) if directional_frames > 0 else 50.0
+    # No named pattern is neutral, not bearish. Patterns can add or subtract
+    # confidence but are never mandatory for a trade.
+    pattern_score = max(50.0, _f(pattern.get("score"), 0.0))
     liquidity = _book_liquidity_score(snapshot)
     volatility = _volatility_quality(snapshot)
     btc_context = _f(market.get("btc_context_score"), 50.0)
