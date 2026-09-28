@@ -74,6 +74,7 @@ def adjustment_for_tier(snapshot: dict[str, Any], tier: str) -> dict[str, Any]:
         "sample": sample,
         "size_multiplier": size_multiplier,
         "leverage_multiplier": leverage_multiplier,
+        "multiplier": min(1.0, size_multiplier, leverage_multiplier),
         "reason": reason,
         "stats": stats,
         "paper_only": True,
