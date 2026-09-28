@@ -374,7 +374,16 @@ async def execute_unified_heart_contracts(
                     **_d(reason_bundle.get("metrics")),
                     "terra_leverage_memory": terra_memory,
                 },
-                "components": _d(reason_bundle.get("components")),
+                "components": {
+                    **_d(reason_bundle.get("components")),
+                    "fundamental_intelligence": _d(heart.get("fundamental_intelligence")),
+                    "catalyst_context": _d(heart.get("catalyst_context")),
+                    "pump_state_machine": _d(heart.get("pump_state_machine")),
+                    "historical_analog": _d(heart.get("historical_analog")),
+                    "forecast_matrix": _d(heart.get("forecast_matrix")),
+                    "quant_brain": _d(heart.get("quant_brain")),
+                    "execution_contract": _d(heart.get("execution_contract")),
+                },
             }
             terra_plan_hint = {
                 "direction": side,
