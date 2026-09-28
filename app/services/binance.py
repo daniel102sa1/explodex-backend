@@ -733,16 +733,19 @@ class BinancePublicClient:
     async def deep_snapshot(self, symbol: str) -> dict[str, Any]:
         symbol = symbol.upper()
 
-        klines, oi, oi_hist, taker, premium, long_short = await asyncio.gather(
+        # Start every independent market-data request at once. Previously the
+        # core six requests had to finish before the multi-timeframe/order-flow
+        # requests even started, adding a full extra network round-trip.
+        base_task = asyncio.gather(
             self.klines(symbol, "5m", 240),
             self.open_interest(symbol),
             self.open_interest_history(symbol, "5m", 12),
             self.taker_ratio(symbol, "5m", 8),
             self.premium_index(symbol),
             self.long_short_ratio(symbol, "5m", 8),
+            return_exceptions=True,
         )
-
-        extras = await asyncio.gather(
+        extras_task = asyncio.gather(
             self.klines(symbol, "1m", 120),
             self.klines(symbol, "15m", 96),
             self.klines(symbol, "1h", 96),
@@ -757,6 +760,9 @@ class BinancePublicClient:
             self.spot_agg_trades(symbol, 250),
             return_exceptions=True,
         )
+        base, extras = await asyncio.gather(base_task, extras_task)
+
+        klines, oi, oi_hist, taker, premium, long_short = base
         (
             klines_1m, klines_15m, klines_1h, klines_4h, klines_1d, klines_1w, klines_1M,
             order_book, agg_trades, top_accounts, top_positions, spot_agg_trades,
@@ -766,7 +772,7 @@ class BinancePublicClient:
             "symbol": symbol,
             "source": self.active_source,
             "provider_warning": self.last_primary_error if self.active_source != "BINANCE_FUTURES" else None,
-            "klines": klines,
+            "klines": self._optional_value(klines, []),
             "klines_1m": self._optional_value(klines_1m, []),
             "klines_15m": self._optional_value(klines_15m, []),
             "klines_1h": self._optional_value(klines_1h, []),
@@ -774,11 +780,11 @@ class BinancePublicClient:
             "klines_1d": self._optional_value(klines_1d, []),
             "klines_1w": self._optional_value(klines_1w, []),
             "klines_1M": self._optional_value(klines_1M, []),
-            "open_interest": oi,
-            "open_interest_history": oi_hist,
-            "taker": taker,
-            "premium": premium,
-            "long_short": long_short,
+            "open_interest": self._optional_value(oi, {}),
+            "open_interest_history": self._optional_value(oi_hist, []),
+            "taker": self._optional_value(taker, []),
+            "premium": self._optional_value(premium, {}),
+            "long_short": self._optional_value(long_short, []),
             "order_book": self._optional_value(order_book, {}),
             "agg_trades": self._optional_value(agg_trades, []),
             "top_long_short_accounts": self._optional_value(top_accounts, []),
