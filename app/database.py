@@ -14,10 +14,10 @@ from app.config import settings
 engine = create_async_engine(
     settings.async_database_url,
     pool_pre_ping=True,
-    pool_recycle=120,
-    pool_timeout=15,
-    pool_size=5,
-    max_overflow=5,
+    pool_recycle=300,
+    pool_timeout=8,
+    pool_size=2,
+    max_overflow=0,
     connect_args={
         "prepared_statement_cache_size": 0,
         "timeout": 10,
@@ -25,26 +25,30 @@ engine = create_async_engine(
 )
 SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
-_DB_CONNECT_RETRIES = 8
-_DB_RETRY_BASE_SECONDS = 0.5
+_DB_CONNECT_RETRIES = 5
+_DB_RETRY_BASE_SECONDS = 0.4
+_DB_CONNECT_GATE = asyncio.Lock()
 
 
 async def _open_healthy_session() -> AsyncSession:
-    """Open and validate a DB session, absorbing short Railway proxy resets."""
+    """Open and validate a DB session without stampeding the public TCP proxy."""
     last_error: BaseException | None = None
 
-    for attempt in range(_DB_CONNECT_RETRIES):
-        session = SessionLocal()
-        try:
-            # Force connection checkout here so transient connect errors happen
-            # before FastAPI starts executing the endpoint body.
-            await session.execute(text("SELECT 1"))
-            return session
-        except (DBAPIError, ConnectionError, OSError) as exc:
-            last_error = exc
-            await session.close()
-            if attempt + 1 < _DB_CONNECT_RETRIES:
-                await asyncio.sleep(_DB_RETRY_BASE_SECONDS * (attempt + 1))
+    # The dashboard calls several PAPER endpoints together. When the database
+    # lives in another Railway project they all traverse the public TCP proxy;
+    # serialize reconnect attempts so one short outage does not create dozens
+    # of simultaneous SSL handshakes.
+    async with _DB_CONNECT_GATE:
+        for attempt in range(_DB_CONNECT_RETRIES):
+            session = SessionLocal()
+            try:
+                await session.execute(text("SELECT 1"))
+                return session
+            except (DBAPIError, ConnectionError, OSError) as exc:
+                last_error = exc
+                await session.close()
+                if attempt + 1 < _DB_CONNECT_RETRIES:
+                    await asyncio.sleep(_DB_RETRY_BASE_SECONDS * (attempt + 1))
 
     if last_error is not None:
         raise last_error
