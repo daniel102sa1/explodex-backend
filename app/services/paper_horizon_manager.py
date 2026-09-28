@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services import paper_portfolio as base
 from app.services.binance import binance_client
 
-VERSION = "paper_horizon_manager_v5_immutable_structural_stop"
+VERSION = "paper_horizon_manager_v6_terra_dynamic_protection"
 DEFAULT_MAX_HOLD_MINUTES = 120
 PROFIT_LOCK_COST_BUFFER_RATE = 0.0018
 PRE_TP1_ARM_PROGRESS = 0.85
@@ -246,6 +246,151 @@ def evaluate_survival_candle(
     return None, None
 
 
+def _terra_atr(candles: list[Any], length: int = 14) -> float:
+    sample = list(candles or [])[-max(2, length):]
+    if len(sample) < 2:
+        return 0.0
+    trs: list[float] = []
+    prev_close = _f(sample[0][4]) if len(sample[0]) >= 5 else 0.0
+    for candle in sample[1:]:
+        if len(candle) < 5:
+            continue
+        high, low, close = _f(candle[2]), _f(candle[3]), _f(candle[4])
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+        prev_close = close
+    return sum(trs) / len(trs) if trs else 0.0
+
+
+def _manage_terra_candles(
+    *,
+    side: str,
+    entry: float,
+    structural_stop: float,
+    final_target: float,
+    metadata: dict[str, Any],
+    candles: list[Any],
+    now_ms: int,
+) -> dict[str, Any]:
+    frozen = _d(metadata.get("frozen_plan"))
+    protection = _d(metadata.get("terra_protection"))
+    tp1 = _f(protection.get("tp1"), _f(metadata.get("tp1"), _f(frozen.get("tp1"))))
+    tp2 = _f(protection.get("tp2"), _f(metadata.get("tp2"), _f(frozen.get("tp2"))))
+    tp3 = _f(protection.get("tp3"), _f(metadata.get("tp3"), _f(frozen.get("tp3"), final_target)))
+    if tp3 > 0:
+        final_target = tp3
+
+    active_stop = _f(protection.get("active_stop"), structural_stop)
+    active_stop = _tighten_only(side, structural_stop, active_stop)
+    stage = str(protection.get("stage") or "INITIAL")
+    last_ms = int(_f(protection.get("last_candle_open_ms"), 0.0))
+    processed: list[Any] = []
+    changed = False
+    exit_price = None
+    exit_reason = None
+
+    for candle in candles:
+        if len(candle) < 5:
+            continue
+        open_ms = int(_f(candle[0]))
+        close_ms = int(_f(candle[6])) if len(candle) > 6 else open_ms
+        if open_ms <= last_ms:
+            continue
+        if close_ms > now_ms:
+            continue
+
+        high, low, close = _f(candle[2]), _f(candle[3]), _f(candle[4])
+        stop_hit = low <= active_stop if side == "LONG" else high >= active_stop
+        target_hit = high >= final_target if side == "LONG" else low <= final_target
+
+        if stop_hit and target_hit:
+            exit_price = active_stop
+            exit_reason = "TERRA_AMBIGUOUS_PROTECTED_STOP"
+            break
+        if stop_hit:
+            exit_price = active_stop
+            exit_reason = "TERRA_PROTECTED_STOP" if stage != "INITIAL" else "TERRA_INITIAL_STOP"
+            break
+        if target_hit:
+            exit_price = final_target
+            exit_reason = "TERRA_FINAL_TARGET"
+            break
+
+        old_stop = active_stop
+        if stage == "INITIAL" and tp1 > 0 and not _touched(side, high, low, tp1):
+            signal = pre_tp1_protection_signal(
+                side=side,
+                entry=entry,
+                tp1=tp1,
+                high=high,
+                low=low,
+                close=close,
+            )
+            if bool(signal.get("triggered")):
+                active_stop = pre_tp1_protective_stop(
+                    side=side,
+                    entry=entry,
+                    current_stop=active_stop,
+                    close=close,
+                )
+                if active_stop != old_stop:
+                    stage = "PRE_TP1_PROTECTED"
+
+        if tp1 > 0 and _touched(side, high, low, tp1):
+            active_stop = breakeven_profit_lock_stop(
+                side=side,
+                entry=entry,
+                tp1=tp1,
+                current_stop=active_stop,
+            )
+            stage = "TP1_BREAKEVEN_PROTECTED"
+
+        if tp2 > 0 and _touched(side, high, low, tp2):
+            active_stop = tp2_profit_lock_stop(
+                side=side,
+                tp1=tp1 if tp1 > 0 else entry,
+                current_stop=active_stop,
+            )
+            stage = "TP2_TRAILING"
+
+        processed.append(candle)
+        if stage == "TP2_TRAILING":
+            atr = _terra_atr(processed)
+            if atr > 0:
+                candidate = close - 1.5 * atr if side == "LONG" else close + 1.5 * atr
+                active_stop = _tighten_only(side, active_stop, candidate)
+
+        if active_stop != old_stop:
+            changed = True
+        last_ms = open_ms
+
+    protection.update({
+        "enabled": True,
+        "stage": stage,
+        "active_stop": active_stop,
+        "initial_structural_stop": structural_stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "last_candle_open_ms": last_ms,
+        "last_updated_at": datetime.now(timezone.utc).isoformat(),
+        "rule": "NEVER_WIDEN_ONLY_TIGHTEN_AFTER_COMPLETED_CANDLES",
+    })
+    metadata["terra_protection"] = protection
+    metadata["stop_policy"] = "TERRA_DYNAMIC_PROTECTION_TIGHTEN_ONLY"
+    metadata["stop_can_widen_after_entry"] = False
+    metadata["stop_can_tighten_after_entry"] = True
+    metadata["hard_stop"] = structural_stop
+
+    return {
+        "exit_price": exit_price,
+        "exit_reason": exit_reason,
+        "active_stop": active_stop,
+        "stage": stage,
+        "changed": changed,
+        "metadata": metadata,
+    }
+
+
 async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
     rows = (await db.execute(text("""
         SELECT id, symbol, side, entry_price, stop_loss, take_profit, quantity,
@@ -291,6 +436,112 @@ async def close_due_positions(db: AsyncSession) -> dict[str, Any]:
 
         start_ms = int(opened_at.timestamp() * 1000)
         future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
+
+        terra_managed = str(metadata.get("canonical_source") or "") == "TERRA_FULL_CONTROL_PAPER"
+        if terra_managed:
+            row_stop = _f(row.get("stop_loss"))
+            structural_stop = _f(
+                metadata.get("initial_hard_stop")
+                or metadata.get("hard_stop")
+                or _d(metadata.get("frozen_plan")).get("structural_stop")
+                or row_stop,
+                row_stop,
+            )
+            entry = _f(row.get("entry_price"))
+            side = str(row.get("side") or "").upper()
+            final_target = _f(row.get("take_profit"))
+            managed = _manage_terra_candles(
+                side=side,
+                entry=entry,
+                structural_stop=structural_stop,
+                final_target=final_target,
+                metadata=metadata,
+                candles=future,
+                now_ms=int(now.timestamp() * 1000),
+            )
+            metadata = _d(managed.get("metadata"))
+            active_stop = _f(managed.get("active_stop"), structural_stop)
+            exit_price = managed.get("exit_price")
+            exit_reason = managed.get("exit_reason")
+
+            if bool(managed.get("changed")) or abs(active_stop - row_stop) > max(1e-12, abs(active_stop) * 1e-10):
+                await db.execute(text("""
+                    UPDATE paper_positions
+                    SET stop_loss=:stop_loss, metadata=CAST(:metadata AS JSONB)
+                    WHERE id=:id AND status='OPEN'
+                """), {
+                    "id": row["id"],
+                    "stop_loss": active_stop,
+                    "metadata": json.dumps(metadata),
+                })
+
+            if exit_price is None and age_minutes >= max_hold:
+                exit_price = _f(future[-1][4]) if future else await base._latest_price(row["symbol"])
+                exit_reason = "TERRA_TIME_EXIT"
+
+            if exit_price is None or _f(exit_price) <= 0:
+                if bool(managed.get("changed")):
+                    actions.append({
+                        "symbol": row["symbol"],
+                        "reason": "TERRA_STOP_TIGHTENED",
+                        "age_minutes": round(age_minutes, 1),
+                        "max_hold_minutes": max_hold,
+                        "active_stop": active_stop,
+                        "initial_structural_stop": structural_stop,
+                        "protection_stage": managed.get("stage"),
+                        "stop_policy": "TERRA_DYNAMIC_PROTECTION_TIGHTEN_ONLY",
+                    })
+                continue
+
+            exit_price = _f(exit_price)
+            pnl = base.calculate_trade_pnl(
+                side=side,
+                entry=entry,
+                exit_price=exit_price,
+                quantity=_f(row["quantity"]),
+                notional=_f(row["notional"]),
+                opened_at=opened_at,
+                closed_at=now,
+            )
+            close_result = await db.execute(text("""
+                UPDATE paper_positions
+                SET status='CLOSED', closed_at=:closed_at, exit_price=:exit_price,
+                    exit_reason=:exit_reason, gross_pnl=:gross_pnl, net_pnl=:net_pnl,
+                    fees=:fees, slippage=:slippage, funding_estimate=:funding_estimate,
+                    metadata=CAST(:metadata AS JSONB)
+                WHERE id=:id AND status='OPEN'
+                RETURNING id
+            """), {
+                "id": row["id"],
+                "closed_at": now,
+                "exit_price": exit_price,
+                "exit_reason": exit_reason,
+                "metadata": json.dumps(metadata),
+                **pnl,
+            })
+            if close_result.scalar_one_or_none() is None:
+                continue
+            await db.execute(text("""
+                UPDATE paper_accounts
+                SET cash_balance=cash_balance+:net_pnl,
+                    realized_pnl=realized_pnl+:net_pnl,
+                    total_fees=total_fees+:fees+:slippage+:funding_estimate,
+                    updated_at=NOW()
+                WHERE id=1
+            """), pnl)
+            closed += 1
+            actions.append({
+                "symbol": row["symbol"],
+                "reason": exit_reason,
+                "age_minutes": round(age_minutes, 1),
+                "max_hold_minutes": max_hold,
+                "active_stop": active_stop,
+                "initial_structural_stop": structural_stop,
+                "protection_stage": managed.get("stage"),
+                "stop_policy": "TERRA_DYNAMIC_PROTECTION_TIGHTEN_ONLY",
+            })
+            continue
+
         exit_price = None
         exit_reason = None
         # The stop used for PAPER execution is frozen at entry. Older open rows
