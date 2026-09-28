@@ -204,7 +204,7 @@ async def _latest_price(symbol: str) -> float:
 
 async def _close_due_positions(db: AsyncSession) -> dict[str, int]:
     rows = (await db.execute(text("""
-        SELECT id, symbol, side, entry_price, stop_loss, take_profit, quantity, notional, opened_at
+        SELECT id, symbol, side, entry_price, stop_loss, take_profit, quantity, notional, opened_at, metadata
         FROM paper_positions
         WHERE status='OPEN'
         ORDER BY opened_at ASC
