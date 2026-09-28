@@ -32,17 +32,52 @@ from app.services.scoring import build_btc_context, score_snapshot
 READY_POLICY = "ExplodeX Heart: guarded prediction + fixed thesis + no_chase + risk guard"
 
 
+async def _initialize_runtime(app: FastAPI) -> None:
+    """Initialize DB-backed runtime without making API liveness depend on Postgres."""
+    while True:
+        try:
+            await ensure_runtime_schema()
+            app.state.paper_reset_result = await maybe_reset_full_paper_baseline()
+            app.state.paper_repair_result = await maybe_repair_current_arsenal_positions()
+            tasks = await start_runtime()
+            app.state.runtime_tasks = tasks
+            app.state.runtime_ready = True
+            app.state.runtime_error = None
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Cross-project Railway DB traffic can suffer short proxy resets.
+            # Keep the API alive and retry initialization instead of crash-looping.
+            app.state.runtime_ready = False
+            app.state.runtime_error = f"{type(exc).__name__}: {exc}"
+            await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await ensure_runtime_schema()
-    app.state.paper_reset_result = await maybe_reset_full_paper_baseline()
-    app.state.paper_repair_result = await maybe_repair_current_arsenal_positions()
-    tasks = await start_runtime()
-    app.state.runtime_tasks = tasks
+    app.state.paper_reset_result = None
+    app.state.paper_repair_result = None
+    app.state.runtime_tasks = []
+    app.state.runtime_ready = False
+    app.state.runtime_error = None
+
+    startup_task = asyncio.create_task(_initialize_runtime(app))
+    app.state.runtime_startup_task = startup_task
+
     try:
         yield
     finally:
-        await stop_runtime(tasks)
+        if not startup_task.done():
+            startup_task.cancel()
+            try:
+                await startup_task
+            except asyncio.CancelledError:
+                pass
+
+        tasks = getattr(app.state, "runtime_tasks", [])
+        if tasks:
+            await stop_runtime(tasks)
 
 
 app = FastAPI(
