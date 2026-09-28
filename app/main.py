@@ -1,8 +1,10 @@
 from contextlib import asynccontextmanager
 import asyncio
+import logging
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,12 +32,15 @@ from app.services.scoring import build_btc_context, score_snapshot
 
 
 READY_POLICY = "ExplodeX Heart: guarded prediction + fixed thesis + no_chase + risk guard"
+logger = logging.getLogger(__name__)
 
 
 async def _initialize_runtime(app: FastAPI) -> None:
-    """Initialize DB-backed runtime without making API liveness depend on Postgres."""
+    """Own DB reconnection until the PAPER runtime is fully ready."""
+    attempt = 0
     while True:
         try:
+            attempt += 1
             await ensure_runtime_schema()
             app.state.paper_reset_result = await maybe_reset_full_paper_baseline()
             app.state.paper_repair_result = await maybe_repair_current_arsenal_positions()
@@ -43,14 +48,20 @@ async def _initialize_runtime(app: FastAPI) -> None:
             app.state.runtime_tasks = tasks
             app.state.runtime_ready = True
             app.state.runtime_error = None
+            logger.info("PAPER runtime ready after database initialization attempt %s", attempt)
             return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # Cross-project Railway DB traffic can suffer short proxy resets.
-            # Keep the API alive and retry initialization instead of crash-looping.
+            # Do not expose connection strings or credentials in state/logs.
+            error_type = type(exc).__name__
             app.state.runtime_ready = False
-            app.state.runtime_error = f"{type(exc).__name__}: {exc}"
+            app.state.runtime_error = error_type
+            logger.warning(
+                "PAPER runtime waiting for PostgreSQL; initialization attempt %s failed (%s)",
+                attempt,
+                error_type,
+            )
             await asyncio.sleep(5)
 
 
@@ -102,6 +113,27 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def paper_runtime_readiness_guard(request: Request, call_next):
+    path = request.url.path
+    paper_path = path.startswith("/api/v1/paper-trading") or path.startswith("/api/v1/paper/")
+    if (
+        request.method != "OPTIONS"
+        and paper_path
+        and not bool(getattr(app.state, "runtime_ready", False))
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "PAPER runtime is reconnecting to PostgreSQL.",
+                "runtime_ready": False,
+                "retry_after_seconds": 5,
+            },
+            headers={"Retry-After": "5"},
+        )
+    return await call_next(request)
 
 
 def _safe_symbol(symbol: str) -> str:

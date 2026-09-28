@@ -76,19 +76,21 @@ async def check_database() -> bool:
 
 
 async def ensure_runtime_schema() -> None:
-    """Apply runtime schema fixes, retrying short Railway/Postgres resets."""
+    """Apply runtime schema fixes through the single DB reconnect gate."""
     last_error: BaseException | None = None
 
-    for attempt in range(_DB_CONNECT_RETRIES):
-        try:
-            await _ensure_runtime_schema_once()
-            return
-        except (DBAPIError, ConnectionError, OSError) as exc:
-            last_error = exc
-            # Drop any half-open pooled connections before the next attempt.
-            await engine.dispose()
-            if attempt + 1 < _DB_CONNECT_RETRIES:
-                await asyncio.sleep(_DB_RETRY_BASE_SECONDS * (attempt + 1))
+    async with _DB_CONNECT_GATE:
+        for attempt in range(_DB_CONNECT_RETRIES):
+            try:
+                await _ensure_runtime_schema_once()
+                return
+            except (DBAPIError, ConnectionError, OSError) as exc:
+                last_error = exc
+                # SQLAlchemy/asyncpg invalidate broken connections themselves.
+                # Do not dispose the whole pool here: that can terminate a
+                # healthy SSL connection opened by another coroutine.
+                if attempt + 1 < _DB_CONNECT_RETRIES:
+                    await asyncio.sleep(_DB_RETRY_BASE_SECONDS * (attempt + 1))
 
     if last_error is not None:
         raise last_error
