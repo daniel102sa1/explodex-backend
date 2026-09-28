@@ -6,9 +6,11 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services.pattern_engine import analyze_pattern_context
+from app.services.terra_controller import build_terra_context
 
 
-AI_BRAIN_VERSION = "terra_full_control_paper_v2_all_timeframes"
+AI_BRAIN_VERSION = "terra_full_control_paper_v3_patterns_risk_protection"
 
 _DECISION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -159,6 +161,7 @@ def _packet(
     market_event: dict[str, Any],
     snapshot: dict[str, Any],
     coinglass: dict[str, Any] | None,
+    pattern_context: dict[str, Any],
 ) -> dict[str, Any]:
     metrics = _dict(scored.get("metrics"))
     components = _dict(scored.get("components"))
@@ -167,6 +170,7 @@ def _packet(
         "symbol": symbol,
         "current_price": _f(scored.get("current_price")),
         "market_data": _compact_snapshot(snapshot),
+        "pattern_context": pattern_context,
         "coinglass": _dict(coinglass),
         "legacy_sensors": {
             "state": scored.get("state"),
@@ -201,6 +205,7 @@ async def evaluate_candidate(
     if not settings.paper_trading_only:
         return _fallback("Terra full-control mode is enabled only for PAPER simulation")
 
+    pattern_context = analyze_pattern_context(snapshot)
     packet = _packet(
         symbol=symbol,
         scored=scored,
@@ -210,6 +215,7 @@ async def evaluate_candidate(
         market_event=market_event,
         snapshot=snapshot,
         coinglass=coinglass,
+        pattern_context=pattern_context,
     )
 
     instructions = (
@@ -228,8 +234,14 @@ async def evaluate_candidate(
         "daily and 4h define regime and major structure, 1h and 15m define the setup, and 5m plus 1m define timing and immediate continuation. "
         "Explicitly notice agreement or conflict between horizons. A higher-timeframe conflict should normally reduce capital/leverage or require "
         "stronger short-term confirmation, not mechanically forbid every shorter trade. Do not let a 1m candle override a weak daily/weekly context. "
-        "Do not treat any score as a calibrated probability. Prefer NO_TRADE when the evidence is not coherent. "
-        "For ENTER decisions, produce internally coherent numeric levels for the chosen direction. "
+        "Treat classic technical analysis as structured evidence: trend, support/resistance, volume confirmation, momentum, "
+        "divergence and multi-timeframe agreement in the spirit of Murphy, while remembering chart patterns are probabilistic, not laws. "
+        "Use the supplied Pattern Engine as one sensor for triangles, flags, wedges, double tops/bottoms, breakouts, retests and false breaks; "
+        "never enter only because a named pattern exists. Define the stop from technical invalidation first: structure/swing, volatility/ATR, "
+        "liquidity and the timeframe of the thesis. Only after defining that invalidation should you choose capital and leverage. "
+        "Do not force a fixed-percent stop and do not place a stop randomly. For a strong setup, more PAPER leverage is allowed only when "
+        "multi-source evidence, liquidity, timeframe alignment and stop geometry support it. Do not treat any score as a calibrated probability. "
+        "Prefer NO_TRADE when the evidence is not coherent. For ENTER decisions, produce internally coherent numeric levels for the chosen direction. "
         "This is simulation only; do not assume or claim guaranteed profit."
     )
 
@@ -262,10 +274,8 @@ async def evaluate_candidate(
         action = str(decision.get("action") or "NO_TRADE").upper()
         direction = str(decision.get("direction") or "NONE").upper()
         state = str(decision.get("state") or "NO_TRADE").upper()
-        allow_entry = bool(decision.get("allow_entry")) and action == "ENTER" and direction in {"LONG", "SHORT"}
 
-        plan_out = {
-            "source": "TERRA_FULL_CONTROL",
+        requested_plan = {
             "direction": direction,
             "entry_low": _f(decision.get("entry_low")),
             "entry_high": _f(decision.get("entry_high")),
@@ -273,10 +283,43 @@ async def evaluate_candidate(
             "tp1": _f(decision.get("tp1")),
             "tp2": _f(decision.get("tp2")),
             "tp3": _f(decision.get("tp3")),
-            "leverage": _f(decision.get("leverage")),
-            "risk_pct": _f(decision.get("risk_pct")),
-            "capital_allocation_pct": _f(decision.get("capital_allocation_pct")),
-            "max_hold_minutes": int(decision.get("max_hold_minutes") or 0),
+            "leverage": _f(decision.get("leverage"), 1.0),
+            "risk_pct": _f(decision.get("risk_pct"), 0.25),
+            "capital_allocation_pct": _f(decision.get("capital_allocation_pct"), 5.0),
+            "max_hold_minutes": int(decision.get("max_hold_minutes") or 60),
+        }
+        controller = build_terra_context(
+            pattern=pattern_context,
+            market={
+                "current_price": _f(scored.get("current_price")),
+                "setup_score": _f(scored.get("setup_score")),
+                "risk_score": _f(scored.get("risk_score")),
+                "btc_context_score": _f(_dict(scored.get("metrics")).get("btc_context_score"), 50.0),
+            },
+            decision=decision,
+            snapshot=snapshot,
+        )
+        adaptive_risk = _dict(controller.get("adaptive_risk"))
+        raw_allow_entry = bool(decision.get("allow_entry")) and action == "ENTER" and direction in {"LONG", "SHORT"}
+        allow_entry = raw_allow_entry and bool(controller.get("allow_entry"))
+        if raw_allow_entry and not allow_entry:
+            action = "WAIT"
+            if state in {"LONG_CONFIRMED", "SHORT_CONFIRMED"}:
+                state = "ARMED"
+
+        plan_out = {
+            "source": "TERRA_FULL_CONTROL_V3",
+            "direction": direction,
+            "entry_low": requested_plan["entry_low"],
+            "entry_high": requested_plan["entry_high"],
+            "stop_loss": requested_plan["stop_loss"],
+            "tp1": requested_plan["tp1"],
+            "tp2": requested_plan["tp2"],
+            "tp3": requested_plan["tp3"],
+            "leverage": _f(adaptive_risk.get("leverage"), 1.0),
+            "risk_pct": _f(adaptive_risk.get("risk_pct"), 0.0),
+            "capital_allocation_pct": _f(adaptive_risk.get("capital_allocation_pct"), 0.0),
+            "max_hold_minutes": requested_plan["max_hold_minutes"],
             "do_not_recalculate": True,
         }
 
@@ -316,6 +359,10 @@ async def evaluate_candidate(
             "risks": list(decision.get("risks") or [])[:10],
             "continuation_checks": list(decision.get("continuation_checks") or [])[:10],
             "summary": str(decision.get("summary") or "")[:800],
+            "pattern_context": pattern_context,
+            "risk_context": adaptive_risk,
+            "controller": controller,
+            "requested_plan": requested_plan,
             "usage": usage,
             "plan": plan_out,
         }

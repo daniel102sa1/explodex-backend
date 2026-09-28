@@ -327,11 +327,16 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
         raw = (mark-entry)*qty if row["side"] == "LONG" else (entry-mark)*qty
         unrealized += raw
         metadata = _meta(row.get("metadata"))
+        frozen_plan = _meta(metadata.get("frozen_plan"))
+        terra_protection = _meta(metadata.get("terra_protection"))
         positions.append({
             "id": row["id"], "symbol": row["symbol"], "side": row["side"], "leverage": row["leverage"],
             "entry_price": entry, "mark_price": mark, "mark_price_stale": mark_stale, "stop_loss": _f(row["stop_loss"]),
-            "take_profit": _f(row["take_profit"]), "tp1": _f(row["take_profit"]),
-            "tp2": metadata.get("tp2"), "tp3": metadata.get("tp3"), "margin_used": _f(row["margin_used"]),
+            "take_profit": _f(row["take_profit"]),
+            "tp1": _f(frozen_plan.get("tp1"), _f(metadata.get("tp1"), _f(row["take_profit"]))),
+            "tp2": _f(frozen_plan.get("tp2"), _f(metadata.get("tp2"))),
+            "tp3": _f(frozen_plan.get("tp3"), _f(metadata.get("tp3"), _f(row["take_profit"]))),
+            "margin_used": _f(row["margin_used"]),
             "unrealized_pnl": round(raw, 6), "opened_at": row["opened_at"].isoformat(),
             "strategy_mode": metadata.get("strategy_mode"),
             "trade_profile": metadata.get("trade_profile") or metadata.get("strategy_mode"),
@@ -358,6 +363,13 @@ async def paper_summary(db: AsyncSession) -> dict[str, Any]:
             "chati_sarpon_612_monitor": metadata.get("chati_sarpon_612_monitor"),
             "chati_sarpon_612_history": list(metadata.get("chati_sarpon_612_history") or [])[-8:],
             "net_rr": _meta(metadata.get("execution_math_live")).get("net_rr"),
+            "terra_pattern_context": metadata.get("terra_pattern_context"),
+            "terra_risk_context": metadata.get("terra_risk_context"),
+            "terra_controller": metadata.get("terra_controller"),
+            "terra_learning_multiplier": metadata.get("terra_learning_multiplier"),
+            "terra_protection": terra_protection,
+            "decision_latency_move_pct": metadata.get("decision_latency_move_pct"),
+            "canonical_source": metadata.get("canonical_source"),
         })
     cash = _f(account["cash_balance"])
     equity = cash + unrealized

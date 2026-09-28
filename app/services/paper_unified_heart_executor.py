@@ -14,10 +14,11 @@ from app.services.binance import binance_client
 from app.services.risk_conviction_engine import build_risk_conviction
 from app.services.paper_regime_router import btc_side_risk_multiplier
 from app.services.stop_survival_engine import build_stop_survival_plan
+from app.services.terra_learning import load_terra_leverage_memory, multiplier_for_tier
 from app.services.trade_thesis import mark_thesis_entered
 from app.services.vnext_evaluation import EVALUATION_GENERATION
 
-VERSION = "paper_unified_heart_executor_v10_terra_adaptive_paper"
+VERSION = "paper_unified_heart_executor_v11_terra_primary_full_system"
 LANE_PRIORITY = {"TACTICAL": 0, "AGGRESSIVE_PAPER": 1, "SWING_PAPER": 2}
 
 DEFENSIVE_RISK_CAP = 0.25
@@ -255,6 +256,12 @@ async def execute_unified_heart_contracts(
     await base.acquire_paper_open_lock(db)
     account = (await db.execute(text("SELECT cash_balance FROM paper_accounts WHERE id=1"))).mappings().first()
     balance = base._f(account["cash_balance"] if account else base.STARTING_BALANCE)
+    terra_primary_global = bool(
+        settings.paper_trading_only
+        and settings.ai_brain_enabled
+        and not settings.ai_brain_shadow_only
+    )
+    terra_memory = await load_terra_leverage_memory(db) if terra_primary_global else {}
     open_count = int((await db.execute(text("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"))).scalar_one() or 0)
     slots = max(0, base.MAX_OPEN_POSITIONS - open_count)
     if defensive:
@@ -295,6 +302,29 @@ async def execute_unified_heart_contracts(
         heart = _d(reason.get("explodex_heart")) or _d(prediction.get("explodex_heart"))
         contract = _d(heart.get("execution_contract"))
         lane_name = str(contract.get("permitted_paper_lane") or "")
+
+        # In Terra-primary mode, legacy Heart is a sensor/candidate generator,
+        # not an entry veto. Every recent active signal may reach Terra.
+        if terra_primary_global:
+            lane = {}
+            if lane_name in LANE_PRIORITY:
+                lane_key = {"TACTICAL": "tactical", "AGGRESSIVE_PAPER": "aggressive_paper", "SWING_PAPER": "swing_paper"}[lane_name]
+                lane = _d(_d(contract.get("lanes")).get(lane_key))
+            if not lane:
+                lane = {
+                    "lane": "TERRA_CANDIDATE",
+                    "direction": prediction.get("direction") or heart.get("direction") or reason.get("direction"),
+                    "entry_low": prediction.get("entry_low") or reason.get("entry_low"),
+                    "entry_high": prediction.get("entry_high") or reason.get("entry_high"),
+                    "stop_loss": prediction.get("stop_loss") or reason.get("stop_loss"),
+                    "tp1": prediction.get("tp1") or reason.get("tp1"),
+                    "tp2": prediction.get("tp2") or reason.get("tp2"),
+                    "tp3": prediction.get("tp3") or reason.get("tp3"),
+                }
+            quality = _f(row.get("setup_score"))
+            candidates.append((0, -quality, _f(row.get("risk_score"), 100.0), row, heart, lane))
+            continue
+
         if lane_name not in LANE_PRIORITY:
             reject("heart_no_permitted_lane")
             continue
@@ -323,30 +353,37 @@ async def execute_unified_heart_contracts(
         if len(opened_items) >= slots:
             break
         symbol = str(row["symbol"])
-        lane_name = str(lane.get("lane") or "")
-        side = str(lane.get("direction") or "").upper()
-        entry_low = _f(lane.get("entry_low"))
-        entry_high = _f(lane.get("entry_high"))
-        original_stop = _f(lane.get("stop_loss"))
-        original_target = _f(lane.get("target_price"))
+        reason_bundle = _d(row.get("reason"))
+        prediction = _d(reason_bundle.get("prediction"))
+        lane_name = str(lane.get("lane") or ("TERRA_CANDIDATE" if terra_primary_global else ""))
+        side = str(lane.get("direction") or prediction.get("direction") or heart.get("direction") or "").upper()
+        entry_low = _f(lane.get("entry_low"), _f(prediction.get("entry_low")))
+        entry_high = _f(lane.get("entry_high"), _f(prediction.get("entry_high")))
+        original_stop = _f(lane.get("stop_loss"), _f(prediction.get("stop_loss")))
+        original_target = _f(lane.get("target_price"), _f(prediction.get("tp2"), _f(prediction.get("tp1"))))
         fill = await base._latest_price(symbol)
 
-        terra_primary = bool(
-            settings.paper_trading_only
-            and settings.ai_brain_enabled
-            and not settings.ai_brain_shadow_only
-        )
-        if terra_primary:
-            reason_bundle = _d(row.get("reason"))
-            prediction = _d(reason_bundle.get("prediction"))
+        if terra_primary_global:
             terra_score = {
                 "current_price": fill,
                 "direction": heart.get("direction") or side,
                 "state": heart.get("state") or "WATCH",
                 "setup_score": row.get("setup_score"),
                 "risk_score": row.get("risk_score"),
-                "metrics": _d(reason_bundle.get("metrics")),
-                "components": _d(reason_bundle.get("components")),
+                "metrics": {
+                    **_d(reason_bundle.get("metrics")),
+                    "terra_leverage_memory": terra_memory,
+                },
+                "components": {
+                    **_d(reason_bundle.get("components")),
+                    "fundamental_intelligence": _d(heart.get("fundamental_intelligence")),
+                    "catalyst_context": _d(heart.get("catalyst_context")),
+                    "pump_state_machine": _d(heart.get("pump_state_machine")),
+                    "historical_analog": _d(heart.get("historical_analog")),
+                    "forecast_matrix": _d(heart.get("forecast_matrix")),
+                    "quant_brain": _d(heart.get("quant_brain")),
+                    "execution_contract": _d(heart.get("execution_contract")),
+                },
             }
             terra_plan_hint = {
                 "direction": side,
@@ -388,24 +425,60 @@ async def execute_unified_heart_contracts(
             tp1 = _f(terra_plan.get("tp1"))
             tp2 = _f(terra_plan.get("tp2"))
             tp3 = _f(terra_plan.get("tp3"))
-            target = tp2 if tp2 > 0 else (tp1 if tp1 > 0 else tp3)
-            leverage = int(max(1, min(20, round(_f(terra_plan.get("leverage"), 1.0)))))
-            risk_pct = max(0.01, min(100.0, _f(terra_plan.get("risk_pct"), 0.01)))
-            allocation_pct = max(0.01, min(100.0, _f(terra_plan.get("capital_allocation_pct"), 0.01)))
-            max_hold_minutes = int(max(1, _f(terra_plan.get("max_hold_minutes"), 60.0)))
+            max_hold_minutes = int(max(1, min(4320, _f(terra_plan.get("max_hold_minutes"), 60.0))))
+
+            # Revalidate price after the AI call. Terra may have spent seconds
+            # reasoning while the market moved; stale pre-AI fills never execute.
+            pre_ai_fill = fill
+            fresh_fill = await base._latest_price(symbol)
+            if fresh_fill <= 0:
+                reject("terra_fresh_price_unavailable")
+                continue
+            fill = fresh_fill
+            latency_move_pct = abs(fill - pre_ai_fill) / pre_ai_fill * 100.0 if pre_ai_fill > 0 else 0.0
 
             if side not in {"LONG", "SHORT"}:
                 reject("terra_invalid_side")
                 continue
+
+            # Use TP3 as final runner target when valid, then TP2, then TP1.
+            target_candidates = [tp3, tp2, tp1]
+            target = 0.0
+            for candidate_target in target_candidates:
+                if candidate_target <= 0:
+                    continue
+                if side == "LONG" and candidate_target > fill:
+                    target = candidate_target
+                    break
+                if side == "SHORT" and candidate_target < fill:
+                    target = candidate_target
+                    break
+
             if min(fill, entry_low, entry_high, hard_stop, target) <= 0:
                 reject("terra_invalid_geometry")
                 continue
             lo, hi = min(entry_low, entry_high), max(entry_low, entry_high)
             if not (lo <= fill <= hi):
-                reject("terra_wait_entry_zone")
+                reject("terra_wait_entry_zone_after_ai")
                 continue
             if not _geometry_ok(side, fill, hard_stop, target):
                 reject("terra_invalid_stop_target_geometry")
+                continue
+
+            risk_context = _d(terra.get("risk_context"))
+            tier = str(risk_context.get("tier") or "UNKNOWN").upper()
+            learning_multiplier = multiplier_for_tier(terra_memory, tier)
+            portfolio_brake = max(0.0, min(1.0, _f(risk_multiplier, 1.0)))
+            if portfolio_brake <= 0:
+                reject("terra_portfolio_brake_zero")
+                continue
+
+            requested_leverage = _f(terra_plan.get("leverage"), 1.0)
+            leverage = int(max(1, min(20, round(requested_leverage * learning_multiplier))))
+            risk_pct = max(0.0, min(2.0, _f(terra_plan.get("risk_pct"), 0.0) * portfolio_brake * learning_multiplier))
+            allocation_pct = max(0.0, min(50.0, _f(terra_plan.get("capital_allocation_pct"), 0.0) * portfolio_brake * learning_multiplier))
+            if risk_pct <= 0 or allocation_pct <= 0:
+                reject("terra_zero_approved_risk")
                 continue
 
             stop_distance = abs(fill - hard_stop)
@@ -433,6 +506,33 @@ async def execute_unified_heart_contracts(
                 "terra_capital_allocation_pct": allocation_pct,
                 "terra_leverage": leverage,
                 "terra_max_hold_minutes": max_hold_minutes,
+                "terra_pattern_context": terra.get("pattern_context"),
+                "terra_risk_context": risk_context,
+                "terra_controller": terra.get("controller"),
+                "terra_requested_plan": terra.get("requested_plan"),
+                "terra_leverage_memory": terra_memory,
+                "terra_learning_multiplier": learning_multiplier,
+                "portfolio_risk_brake": portfolio_brake,
+                "pre_ai_price": pre_ai_fill,
+                "execution_price_after_ai": fill,
+                "decision_latency_move_pct": round(latency_move_pct, 6),
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "stop_policy": "TERRA_DYNAMIC_PROTECTION_TIGHTEN_ONLY",
+                "stop_can_widen_after_entry": False,
+                "stop_can_tighten_after_entry": True,
+                "initial_hard_stop": hard_stop,
+                "hard_stop": hard_stop,
+                "terra_protection": {
+                    "enabled": True,
+                    "stage": "INITIAL",
+                    "active_stop": hard_stop,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "tp3": tp3,
+                    "rule": "NEVER_WIDEN_ONLY_TIGHTEN_AFTER_COMPLETED_CANDLES",
+                },
                 "legacy_heart_advisory_only": heart,
                 "frozen_plan": {
                     "entry": fill,
@@ -500,6 +600,9 @@ async def execute_unified_heart_contracts(
                 "terra_state": terra.get("state"),
                 "terra_evidence_strength": terra.get("evidence_strength"),
                 "terra_summary": terra.get("summary"),
+                "terra_risk_tier": tier,
+                "terra_learning_multiplier": learning_multiplier,
+                "decision_latency_move_pct": round(latency_move_pct, 6),
             })
             continue
 

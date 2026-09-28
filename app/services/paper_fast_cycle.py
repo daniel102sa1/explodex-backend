@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.services import paper_portfolio as base
 from app.services.chati_sarpon_612_monitor import monitor_open_paper_positions
 from app.services.paper_horizon_manager import close_due_positions
@@ -21,7 +22,7 @@ from app.services.paper_unified_heart_executor import (
 )
 from app.services.validation_mode import ensure_validation_schema
 
-VERSION = "paper_fast_cycle_v14_single_authority_hardened"
+VERSION = "paper_fast_cycle_v15_terra_primary_authority"
 _LAST_FAST_CYCLE_RESULT: dict[str, Any] | None = None
 _PAPER_CYCLE_LOCK = asyncio.Lock()
 
@@ -52,7 +53,7 @@ async def run_fast_paper_cycle(db: AsyncSession) -> dict[str, Any]:
             "closed": 0,
             "reason": "paper_cycle_already_running",
             "single_paper_authority": True,
-            "authority": "UNIFIED_HEART_CONTRACT_ONLY",
+            "authority": "TERRA_PRIMARY_PAPER" if terra_primary else "UNIFIED_HEART_CONTRACT_ONLY",
         }
     async with _PAPER_CYCLE_LOCK:
         return await _run_fast_paper_cycle_unlocked(db)
@@ -120,6 +121,14 @@ async def _run_fast_paper_cycle_unlocked(db: AsyncSession) -> dict[str, Any]:
     base_risk_multiplier *= float(((policy.get("trend_premove") or {}).get("risk_multiplier")) or 0.0)
     base_risk_multiplier *= float(live_monitor.get("portfolio_new_entry_risk_multiplier") or 1.0)
     risk_multiplier = base_risk_multiplier * float(quant_guard.get("risk_multiplier") or 0.0)
+    terra_primary = bool(
+        settings.paper_trading_only
+        and settings.ai_brain_enabled
+        and not settings.ai_brain_shadow_only
+    )
+    # Terra uses current market/regime/live-monitor brakes, but a legacy
+    # historical quant cohort cannot permanently halt the new Terra experiment.
+    terra_risk_multiplier = max(0.0, min(1.0, base_risk_multiplier))
 
     btc_blocks_new_entries = bool(btc_overlay.get("block_new_entries"))
     validation_probation = False
@@ -142,6 +151,28 @@ async def _run_fast_paper_cycle_unlocked(db: AsyncSession) -> dict[str, Any]:
         }
         pre_event_execution = {"opened": 0, "trades": [], "reason": "btc_shock_block", "rejected": {"btc_shock_block": 1}}
         structure_retest_execution = {"opened": 0, "trades": [], "reason": "btc_shock_block", "rejected": {"btc_shock_block": 1}}
+    elif terra_primary:
+        execution = await execute_unified_heart_contracts(
+            db,
+            defensive=defensive,
+            risk_multiplier=terra_risk_multiplier,
+            btc_overlay=btc_overlay,
+            validation_probation=False,
+        )
+        # One authority only: secondary legacy PAPER executors cannot open a
+        # position behind Terra's back.
+        pre_event_execution = {
+            "opened": 0,
+            "trades": [],
+            "reason": "disabled_terra_primary_single_authority",
+            "rejected": {},
+        }
+        structure_retest_execution = {
+            "opened": 0,
+            "trades": [],
+            "reason": "disabled_terra_primary_single_authority",
+            "rejected": {},
+        }
     elif quant_guard.get("halt_new_entries"):
         # VNext probation: continue gathering *actual PAPER execution* evidence at
         # tiny risk instead of letting 206 legacy trades permanently deadlock the
@@ -228,6 +259,8 @@ async def _run_fast_paper_cycle_unlocked(db: AsyncSession) -> dict[str, Any]:
 
     if btc_blocks_new_entries:
         cycle_reason = "btc_shock_block"
+    elif terra_primary:
+        cycle_reason = str(execution.get("reason") or "terra_primary_no_candidate")
     elif quant_guard.get("halt_new_entries"):
         cycle_reason = (
             "opened_vnext_probation"
@@ -262,8 +295,11 @@ async def _run_fast_paper_cycle_unlocked(db: AsyncSession) -> dict[str, Any]:
         "btc_overlay": btc_overlay,
         "trade_audit": trade_audit,
         "chati_sarpon_612_live_monitor": live_monitor,
-        "effective_new_entry_risk_multiplier": round(max(0.0, risk_multiplier), 4),
+        "effective_new_entry_risk_multiplier": round(max(0.0, terra_risk_multiplier if terra_primary else risk_multiplier), 4),
         "base_non_quant_risk_multiplier": round(max(0.0, base_risk_multiplier), 4),
+        "terra_primary": terra_primary,
+        "legacy_quant_guard_advisory_only_for_terra": terra_primary,
+        "secondary_legacy_executors_disabled_for_terra": terra_primary,
         "validation_probation": {
             "active": validation_probation,
             "risk_multiplier": round(max(0.0, probation_risk_multiplier), 4),
