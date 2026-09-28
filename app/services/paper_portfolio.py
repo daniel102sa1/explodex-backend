@@ -218,24 +218,55 @@ async def _close_due_positions(db: AsyncSession) -> dict[str, int]:
         future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
         exit_price = None
         exit_reason = None
+        metadata = _meta(row.get("metadata"))
+        frozen = _meta(metadata.get("frozen_plan"))
+        terra_managed = str(metadata.get("canonical_source") or "").startswith("TERRA")
+        original_stop = _f(row["stop_loss"])
+        effective_stop = original_stop
+        entry = _f(row["entry_price"])
+        tp1 = _f(frozen.get("tp1"), _f(metadata.get("tp1")))
+        tp2 = _f(frozen.get("tp2"), _f(metadata.get("tp2")))
+        tp3 = _f(frozen.get("tp3"), _f(metadata.get("tp3"), _f(row["take_profit"])))
+        final_target = tp3 if terra_managed and tp3 > 0 else _f(row["take_profit"])
         for k in future:
             high, low = _f(k[2]), _f(k[3])
             side = row["side"]
-            stop_hit = low <= _f(row["stop_loss"]) if side == "LONG" else high >= _f(row["stop_loss"])
-            tp_hit = high >= _f(row["take_profit"]) if side == "LONG" else low <= _f(row["take_profit"])
+            if terra_managed:
+                if side == "LONG":
+                    if tp1 > 0 and high >= tp1:
+                        effective_stop = max(effective_stop, entry)
+                    if tp2 > 0 and high >= tp2 and tp1 > 0:
+                        effective_stop = max(effective_stop, tp1)
+                else:
+                    if tp1 > 0 and low <= tp1:
+                        effective_stop = min(effective_stop, entry)
+                    if tp2 > 0 and low <= tp2 and tp1 > 0:
+                        effective_stop = min(effective_stop, tp1)
+
+            stop_hit = low <= effective_stop if side == "LONG" else high >= effective_stop
+            tp_hit = high >= final_target if side == "LONG" else low <= final_target
             if stop_hit and tp_hit:
-                exit_price, exit_reason = _f(row["stop_loss"]), "AMBIGUOUS_STOP"
+                exit_price = effective_stop
+                exit_reason = "TERRA_PROTECTED_STOP" if terra_managed and effective_stop != original_stop else "AMBIGUOUS_STOP"
                 break
             if stop_hit:
-                exit_price, exit_reason = _f(row["stop_loss"]), "STOP"
+                exit_price = effective_stop
+                if terra_managed and effective_stop == entry:
+                    exit_reason = "TERRA_BREAK_EVEN"
+                elif terra_managed and effective_stop != original_stop:
+                    exit_reason = "TERRA_PROFIT_LOCK"
+                else:
+                    exit_reason = "STOP"
                 break
             if tp_hit:
-                exit_price, exit_reason = _f(row["take_profit"]), "TP1"
+                exit_price = final_target
+                exit_reason = "TERRA_TP3" if terra_managed and tp3 > 0 else "TP1"
                 break
         age_minutes = (now - row["opened_at"]).total_seconds() / 60.0
-        if exit_price is None and age_minutes >= MAX_HOLD_MINUTES:
+        position_max_hold = int(_f(metadata.get("max_hold_minutes"), MAX_HOLD_MINUTES)) if terra_managed else MAX_HOLD_MINUTES
+        if exit_price is None and age_minutes >= position_max_hold:
             exit_price = _f(future[-1][4]) if future else await _latest_price(row["symbol"])
-            exit_reason = "TIME_EXIT"
+            exit_reason = "TERRA_TIME_EXIT" if terra_managed else "TIME_EXIT"
         if exit_price is None or exit_price <= 0:
             continue
         pnl = calculate_trade_pnl(
