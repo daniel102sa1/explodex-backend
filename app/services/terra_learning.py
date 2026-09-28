@@ -78,3 +78,7 @@ def adjustment_for_tier(snapshot: dict[str, Any], tier: str) -> dict[str, Any]:
         "stats": stats,
         "paper_only": True,
     }
+
+
+# Backward-compatible name used by the PAPER executor.
+downside_adjustment = adjustment_for_tier
