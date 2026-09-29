@@ -319,7 +319,7 @@ async def ensure_fresh_database_schema(conn: AsyncConnection) -> None:
     await conn.execute(text("""
         CREATE TABLE IF NOT EXISTS paper_orders (
             id BIGSERIAL PRIMARY KEY,
-            signal_id UUID REFERENCES validation_observations(signal_id) ON DELETE SET NULL,
+            signal_id UUID REFERENCES signals(id) ON DELETE SET NULL,
             position_id BIGINT REFERENCES paper_positions(id) ON DELETE SET NULL,
             symbol VARCHAR(32) NOT NULL,
             position_side VARCHAR(8) NOT NULL,
