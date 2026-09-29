@@ -57,7 +57,7 @@ class Settings(BaseSettings):
 
     # Historical Market Brain. Builds a point-in-time OHLCV replay archive in
     # small background batches. It is shadow-only and cannot create entries.
-    historical_market_enabled: bool = True
+    historical_market_enabled: bool = False
     historical_market_interval: str = "5m"
     historical_market_backfill_days: int = 60
     historical_market_stride_bars: int = 6
@@ -71,9 +71,10 @@ class Settings(BaseSettings):
     coingecko_demo_api_key: str = ""
     coingecko_timeout_seconds: float = 10.0
 
-    # Automatic runtime loops. These values are deliberately conservative so
-    # Railway usage and exchange/API traffic remain controlled in v1.
-    scheduler_enabled: bool = True
+    # Automatic runtime loops are OFF by default for the low-cost PAPER setup.
+    # Manual scanner/prediction endpoints still work; enable this only when you
+    # explicitly want continuous background scanning and learning.
+    scheduler_enabled: bool = False
     scanner_interval_seconds: int = 300
     paper_manage_interval_seconds: int = 60
     paper_sync_interval_seconds: int = 300
