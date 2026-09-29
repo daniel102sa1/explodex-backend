@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
+from app.bootstrap_schema import ensure_fresh_database_schema
 from app.config import settings
 
 
@@ -34,10 +35,10 @@ async def _open_healthy_session() -> AsyncSession:
     """Open and validate a DB session without stampeding the public TCP proxy."""
     last_error: BaseException | None = None
 
-    # The dashboard calls several PAPER endpoints together. When the database
-    # lives in another Railway project they all traverse the public TCP proxy;
-    # serialize reconnect attempts so one short outage does not create dozens
-    # of simultaneous SSL handshakes.
+    # The dashboard calls several PAPER endpoints together. Serialize reconnect
+    # attempts so a Railway database wake/restart cannot create a connection
+    # stampede. In production ExplodeX and Postgres share a project and use the
+    # private DATABASE_URL reference.
     async with _DB_CONNECT_GATE:
         for attempt in range(_DB_CONNECT_RETRIES):
             session = SessionLocal()
@@ -100,6 +101,10 @@ async def ensure_runtime_schema() -> None:
 async def _ensure_runtime_schema_once() -> None:
     """Keep the live Railway schema compatible with current ExplodeX engines."""
     async with engine.begin() as conn:
+        # A fresh/demo database may be completely empty. Create the foundational
+        # schema first, then apply backwards-compatible runtime extensions.
+        await ensure_fresh_database_schema(conn)
+
         # New structural exit labels can exceed the legacy VARCHAR(24) column.
         # Widening is backward-compatible and prevents PAPER sync from crashing.
         await conn.execute(text("ALTER TABLE paper_positions ALTER COLUMN exit_reason TYPE VARCHAR(64)"))
