@@ -59,4 +59,22 @@ No agregues API keys privadas al repositorio. Esta etapa usa datos públicos y n
 
 The API liveness is intentionally decoupled from PostgreSQL readiness. Database-backed
 runtime initialization retries transient connection failures in the background so a
-short Railway database proxy reset does not crash-loop the API container.
+short Railway database restart does not crash-loop the API container.
+
+### Fresh PAPER database
+
+ExplodeX can boot against a completely empty PostgreSQL database. On startup it creates
+the foundational scanner, signal, validation and PAPER ledgers before applying the
+feature-specific runtime schema. No dump from an older database is required.
+
+For Railway, keep the backend and PostgreSQL in the same project and set `DATABASE_URL`
+with a Railway reference such as `${{Postgres.DATABASE_URL}}`. The default profile is
+intentionally low-cost:
+
+- `PAPER_TRADING_ONLY=true`
+- `BINANCE_USER_API_READ_ONLY=true`
+- `SCHEDULER_ENABLED=false`
+- `HISTORICAL_MARKET_ENABLED=false`
+
+Manual scanner, prediction, analysis and PAPER endpoints remain available. Background
+scanner/learning loops run only when the scheduler is explicitly enabled.
