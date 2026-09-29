@@ -34,7 +34,7 @@ async def ensure_paper_orders_schema(db: AsyncSession) -> None:
     await db.execute(text("""
         CREATE TABLE IF NOT EXISTS paper_orders (
             id BIGSERIAL PRIMARY KEY,
-            signal_id UUID REFERENCES validation_observations(signal_id) ON DELETE SET NULL,
+            signal_id UUID REFERENCES signals(id) ON DELETE SET NULL,
             position_id BIGINT REFERENCES paper_positions(id) ON DELETE SET NULL,
             symbol VARCHAR(32) NOT NULL,
             position_side VARCHAR(8) NOT NULL,
@@ -55,6 +55,34 @@ async def ensure_paper_orders_schema(db: AsyncSession) -> None:
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             UNIQUE (position_id, order_role)
         )
+    """))
+    # Migrate the old validation_observations FK in-place. NOT VALID preserves
+    # legacy rows while enforcing signals(id) for every future order write.
+    await db.execute(text("""
+        DO $
+        DECLARE c RECORD;
+        BEGIN
+            FOR c IN
+                SELECT conname, pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE conrelid = 'paper_orders'::regclass
+                  AND contype = 'f'
+                  AND pg_get_constraintdef(oid) ILIKE '%validation_observations%'
+            LOOP
+                EXECUTE format('ALTER TABLE paper_orders DROP CONSTRAINT %I', c.conname);
+            END LOOP;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'paper_orders'::regclass
+                  AND conname = 'paper_orders_signal_id_signals_fkey'
+            ) THEN
+                ALTER TABLE paper_orders
+                ADD CONSTRAINT paper_orders_signal_id_signals_fkey
+                FOREIGN KEY (signal_id) REFERENCES signals(id)
+                ON DELETE SET NULL NOT VALID;
+            END IF;
+        END $;
     """))
     await db.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status, created_at DESC)"
