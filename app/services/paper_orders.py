@@ -59,7 +59,7 @@ async def ensure_paper_orders_schema(db: AsyncSession) -> None:
     # Migrate the old validation_observations FK in-place. NOT VALID preserves
     # legacy rows while enforcing signals(id) for every future order write.
     await db.execute(text("""
-        DO $
+        DO $$
         DECLARE c RECORD;
         BEGIN
             FOR c IN
@@ -82,7 +82,7 @@ async def ensure_paper_orders_schema(db: AsyncSession) -> None:
                 FOREIGN KEY (signal_id) REFERENCES signals(id)
                 ON DELETE SET NULL NOT VALID;
             END IF;
-        END $;
+        END $$;
     """))
     await db.execute(text(
         "CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status, created_at DESC)"
