@@ -147,11 +147,30 @@ async def ensure_fresh_database_schema(conn: AsyncConnection) -> None:
         )
     """))
 
+    # Avoid literal JSON inside SQLAlchemy text(): tokens such as ":80"
+    # are parsed as bind parameters. Build JSON in PostgreSQL instead.
     await conn.execute(text("""
         INSERT INTO system_settings (key, value)
         VALUES
-            ('scanner', '{"min_setup_score":80,"max_risk_score":35,"max_open_trades":2,"max_daily_loss_pct":3,"risk_per_trade_pct":0.5}'::jsonb),
-            ('paper_account', '{"starting_equity_usdt":1000,"max_leverage":3,"estimated_fee_rate":0.0005,"target_policy":"TP2_FULL"}'::jsonb)
+            (
+                'scanner',
+                jsonb_build_object(
+                    'min_setup_score', 80,
+                    'max_risk_score', 35,
+                    'max_open_trades', 2,
+                    'max_daily_loss_pct', 3,
+                    'risk_per_trade_pct', 0.5
+                )
+            ),
+            (
+                'paper_account',
+                jsonb_build_object(
+                    'starting_equity_usdt', 1000,
+                    'max_leverage', 3,
+                    'estimated_fee_rate', 0.0005,
+                    'target_policy', 'TP2_FULL'
+                )
+            )
         ON CONFLICT (key) DO NOTHING
     """))
 
