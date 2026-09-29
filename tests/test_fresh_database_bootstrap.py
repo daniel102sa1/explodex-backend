@@ -20,3 +20,17 @@ def test_fresh_database_bootstrap_has_explodex_foundations() -> None:
         "paper_orders",
     }
     assert required <= FOUNDATIONAL_TABLES
+
+
+def test_bootstrap_sql_has_no_unbound_sqlalchemy_parameters() -> None:
+    import asyncio
+
+    from app.bootstrap_schema import ensure_fresh_database_schema
+
+    class FakeConnection:
+        async def execute(self, statement):
+            assert not statement._bindparams, (
+                f"Unexpected SQLAlchemy bind parameters: {sorted(statement._bindparams)}"
+            )
+
+    asyncio.run(ensure_fresh_database_schema(FakeConnection()))
