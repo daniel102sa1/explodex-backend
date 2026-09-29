@@ -18,6 +18,10 @@ def test_fresh_database_bootstrap_has_explodex_foundations() -> None:
         "paper_positions",
         "paper_equity_curve",
         "paper_orders",
+        "paper_micro_signals",
+        "paper_range_signals",
+        "paper_trade_theses",
+        "paper_trade_audits",
     }
     assert required <= FOUNDATIONAL_TABLES
 
