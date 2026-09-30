@@ -14,7 +14,16 @@ from app.services.formula_brain import formula_brain_calibration_report, formula
 from app.services.macro_cycle_persistence import macro_cycle_report
 from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
-from app.services.paper_manual import close_manual_position, manual_account_snapshot, open_manual_position
+from app.services.paper_manual import (
+    cancel_manual_order,
+    close_manual_position,
+    create_manual_order,
+    manual_account_snapshot,
+    manual_history,
+    move_manual_stop_to_be,
+    reset_manual_practice_account,
+    update_manual_risk,
+)
 from app.services.paper_orders import paper_order_history, paper_order_stats
 from app.services.paper_portfolio import ARSENAL_DISPLAY_START, ensure_paper_schema, paper_arsenal_summary, paper_equity_curve, paper_history, paper_signal_history, paper_summary
 from app.services.paper_quant_risk_guard import paper_quant_risk_guard
@@ -32,11 +41,28 @@ router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
 class ManualPracticeOpen(BaseModel):
     symbol: str = Field(min_length=3, max_length=32)
     side: str
+    order_type: str = "MARKET"
     margin_usdt: float = Field(gt=0, le=100000)
     leverage: int = Field(ge=1, le=20)
     stop_loss: float = Field(gt=0)
-    take_profit: float = Field(gt=0)
-    practice_note: str | None = Field(default=None, max_length=300)
+    tp1: float | None = Field(default=None, gt=0)
+    tp2: float | None = Field(default=None, gt=0)
+    tp3: float | None = Field(default=None, gt=0)
+    take_profit: float | None = Field(default=None, gt=0)
+    limit_price: float | None = Field(default=None, gt=0)
+    practice_note: str | None = Field(default=None, max_length=500)
+    auto_be_after_tp1: bool = False
+
+
+class ManualRiskUpdate(BaseModel):
+    stop_loss: float = Field(gt=0)
+    tp1: float = Field(gt=0)
+    tp2: float = Field(gt=0)
+    tp3: float = Field(gt=0)
+
+
+class ManualPartialClose(BaseModel):
+    fraction: float = Field(default=1.0, gt=0, le=1)
 
 
 def _safe_manual_symbol(symbol: str) -> str:
@@ -314,47 +340,108 @@ async def run_cycle(db: AsyncSession = Depends(get_db)):
 
 @router.get("/manual/account")
 async def manual_practice_account(db: AsyncSession = Depends(get_db)):
-    await _ensure_paper_dependencies(db)
     return await manual_account_snapshot(db)
+
+
+@router.get("/manual/history")
+async def manual_practice_history(limit: int = Query(default=50, ge=1, le=200), db: AsyncSession = Depends(get_db)):
+    return {"paper_only": True, "rows": await manual_history(db, limit=limit)}
 
 
 @router.post("/manual/open")
 async def manual_practice_open(payload: ManualPracticeOpen, db: AsyncSession = Depends(get_db)):
-    await _ensure_paper_dependencies(db)
     try:
-        return await open_manual_position(
+        fallback_tp = payload.take_profit
+        tp1 = payload.tp1 or fallback_tp
+        tp2 = payload.tp2 or fallback_tp
+        tp3 = payload.tp3 or fallback_tp
+        if not all([tp1, tp2, tp3]):
+            raise ValueError("missing_take_profit")
+        return await create_manual_order(
             db,
             symbol=_safe_manual_symbol(payload.symbol),
             side=payload.side,
+            order_type=payload.order_type,
             margin_usdt=payload.margin_usdt,
             leverage=payload.leverage,
             stop_loss=payload.stop_loss,
-            take_profit=payload.take_profit,
+            tp1=float(tp1),
+            tp2=float(tp2),
+            tp3=float(tp3),
+            limit_price=payload.limit_price,
             practice_note=payload.practice_note,
+            auto_be_after_tp1=payload.auto_be_after_tp1,
         )
     except ValueError as exc:
         await db.rollback()
         messages = {
             "invalid_side": "Side must be LONG or SHORT.",
+            "invalid_order_type": "Order type must be MARKET or LIMIT.",
             "invalid_margin": "Paper margin must be greater than zero.",
-            "invalid_long_geometry": "For LONG use SL < entry < TP.",
-            "invalid_short_geometry": "For SHORT use TP < entry < SL.",
+            "invalid_limit_price": "A valid limit price is required.",
+            "long_limit_must_be_below_market": "A LONG limit entry must be below the current market price.",
+            "short_limit_must_be_above_market": "A SHORT limit entry must be above the current market price.",
+            "invalid_long_geometry": "For LONG use SL < entry < TP1 <= TP2 <= TP3.",
+            "invalid_short_geometry": "For SHORT use TP3 <= TP2 <= TP1 < entry < SL.",
             "insufficient_paper_margin": "Not enough fictitious available margin.",
             "market_price_unavailable": "Live market price is unavailable.",
+            "missing_take_profit": "TP1, TP2 and TP3 are required.",
         }
         raise HTTPException(status_code=400, detail=messages.get(str(exc), str(exc))) from exc
 
 
 @router.post("/manual/close/{position_id}")
-async def manual_practice_close(position_id: int, db: AsyncSession = Depends(get_db)):
-    await _ensure_paper_dependencies(db)
+async def manual_practice_close(position_id: int, fraction: float = Query(default=1.0, gt=0, le=1), db: AsyncSession = Depends(get_db)):
     try:
-        return await close_manual_position(db, position_id)
+        return await close_manual_position(db, position_id, fraction=fraction)
     except ValueError as exc:
         await db.rollback()
         messages = {
             "position_not_open": "Paper position is not open.",
-            "not_manual_practice_position": "Only manual-practice positions can be closed here.",
             "market_price_unavailable": "Live market price is unavailable.",
         }
         raise HTTPException(status_code=400, detail=messages.get(str(exc), str(exc))) from exc
+
+
+@router.post("/manual/be/{position_id}")
+async def manual_practice_break_even(position_id: int, db: AsyncSession = Depends(get_db)):
+    try:
+        return await move_manual_stop_to_be(db, position_id)
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/manual/update/{position_id}")
+async def manual_practice_update(position_id: int, payload: ManualRiskUpdate, db: AsyncSession = Depends(get_db)):
+    try:
+        return await update_manual_risk(
+            db,
+            position_id,
+            stop_loss=payload.stop_loss,
+            tp1=payload.tp1,
+            tp2=payload.tp2,
+            tp3=payload.tp3,
+        )
+    except ValueError as exc:
+        await db.rollback()
+        messages = {
+            "position_not_open": "Paper position is not open.",
+            "invalid_long_geometry": "For LONG use SL <= entry < TP1 <= TP2 <= TP3.",
+            "invalid_short_geometry": "For SHORT use TP3 <= TP2 <= TP1 < entry <= SL.",
+        }
+        raise HTTPException(status_code=400, detail=messages.get(str(exc), str(exc))) from exc
+
+
+@router.post("/manual/cancel/{order_id}")
+async def manual_practice_cancel(order_id: int, db: AsyncSession = Depends(get_db)):
+    try:
+        return await cancel_manual_order(db, order_id)
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/manual/reset")
+async def manual_practice_reset(db: AsyncSession = Depends(get_db)):
+    return await reset_manual_practice_account(db)
