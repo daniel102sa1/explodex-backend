@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -13,6 +14,7 @@ from app.services.formula_brain import formula_brain_calibration_report, formula
 from app.services.macro_cycle_persistence import macro_cycle_report
 from app.services.paper_loss_autopsy import loss_autopsy_report
 from app.services.paper_micro_scalp import micro_summary, scan_micro_scalps
+from app.services.paper_manual import close_manual_position, manual_account_snapshot, open_manual_position
 from app.services.paper_orders import paper_order_history, paper_order_stats
 from app.services.paper_portfolio import ARSENAL_DISPLAY_START, ensure_paper_schema, paper_arsenal_summary, paper_equity_curve, paper_history, paper_signal_history, paper_summary
 from app.services.paper_quant_risk_guard import paper_quant_risk_guard
@@ -25,6 +27,26 @@ from app.services.validation_mode import ensure_validation_schema
 from app.services.vnext_evaluation import vnext_evaluation_report
 
 router = APIRouter(prefix="/api/v1/paper-trading", tags=["paper-trading"])
+
+
+class ManualPracticeOpen(BaseModel):
+    symbol: str = Field(min_length=3, max_length=32)
+    side: str
+    margin_usdt: float = Field(gt=0, le=100000)
+    leverage: int = Field(ge=1, le=20)
+    stop_loss: float = Field(gt=0)
+    take_profit: float = Field(gt=0)
+    practice_note: str | None = Field(default=None, max_length=300)
+
+
+def _safe_manual_symbol(symbol: str) -> str:
+    value = str(symbol or "").upper().strip().replace("/", "")
+    if not value.endswith("USDT"):
+        value += "USDT"
+    if not value.replace("USDT", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    return value
+
 
 
 async def _ensure_paper_dependencies(db: AsyncSession) -> None:
@@ -288,3 +310,51 @@ async def run_cycle(db: AsyncSession = Depends(get_db)):
         "result": await run_fast_paper_cycle(db),
         "note": "Alias seguro del único ciclo PAPER canónico. Los laboratorios legacy ya no pueden abrir posiciones desde este endpoint.",
     }
+
+
+@router.get("/manual/account")
+async def manual_practice_account(db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    return await manual_account_snapshot(db)
+
+
+@router.post("/manual/open")
+async def manual_practice_open(payload: ManualPracticeOpen, db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    try:
+        return await open_manual_position(
+            db,
+            symbol=_safe_manual_symbol(payload.symbol),
+            side=payload.side,
+            margin_usdt=payload.margin_usdt,
+            leverage=payload.leverage,
+            stop_loss=payload.stop_loss,
+            take_profit=payload.take_profit,
+            practice_note=payload.practice_note,
+        )
+    except ValueError as exc:
+        await db.rollback()
+        messages = {
+            "invalid_side": "Side must be LONG or SHORT.",
+            "invalid_margin": "Paper margin must be greater than zero.",
+            "invalid_long_geometry": "For LONG use SL < entry < TP.",
+            "invalid_short_geometry": "For SHORT use TP < entry < SL.",
+            "insufficient_paper_margin": "Not enough fictitious available margin.",
+            "market_price_unavailable": "Live market price is unavailable.",
+        }
+        raise HTTPException(status_code=400, detail=messages.get(str(exc), str(exc))) from exc
+
+
+@router.post("/manual/close/{position_id}")
+async def manual_practice_close(position_id: int, db: AsyncSession = Depends(get_db)):
+    await _ensure_paper_dependencies(db)
+    try:
+        return await close_manual_position(db, position_id)
+    except ValueError as exc:
+        await db.rollback()
+        messages = {
+            "position_not_open": "Paper position is not open.",
+            "not_manual_practice_position": "Only manual-practice positions can be closed here.",
+            "market_price_unavailable": "Live market price is unavailable.",
+        }
+        raise HTTPException(status_code=400, detail=messages.get(str(exc), str(exc))) from exc
