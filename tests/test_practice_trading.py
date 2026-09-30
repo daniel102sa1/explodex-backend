@@ -28,3 +28,13 @@ def test_long_and_short_geometry_validation() -> None:
         _validate_geometry(side="LONG", entry=100, stop_loss=101, take_profit=104)
     with pytest.raises(ValueError):
         _validate_geometry(side="SHORT", entry=100, stop_loss=102, take_profit=96, tp2=97)
+
+
+def test_open_trade_rejects_break_even_but_management_can_allow_it() -> None:
+    with pytest.raises(ValueError):
+        _validate_geometry(side="LONG", entry=100, stop_loss=100, take_profit=102)
+    _validate_geometry(side="LONG", entry=100, stop_loss=100, take_profit=102, allow_break_even=True)
+
+    with pytest.raises(ValueError):
+        _validate_geometry(side="SHORT", entry=100, stop_loss=100, take_profit=98)
+    _validate_geometry(side="SHORT", entry=100, stop_loss=100, take_profit=98, allow_break_even=True)
