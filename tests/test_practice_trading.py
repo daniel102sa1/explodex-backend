@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.practice_trading import _clean_session_id, _clean_symbol, _validate_geometry, estimated_liquidation_price
+from app.services.practice_trading import _candle_range_after_sync, _clean_session_id, _clean_symbol, _validate_geometry, estimated_liquidation_price
 
 
 def test_practice_symbol_normalization() -> None:
@@ -38,3 +38,14 @@ def test_open_trade_rejects_break_even_but_management_can_allow_it() -> None:
     with pytest.raises(ValueError):
         _validate_geometry(side="SHORT", entry=100, stop_loss=100, take_profit=98)
     _validate_geometry(side="SHORT", entry=100, stop_loss=100, take_profit=98, allow_break_even=True)
+
+
+def test_management_change_does_not_reuse_earlier_intrabar_extremes() -> None:
+    kline = [1_000, "100", "110", "90", "103", "0"]
+    high, low = _candle_range_after_sync(kline, 1_030)
+    assert high == 103
+    assert low == 103
+
+    high2, low2 = _candle_range_after_sync(kline, 900)
+    assert high2 == 110
+    assert low2 == 90

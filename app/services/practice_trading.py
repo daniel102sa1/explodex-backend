@@ -50,6 +50,15 @@ def _clean_symbol(value: str) -> str:
     return value
 
 
+def _candle_range_after_sync(kline: list[Any], start_ms: int) -> tuple[float, float]:
+    """Return a non-retroactive range for a candle overlapping a management change."""
+    candle_open_ms = int(kline[0])
+    if candle_open_ms < int(start_ms):
+        current_price = _f(kline[4])
+        return current_price, current_price
+    return _f(kline[2]), _f(kline[3])
+
+
 def estimated_liquidation_price(entry: float, side: str, leverage: int) -> float:
     """Simple isolated-margin training estimate, not an exchange liquidation engine."""
     entry = _f(entry)
@@ -1059,7 +1068,11 @@ async def _sync_open_positions(db: AsyncSession, session_id: str) -> dict[str, i
             if not current or str(current["status"]) != "OPEN":
                 break
             position = dict(current)
-            high, low = _f(k[2]), _f(k[3])
+            # When a stop/TP was changed inside the currently open minute,
+            # the candle high/low may include price action from BEFORE that
+            # change. Use the current/last price for that overlapping candle
+            # so new management never acts retroactively.
+            high, low = _candle_range_after_sync(k, start_ms)
 
             liquidation_hit = (
                 liq > 0 and (
