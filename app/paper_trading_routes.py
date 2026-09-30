@@ -391,9 +391,9 @@ async def manual_practice_open(payload: ManualPracticeOpen, db: AsyncSession = D
 
 
 @router.post("/manual/close/{position_id}")
-async def manual_practice_close(position_id: int, payload: ManualPartialClose = ManualPartialClose(), db: AsyncSession = Depends(get_db)):
+async def manual_practice_close(position_id: int, fraction: float = Query(default=1.0, gt=0, le=1), db: AsyncSession = Depends(get_db)):
     try:
-        return await close_manual_position(db, position_id, fraction=payload.fraction)
+        return await close_manual_position(db, position_id, fraction=fraction)
     except ValueError as exc:
         await db.rollback()
         messages = {
