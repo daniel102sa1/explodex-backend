@@ -458,7 +458,10 @@ async def _sync_open_positions(db: AsyncSession, prices: dict[str, float]) -> in
             if bool(meta.get("auto_be_after_tp1")):
                 await db.execute(text("UPDATE manual_practice_positions SET stop_loss=entry_price WHERE id=:id"), {"id": row["id"]})
             events += 1
-            row["quantity_remaining"] = qty_remaining - close_qty
+            previous_qty = qty_remaining
+            previous_margin = _f(row["margin_remaining"])
+            row["quantity_remaining"] = max(0.0, previous_qty - close_qty)
+            row["margin_remaining"] = previous_margin * (row["quantity_remaining"] / previous_qty) if previous_qty > 0 else 0.0
             row["tp1_hit"] = True
             qty_remaining = _f(row["quantity_remaining"])
 
@@ -467,7 +470,10 @@ async def _sync_open_positions(db: AsyncSession, prices: dict[str, float]) -> in
             await _realize_quantity(db, row, exit_price=tp2, quantity=close_qty, reason="TP2_PARTIAL")
             await db.execute(text("UPDATE manual_practice_positions SET tp2_hit=TRUE WHERE id=:id"), {"id": row["id"]})
             events += 1
-            row["quantity_remaining"] = qty_remaining - close_qty
+            previous_qty = qty_remaining
+            previous_margin = _f(row["margin_remaining"])
+            row["quantity_remaining"] = max(0.0, previous_qty - close_qty)
+            row["margin_remaining"] = previous_margin * (row["quantity_remaining"] / previous_qty) if previous_qty > 0 else 0.0
             row["tp2_hit"] = True
             qty_remaining = _f(row["quantity_remaining"])
 
