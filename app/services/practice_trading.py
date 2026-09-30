@@ -231,6 +231,7 @@ def _validate_geometry(
     take_profit: float,
     tp2: float | None = None,
     tp3: float | None = None,
+    allow_break_even: bool = False,
 ) -> None:
     side = str(side).upper()
     entry = _f(entry)
@@ -240,7 +241,8 @@ def _validate_geometry(
     tp3f = _f(tp3) if tp3 is not None else None
     if side == "LONG":
         targets = [x for x in (take_profit, tp2f, tp3f) if x is not None]
-        if not (0 < stop_loss < entry < take_profit):
+        stop_ok = 0 < stop_loss <= entry if allow_break_even else 0 < stop_loss < entry
+        if not (stop_ok and entry < take_profit):
             raise ValueError("invalid LONG stop-target geometry")
         if any(target <= entry for target in targets):
             raise ValueError("LONG targets must be above entry")
@@ -248,7 +250,8 @@ def _validate_geometry(
             raise ValueError("LONG TP1/TP2/TP3 must be ascending")
     elif side == "SHORT":
         targets = [x for x in (take_profit, tp2f, tp3f) if x is not None]
-        if not (0 < take_profit < entry < stop_loss):
+        stop_ok = stop_loss >= entry if allow_break_even else stop_loss > entry
+        if not (0 < take_profit < entry and stop_ok):
             raise ValueError("invalid SHORT stop-target geometry")
         if any(target >= entry for target in targets):
             raise ValueError("SHORT targets must be below entry")
@@ -745,6 +748,7 @@ async def modify_practice_trade(
         take_profit=new_tp1,
         tp2=new_tp2,
         tp3=new_tp3,
+        allow_break_even=True,
     )
     qty = _f(position.get("quantity"))
     risk = abs(_f(position["entry_price"]) - new_stop) * qty
