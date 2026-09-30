@@ -1059,7 +1059,17 @@ async def _sync_open_positions(db: AsyncSession, session_id: str) -> dict[str, i
             if not current or str(current["status"]) != "OPEN":
                 break
             position = dict(current)
-            high, low = _f(k[2]), _f(k[3])
+            candle_open_ms = int(k[0])
+            # When a stop/TP was changed inside the currently open minute,
+            # the candle high/low may include price action from BEFORE that
+            # change. Use the current/last price for that overlapping candle
+            # so new management never acts retroactively.
+            if candle_open_ms < start_ms:
+                current_price = _f(k[4])
+                high = current_price
+                low = current_price
+            else:
+                high, low = _f(k[2]), _f(k[3])
 
             liquidation_hit = (
                 liq > 0 and (
