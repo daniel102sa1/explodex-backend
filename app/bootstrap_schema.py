@@ -31,6 +31,10 @@ FOUNDATIONAL_TABLES = {
     "paper_positions",
     "paper_equity_curve",
     "paper_orders",
+    "paper_micro_signals",
+    "paper_range_signals",
+    "paper_trade_theses",
+    "paper_trade_audits",
 }
 
 
@@ -361,6 +365,102 @@ async def ensure_fresh_database_schema(conn: AsyncConnection) -> None:
         )
     """))
 
+    # Optional PAPER strategy modules are bootstrapped too. This keeps the
+    # standalone Railway reset service and every manual strategy endpoint safe
+    # even before those modules have been visited once.
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS paper_micro_signals (
+            id UUID PRIMARY KEY,
+            symbol VARCHAR(32) NOT NULL,
+            side VARCHAR(8) NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            entry_reference NUMERIC(30,12) NOT NULL,
+            stop_loss NUMERIC(30,12) NOT NULL,
+            take_profit NUMERIC(30,12) NOT NULL,
+            score NUMERIC(10,4) NOT NULL,
+            tier VARCHAR(16) NOT NULL,
+            setup_type VARCHAR(40),
+            quote_volume NUMERIC(30,4),
+            status VARCHAR(16) NOT NULL DEFAULT 'NEW',
+            skip_reason VARCHAR(80),
+            projected_net_pnl NUMERIC(24,8),
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+    """))
+
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS paper_range_signals (
+            id UUID PRIMARY KEY,
+            symbol VARCHAR(32) NOT NULL,
+            side VARCHAR(8) NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            entry_reference NUMERIC(30,12) NOT NULL,
+            stop_loss NUMERIC(30,12) NOT NULL,
+            take_profit NUMERIC(30,12) NOT NULL,
+            range_low NUMERIC(30,12) NOT NULL,
+            range_high NUMERIC(30,12) NOT NULL,
+            score NUMERIC(10,4) NOT NULL,
+            quote_volume NUMERIC(30,4),
+            status VARCHAR(16) NOT NULL DEFAULT 'NEW',
+            skip_reason VARCHAR(80),
+            projected_net_pnl NUMERIC(24,8),
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+    """))
+
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS paper_trade_theses (
+            id BIGSERIAL PRIMARY KEY,
+            symbol VARCHAR(32) NOT NULL,
+            direction VARCHAR(8) NOT NULL,
+            status VARCHAR(24) NOT NULL DEFAULT 'WAITING_ENTRY',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL,
+            cooldown_until TIMESTAMPTZ,
+            signal_id UUID,
+            entry_price NUMERIC(30,12) NOT NULL,
+            entry_low NUMERIC(30,12) NOT NULL,
+            entry_high NUMERIC(30,12) NOT NULL,
+            stop_loss NUMERIC(30,12) NOT NULL,
+            take_profit NUMERIC(30,12) NOT NULL,
+            fingerprint_score NUMERIC(10,4),
+            contradiction_count INTEGER NOT NULL DEFAULT 0,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+    """))
+
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS paper_trade_audits (
+            id BIGSERIAL PRIMARY KEY,
+            position_id BIGINT NOT NULL REFERENCES paper_positions(id) ON DELETE CASCADE,
+            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            stage VARCHAR(16) NOT NULL,
+            strategy_mode VARCHAR(40) NOT NULL,
+            side VARCHAR(8) NOT NULL,
+            score_bucket VARCHAR(16),
+            current_price NUMERIC(30,12),
+            progress_r NUMERIC(12,6),
+            max_favorable_r NUMERIC(12,6),
+            max_adverse_r NUMERIC(12,6),
+            one_r_before_stop BOOLEAN,
+            tp1_before_stop BOOLEAN,
+            stop_before_tp1 BOOLEAN,
+            runner_2r_after_tp1 BOOLEAN,
+            runner_3r_after_tp1 BOOLEAN,
+            reversed_to_entry_after_tp1 BOOLEAN,
+            stop_quality VARCHAR(24),
+            recommendation VARCHAR(64),
+            technical JSONB NOT NULL DEFAULT '{}'::jsonb,
+            flow JSONB NOT NULL DEFAULT '{}'::jsonb,
+            stop_analysis JSONB NOT NULL DEFAULT '{}'::jsonb,
+            management JSONB NOT NULL DEFAULT '{}'::jsonb,
+            calibration JSONB NOT NULL DEFAULT '{}'::jsonb,
+            narrative TEXT,
+            UNIQUE(position_id, stage)
+        )
+    """))
+
     # Small, high-value indexes only. Avoid indexing large JSON payloads so the
     # demo database remains cheap and compact.
     indexes = [
@@ -376,6 +476,13 @@ async def ensure_fresh_database_schema(conn: AsyncConnection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_paper_positions_status ON paper_positions(status, opened_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_paper_orders_symbol ON paper_orders(symbol, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_micro_status ON paper_micro_signals(status, observed_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_micro_symbol ON paper_micro_signals(symbol, observed_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_range_status ON paper_range_signals(status, observed_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_range_symbol ON paper_range_signals(symbol, observed_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_thesis_symbol_time ON paper_trade_theses(symbol, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_thesis_status ON paper_trade_theses(status, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_paper_trade_audits_stage_strategy ON paper_trade_audits(stage, strategy_mode, side, observed_at DESC)",
     ]
     for ddl in indexes:
         await conn.execute(text(ddl))
