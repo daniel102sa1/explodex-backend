@@ -161,10 +161,12 @@ async def _available_margin(db: AsyncSession) -> tuple[float, float, float]:
     return cash, used, max(0.0, cash - used - reserved)
 
 
-def _validate_geometry(side: str, entry: float, stop: float, tp1: float, tp2: float, tp3: float) -> None:
-    if side == "LONG" and not (0 < stop < entry < tp1 <= tp2 <= tp3):
+def _validate_geometry(side: str, entry: float, stop: float, tp1: float, tp2: float, tp3: float, *, allow_be: bool = False) -> None:
+    long_stop_ok = 0 < stop <= entry if allow_be else 0 < stop < entry
+    short_stop_ok = stop >= entry if allow_be else stop > entry
+    if side == "LONG" and not (long_stop_ok and entry < tp1 <= tp2 <= tp3):
         raise ValueError("invalid_long_geometry")
-    if side == "SHORT" and not (0 < tp3 <= tp2 <= tp1 < entry < stop):
+    if side == "SHORT" and not (0 < tp3 <= tp2 <= tp1 < entry and short_stop_ok):
         raise ValueError("invalid_short_geometry")
 
 
@@ -628,7 +630,7 @@ async def update_manual_risk(
     if not row:
         raise ValueError("position_not_open")
     row = dict(row)
-    _validate_geometry(str(row["side"]), _f(row["entry_price"]), _f(stop_loss), _f(tp1), _f(tp2), _f(tp3))
+    _validate_geometry(str(row["side"]), _f(row["entry_price"]), _f(stop_loss), _f(tp1), _f(tp2), _f(tp3), allow_be=True)
     await db.execute(text("""
         UPDATE manual_practice_positions
         SET stop_loss=:stop,tp1=:tp1,tp2=:tp2,tp3=:tp3
