@@ -26,6 +26,7 @@ from app.services.opportunities import calibration_by_score, ranked_opportunitie
 from app.services.paper_fast_cycle import VERSION as PAPER_EXECUTION_VERSION, run_fast_paper_cycle, run_paper_exit_management
 from app.services.paper_portfolio import ARSENAL_DISPLAY_START, paper_arsenal_summary, paper_history as canonical_paper_history, paper_performance_summary, paper_summary
 from app.services.paper_reset import maybe_repair_current_arsenal_positions, maybe_reset_full_paper_baseline
+from app.services.practice_ai import analyze_practice_direction
 from app.services.runtime import runtime_state, start_runtime, stop_runtime
 from app.services.scanner import run_scanner
 from app.services.scanner_progress import scanner_progress
@@ -323,7 +324,7 @@ async def market_price(symbol: str):
 async def market_candles(
     symbol: str,
     interval: str = Query(default="15m"),
-    limit: int = Query(default=120, ge=20, le=300),
+    limit: int = Query(default=120, ge=20, le=600),
 ):
     allowed = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"}
     safe_interval = interval if interval in allowed else "15m"
@@ -353,6 +354,14 @@ async def market_candles(
         }
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Candles unavailable: {exc}") from exc
+
+
+@app.post("/api/v1/practice/ai-direction")
+async def practice_ai_direction(payload: dict[str, object]):
+    try:
+        return await analyze_practice_direction(dict(payload))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Practice AI unavailable: {type(exc).__name__}") from exc
 
 
 @app.get("/api/v1/analysis/{symbol}")
