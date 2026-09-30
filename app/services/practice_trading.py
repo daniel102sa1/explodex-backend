@@ -115,14 +115,16 @@ async def ensure_practice_schema(db: AsyncSession) -> None:
         "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS tp2_hit BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS tp3_hit BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS moved_to_be BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ",
     ]
     for ddl in migrations:
         await db.execute(text(ddl))
     await db.execute(text("""
         UPDATE practice_positions
         SET initial_quantity=COALESCE(initial_quantity, quantity),
-            initial_risk_usdt=COALESCE(initial_risk_usdt, risk_usdt)
-        WHERE initial_quantity IS NULL OR initial_risk_usdt IS NULL
+            initial_risk_usdt=COALESCE(initial_risk_usdt, risk_usdt),
+            last_synced_at=COALESCE(last_synced_at, opened_at)
+        WHERE initial_quantity IS NULL OR initial_risk_usdt IS NULL OR last_synced_at IS NULL
     """))
 
     await db.execute(text("""
@@ -315,11 +317,11 @@ async def _insert_position(
         INSERT INTO practice_positions (
             session_id, symbol, side, timeframe, pattern, entry_price, stop_loss,
             take_profit, tp2, tp3, leverage, margin_used, quantity, initial_quantity,
-            notional, risk_usdt, initial_risk_usdt, liquidation_price, note, metadata
+            notional, risk_usdt, initial_risk_usdt, liquidation_price, note, metadata, last_synced_at
         ) VALUES (
             :session_id, :symbol, :side, :timeframe, :pattern, :entry_price, :stop_loss,
             :take_profit, :tp2, :tp3, :leverage, :margin_used, :quantity, :quantity,
-            :notional, :risk_usdt, :risk_usdt, :liquidation_price, :note, CAST(:metadata AS JSONB)
+            :notional, :risk_usdt, :risk_usdt, :liquidation_price, :note, CAST(:metadata AS JSONB), NOW()
         ) RETURNING id
     """), {
         "session_id": session_id,
@@ -402,6 +404,7 @@ async def _mark_positions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "partial_realized_pnl": _f(row.get("partial_realized_pnl")),
             "roi_on_margin_pct": round(gross / margin * 100.0, 4) if margin > 0 else 0.0,
             "opened_at": row["opened_at"].isoformat() if row.get("opened_at") else None,
+            "last_synced_at": row["last_synced_at"].isoformat() if row.get("last_synced_at") else None,
         })
     return out
 
@@ -748,7 +751,7 @@ async def modify_practice_trade(
     await db.execute(text("""
         UPDATE practice_positions
         SET stop_loss=:stop_loss, take_profit=:take_profit, tp2=:tp2, tp3=:tp3,
-            risk_usdt=:risk_usdt
+            risk_usdt=:risk_usdt, last_synced_at=NOW()
         WHERE id=:trade_id AND session_id=:session_id
     """), {
         "stop_loss": new_stop,
@@ -794,7 +797,7 @@ async def move_practice_stop_to_break_even(db: AsyncSession, session_id: str, tr
     entry = _f(row["entry_price"])
     await db.execute(text("""
         UPDATE practice_positions
-        SET stop_loss=:entry, risk_usdt=0, moved_to_be=TRUE
+        SET stop_loss=:entry, risk_usdt=0, moved_to_be=TRUE, last_synced_at=NOW()
         WHERE id=:trade_id AND session_id=:session_id
     """), {"entry": entry, "trade_id": int(trade_id), "session_id": session_id})
     await _record_event(
@@ -1027,7 +1030,8 @@ async def _sync_open_positions(db: AsyncSession, session_id: str) -> dict[str, i
             klines = await binance_client.klines(str(row["symbol"]), interval="1m", limit=500)
         except Exception:
             continue
-        start_ms = int(row["opened_at"].timestamp() * 1000)
+        sync_from = row.get("last_synced_at") or row["opened_at"]
+        start_ms = int(sync_from.timestamp() * 1000)
         future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
         if not future:
             continue
@@ -1149,6 +1153,12 @@ async def _sync_open_positions(db: AsyncSession, session_id: str) -> dict[str, i
                 partials += 1
                 closed += 1
                 break
+
+        await db.execute(text("""
+            UPDATE practice_positions
+            SET last_synced_at=NOW()
+            WHERE id=:id AND session_id=:session_id AND status='OPEN'
+        """), {"id": int(row["id"]), "session_id": session_id})
     return {"closed": closed, "partials": partials}
 
 
