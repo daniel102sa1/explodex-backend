@@ -1059,11 +1059,15 @@ async def _sync_open_positions(db: AsyncSession, session_id: str) -> dict[str, i
     closed = 0
     partials = 0
     for row in rows:
+        sync_from = row.get("last_synced_at") or row["opened_at"]
+        # Download only the candles since the previous sync, not 500 on each
+        # browser poll. Keep a small overlap for the boundary minute.
+        elapsed_minutes = max(0, int((datetime.now(timezone.utc) - sync_from).total_seconds() / 60))
+        candle_limit = max(5, min(500, elapsed_minutes + 4))
         try:
-            klines = await binance_client.klines(str(row["symbol"]), interval="1m", limit=500)
+            klines = await binance_client.klines(str(row["symbol"]), interval="1m", limit=candle_limit)
         except Exception:
             continue
-        sync_from = row.get("last_synced_at") or row["opened_at"]
         start_ms = int(sync_from.timestamp() * 1000)
         future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
         if not future:
