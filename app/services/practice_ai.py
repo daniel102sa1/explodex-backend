@@ -1,11 +1,41 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from app.config import settings
+
+# A bounded in-memory per-session limit: zero PostgreSQL writes.
+# For a hard account-wide spending cap, also set a provider-side project budget.
+_AI_USAGE: dict[str, tuple[float, float, int]] = {}
+_AI_USAGE_LOCK = asyncio.Lock()
+
+
+async def _reserve_practice_ai(session_id: str) -> str | None:
+    if not (8 <= len(session_id) <= 80) or any(not (ch.isalnum() or ch in "-_") for ch in session_id):
+        return "Sesión no válida para usar la IA de pago; utiliza el análisis técnico gratuito."
+    limit = max(0, min(50, settings.practice_ai_daily_limit))
+    if limit == 0:
+        return "La IA de pago está desactivada para controlar los gastos."
+    now = time.monotonic()
+    async with _AI_USAGE_LOCK:
+        if len(_AI_USAGE) > 1024:
+            for key, (start, _, _) in list(_AI_USAGE.items()):
+                if now - start > 86_400:
+                    _AI_USAGE.pop(key, None)
+        start, last, count = _AI_USAGE.get(session_id, (now, -10_000.0, 0))
+        if now - start >= 86_400:
+            start, last, count = now, -10_000.0, 0
+        if count >= limit:
+            return "Se alcanzó el límite diario de consultas a la IA; usa el motor técnico gratuito."
+        if now - last < max(0, settings.practice_ai_cooldown_seconds):
+            return "Consulta demasiado reciente; espera antes de volver a gastar en IA."
+        _AI_USAGE[session_id] = (start, now, count + 1)
+    return None
 
 
 _AI_SCHEMA: dict[str, Any] = {
@@ -121,13 +151,36 @@ async def analyze_practice_direction(payload: dict[str, Any]) -> dict[str, Any]:
     if not settings.openai_api_key:
         return _fallback(payload, "OPENAI_API_KEY no está configurada en Railway.")
 
+    budget_error = await _reserve_practice_ai(str(payload.get("session_id") or ""))
+    if budget_error:
+        return _fallback(payload, budget_error)
+
+    # The model receives compact market features and a handful of trade
+    # outcomes. It never receives session IDs, raw database rows or overlays.
+    current = dict(_dict(payload.get("current")))
+    pattern = dict(_dict(current.get("pattern")))
+    pattern.pop("overlays", None)
+    current["pattern"] = pattern
+    current.pop("indicatorNotes", None)
+    current.pop("autoOverlays", None)
+    features = ("timestamp", "open", "high", "low", "close", "volume")
+    candles = []
+    for row in list(payload.get("recent_candles") or [])[-36:]:
+        if isinstance(row, dict):
+            candles.append({key: row.get(key) for key in features if key in row})
+    trades = []
+    trade_keys = ("side", "symbol", "timeframe", "pattern", "entry_price", "exit_price", "net_pnl", "r_multiple", "close_reason")
+    for item in list(payload.get("recent_trades") or [])[:10]:
+        if isinstance(item, dict):
+            trades.append({key: item.get(key) for key in trade_keys if key in item})
     packet = {
-        "symbol": payload.get("symbol"),
-        "interval": payload.get("interval"),
+        "symbol": str(payload.get("symbol") or "")[:32],
+        "interval": str(payload.get("interval") or "")[:16],
         "engine_direction": payload.get("engine_direction"),
-        "current": payload.get("current"),
-        "multi_timeframe": payload.get("multi_timeframe"),
-        "recent_candles": list(payload.get("recent_candles") or [])[-120:],
+        "current": current,
+        "multi_timeframe": list(payload.get("multi_timeframe") or [])[:4],
+        "recent_candles": candles,
+        "recent_trades": trades,
     }
 
     instructions = (
@@ -139,6 +192,8 @@ async def analyze_practice_direction(payload: dict[str, Any]) -> dict[str, Any]:
         "hasta ruptura/retest. Si existe conflicto importante entre temporalidades, responde WAIT. "
         "Si eliges LONG o SHORT, devuelve niveles internamente coherentes: entrada, stop estructural, TP1/TP2/TP3, "
         "invalidación y un projection_to razonable. No inventes una precisión falsa. "
+        "Si se incluyen operaciones históricas, identifica errores recurrentes observables " 
+        "sin asumir que los resultados garantizan operaciones futuras. " 
         "Los precios son solo para simulación PAPER."
     )
 
