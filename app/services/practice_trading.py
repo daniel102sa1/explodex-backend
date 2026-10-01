@@ -1013,10 +1013,18 @@ async def _sync_pending_orders(db: AsyncSession, session_id: str) -> int:
         ORDER BY created_at ASC
     """), {"session_id": session_id})).mappings().all()]
     filled = 0
+    marks: dict[str, float] = {}
+    # An account may have many LIMIT orders on the same symbol.
+    # Request its mark once per sync, rather than once per order.
     for order in orders:
-        try:
-            mark = await _latest_price(str(order["symbol"]))
-        except Exception:
+        symbol = str(order["symbol"])
+        if symbol not in marks:
+            try:
+                marks[symbol] = await _latest_price(symbol)
+            except Exception:
+                marks[symbol] = 0.0
+        mark = marks[symbol]
+        if mark <= 0:
             continue
         side = str(order["side"]).upper()
         limit_price = _f(order["limit_price"])
@@ -1058,16 +1066,24 @@ async def _sync_open_positions(db: AsyncSession, session_id: str) -> dict[str, i
     """), {"session_id": session_id})).mappings().all()]
     closed = 0
     partials = 0
+    now = datetime.now(timezone.utc)
+    requested_bars: dict[str, int] = {}
+    for row in rows:
+        symbol = str(row["symbol"])
+        sync_from = row.get("last_synced_at") or row["opened_at"]
+        elapsed_minutes = max(0, int((now - sync_from).total_seconds() / 60))
+        count = max(5, min(500, elapsed_minutes + 4))
+        requested_bars[symbol] = max(requested_bars.get(symbol, 0), count)
+    bars_by_symbol: dict[str, list[Any]] = {}
+    for symbol, count in requested_bars.items():
+        try:
+            bars_by_symbol[symbol] = await binance_client.klines(symbol, interval="1m", limit=count)
+        except Exception:
+            bars_by_symbol[symbol] = []
+
     for row in rows:
         sync_from = row.get("last_synced_at") or row["opened_at"]
-        # Download only the candles since the previous sync, not 500 on each
-        # browser poll. Keep a small overlap for the boundary minute.
-        elapsed_minutes = max(0, int((datetime.now(timezone.utc) - sync_from).total_seconds() / 60))
-        candle_limit = max(5, min(500, elapsed_minutes + 4))
-        try:
-            klines = await binance_client.klines(str(row["symbol"]), interval="1m", limit=candle_limit)
-        except Exception:
-            continue
+        klines = bars_by_symbol.get(str(row["symbol"]), [])
         start_ms = int(sync_from.timestamp() * 1000)
         future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
         if not future:
