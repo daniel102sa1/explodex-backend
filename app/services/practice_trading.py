@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +20,9 @@ STARTING_BALANCE = 1000.0
 MAX_LEVERAGE = 20
 MAX_MARGIN_SHARE = 0.95
 MAINTENANCE_MARGIN_RATE = 0.005
+
+_PRACTICE_SCHEMA_READY = False
+_PRACTICE_SCHEMA_LOCK = asyncio.Lock()
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -71,121 +75,143 @@ def estimated_liquidation_price(entry: float, side: str, leverage: int) -> float
 
 
 async def ensure_practice_schema(db: AsyncSession) -> None:
-    await db.execute(text("""
-        CREATE TABLE IF NOT EXISTS practice_accounts (
-            session_id VARCHAR(80) PRIMARY KEY,
-            starting_balance NUMERIC(18,6) NOT NULL DEFAULT 1000,
-            cash_balance NUMERIC(18,6) NOT NULL DEFAULT 1000,
-            realized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
-            total_costs NUMERIC(18,6) NOT NULL DEFAULT 0,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """))
-    await db.execute(text("""
-        CREATE TABLE IF NOT EXISTS practice_positions (
-            id BIGSERIAL PRIMARY KEY,
-            session_id VARCHAR(80) NOT NULL REFERENCES practice_accounts(session_id) ON DELETE CASCADE,
-            symbol VARCHAR(32) NOT NULL,
-            side VARCHAR(8) NOT NULL,
-            status VARCHAR(16) NOT NULL DEFAULT 'OPEN',
-            timeframe VARCHAR(16),
-            pattern VARCHAR(80),
-            entry_price NUMERIC(30,12) NOT NULL,
-            exit_price NUMERIC(30,12),
-            stop_loss NUMERIC(30,12) NOT NULL,
-            take_profit NUMERIC(30,12) NOT NULL,
-            tp2 NUMERIC(30,12),
-            tp3 NUMERIC(30,12),
-            leverage INTEGER NOT NULL,
-            margin_used NUMERIC(24,8) NOT NULL,
-            quantity NUMERIC(30,12) NOT NULL,
-            notional NUMERIC(24,8) NOT NULL,
-            risk_usdt NUMERIC(24,8) NOT NULL,
-            gross_pnl NUMERIC(24,8),
-            net_pnl NUMERIC(24,8),
-            fees NUMERIC(24,8),
-            slippage NUMERIC(24,8),
-            funding_estimate NUMERIC(24,8),
-            close_reason VARCHAR(64),
-            note TEXT,
-            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-            opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            closed_at TIMESTAMPTZ
-        )
-    """))
-    # Additive migrations keep existing browser practice accounts intact.
-    migrations = [
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS initial_quantity NUMERIC(30,12)",
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS initial_risk_usdt NUMERIC(24,8)",
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS partial_realized_pnl NUMERIC(24,8) NOT NULL DEFAULT 0",
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS liquidation_price NUMERIC(30,12)",
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS tp1_hit BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS tp2_hit BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS tp3_hit BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS moved_to_be BOOLEAN NOT NULL DEFAULT FALSE",
-        "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ",
-    ]
-    for ddl in migrations:
-        await db.execute(text(ddl))
-    await db.execute(text("""
-        UPDATE practice_positions
-        SET initial_quantity=COALESCE(initial_quantity, quantity),
-            initial_risk_usdt=COALESCE(initial_risk_usdt, risk_usdt),
-            last_synced_at=COALESCE(last_synced_at, opened_at)
-        WHERE initial_quantity IS NULL OR initial_risk_usdt IS NULL OR last_synced_at IS NULL
-    """))
+    """Create/migrate the browser practice schema once per process, safely.
 
-    await db.execute(text("""
-        CREATE TABLE IF NOT EXISTS practice_orders (
-            id BIGSERIAL PRIMARY KEY,
-            session_id VARCHAR(80) NOT NULL REFERENCES practice_accounts(session_id) ON DELETE CASCADE,
-            symbol VARCHAR(32) NOT NULL,
-            side VARCHAR(8) NOT NULL,
-            order_type VARCHAR(16) NOT NULL DEFAULT 'LIMIT',
-            status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
-            limit_price NUMERIC(30,12) NOT NULL,
-            stop_loss NUMERIC(30,12) NOT NULL,
-            take_profit NUMERIC(30,12) NOT NULL,
-            tp2 NUMERIC(30,12),
-            tp3 NUMERIC(30,12),
-            leverage INTEGER NOT NULL,
-            margin_used NUMERIC(24,8) NOT NULL,
-            timeframe VARCHAR(16),
-            pattern VARCHAR(80),
-            note TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            filled_at TIMESTAMPTZ,
-            canceled_at TIMESTAMPTZ,
-            position_id BIGINT REFERENCES practice_positions(id) ON DELETE SET NULL
-        )
-    """))
-    await db.execute(text("""
-        CREATE TABLE IF NOT EXISTS practice_trade_events (
-            id BIGSERIAL PRIMARY KEY,
-            session_id VARCHAR(80) NOT NULL REFERENCES practice_accounts(session_id) ON DELETE CASCADE,
-            position_id BIGINT REFERENCES practice_positions(id) ON DELETE CASCADE,
-            event_type VARCHAR(32) NOT NULL,
-            price NUMERIC(30,12),
-            quantity NUMERIC(30,12),
-            net_pnl NUMERIC(24,8),
-            message TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """))
-    await db.execute(text(
-        "CREATE INDEX IF NOT EXISTS idx_practice_positions_session_status "
-        "ON practice_positions(session_id, status, opened_at DESC)"
-    ))
-    await db.execute(text(
-        "CREATE INDEX IF NOT EXISTS idx_practice_orders_session_status "
-        "ON practice_orders(session_id, status, created_at DESC)"
-    ))
-    await db.execute(text(
-        "CREATE INDEX IF NOT EXISTS idx_practice_events_position_time "
-        "ON practice_trade_events(position_id, created_at DESC)"
-    ))
-    await db.commit()
+    The UI loads summary/history/sync together. PostgreSQL's CREATE TABLE IF NOT
+    EXISTS is not race-proof when two sessions concurrently create the same new
+    relation because the implicit pg_type row can collide. Serialize the first
+    initialization both in-process and at the database level, then cache success.
+    """
+    global _PRACTICE_SCHEMA_READY
+    if _PRACTICE_SCHEMA_READY:
+        return
+
+    async with _PRACTICE_SCHEMA_LOCK:
+        if _PRACTICE_SCHEMA_READY:
+            return
+
+        # Cross-process safety in case Railway ever runs more than one worker.
+        # The transaction-scoped advisory lock is automatically released at commit.
+        await db.execute(text(
+            "SELECT pg_advisory_xact_lock(hashtext('explodex_practice_schema_v3'))"
+        ))
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS practice_accounts (
+                    session_id VARCHAR(80) PRIMARY KEY,
+                    starting_balance NUMERIC(18,6) NOT NULL DEFAULT 1000,
+                    cash_balance NUMERIC(18,6) NOT NULL DEFAULT 1000,
+                    realized_pnl NUMERIC(18,6) NOT NULL DEFAULT 0,
+                    total_costs NUMERIC(18,6) NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """))
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS practice_positions (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id VARCHAR(80) NOT NULL REFERENCES practice_accounts(session_id) ON DELETE CASCADE,
+                    symbol VARCHAR(32) NOT NULL,
+                    side VARCHAR(8) NOT NULL,
+                    status VARCHAR(16) NOT NULL DEFAULT 'OPEN',
+                    timeframe VARCHAR(16),
+                    pattern VARCHAR(80),
+                    entry_price NUMERIC(30,12) NOT NULL,
+                    exit_price NUMERIC(30,12),
+                    stop_loss NUMERIC(30,12) NOT NULL,
+                    take_profit NUMERIC(30,12) NOT NULL,
+                    tp2 NUMERIC(30,12),
+                    tp3 NUMERIC(30,12),
+                    leverage INTEGER NOT NULL,
+                    margin_used NUMERIC(24,8) NOT NULL,
+                    quantity NUMERIC(30,12) NOT NULL,
+                    notional NUMERIC(24,8) NOT NULL,
+                    risk_usdt NUMERIC(24,8) NOT NULL,
+                    gross_pnl NUMERIC(24,8),
+                    net_pnl NUMERIC(24,8),
+                    fees NUMERIC(24,8),
+                    slippage NUMERIC(24,8),
+                    funding_estimate NUMERIC(24,8),
+                    close_reason VARCHAR(64),
+                    note TEXT,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    closed_at TIMESTAMPTZ
+                )
+            """))
+            # Additive migrations keep existing browser practice accounts intact.
+            migrations = [
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS initial_quantity NUMERIC(30,12)",
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS initial_risk_usdt NUMERIC(24,8)",
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS partial_realized_pnl NUMERIC(24,8) NOT NULL DEFAULT 0",
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS liquidation_price NUMERIC(30,12)",
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS tp1_hit BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS tp2_hit BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS tp3_hit BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS moved_to_be BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE practice_positions ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ",
+            ]
+            for ddl in migrations:
+                await db.execute(text(ddl))
+            await db.execute(text("""
+                UPDATE practice_positions
+                SET initial_quantity=COALESCE(initial_quantity, quantity),
+                    initial_risk_usdt=COALESCE(initial_risk_usdt, risk_usdt),
+                    last_synced_at=COALESCE(last_synced_at, opened_at)
+                WHERE initial_quantity IS NULL OR initial_risk_usdt IS NULL OR last_synced_at IS NULL
+            """))
+        
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS practice_orders (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id VARCHAR(80) NOT NULL REFERENCES practice_accounts(session_id) ON DELETE CASCADE,
+                    symbol VARCHAR(32) NOT NULL,
+                    side VARCHAR(8) NOT NULL,
+                    order_type VARCHAR(16) NOT NULL DEFAULT 'LIMIT',
+                    status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+                    limit_price NUMERIC(30,12) NOT NULL,
+                    stop_loss NUMERIC(30,12) NOT NULL,
+                    take_profit NUMERIC(30,12) NOT NULL,
+                    tp2 NUMERIC(30,12),
+                    tp3 NUMERIC(30,12),
+                    leverage INTEGER NOT NULL,
+                    margin_used NUMERIC(24,8) NOT NULL,
+                    timeframe VARCHAR(16),
+                    pattern VARCHAR(80),
+                    note TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    filled_at TIMESTAMPTZ,
+                    canceled_at TIMESTAMPTZ,
+                    position_id BIGINT REFERENCES practice_positions(id) ON DELETE SET NULL
+                )
+            """))
+            await db.execute(text("""
+                CREATE TABLE IF NOT EXISTS practice_trade_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id VARCHAR(80) NOT NULL REFERENCES practice_accounts(session_id) ON DELETE CASCADE,
+                    position_id BIGINT REFERENCES practice_positions(id) ON DELETE CASCADE,
+                    event_type VARCHAR(32) NOT NULL,
+                    price NUMERIC(30,12),
+                    quantity NUMERIC(30,12),
+                    net_pnl NUMERIC(24,8),
+                    message TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """))
+            await db.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_practice_positions_session_status "
+                "ON practice_positions(session_id, status, opened_at DESC)"
+            ))
+            await db.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_practice_orders_session_status "
+                "ON practice_orders(session_id, status, created_at DESC)"
+            ))
+            await db.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_practice_events_position_time "
+                "ON practice_trade_events(position_id, created_at DESC)"
+            ))
+            await db.commit()
+        
+        _PRACTICE_SCHEMA_READY = True
 
 
 async def ensure_practice_account(db: AsyncSession, session_id: str) -> None:
