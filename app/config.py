@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     ai_brain_reasoning_effort: str = "low"
     ai_brain_max_output_tokens: int = 700
 
+    # On-demand Trading Lab AI budget; never store candles or AI output in PostgreSQL.
+    practice_ai_daily_limit: int = 8
+    practice_ai_cooldown_seconds: int = 120
+
     # CoinGlass is a confirmation layer, never a single-source trade trigger.
     coinglass_enabled: bool = True
     coinglass_api_key: str = ""
