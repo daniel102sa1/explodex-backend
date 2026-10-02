@@ -78,6 +78,19 @@ def _dict(value: Any) -> dict[str, Any]:
 
 
 def _fallback(payload: dict[str, Any], reason: str) -> dict[str, Any]:
+    review = _dict(payload.get("review_trade"))
+    if review:
+        net = _f(review.get("net_pnl"))
+        exit_reason = str(review.get("close_reason") or "no registrado")[:50]
+        return {
+            "available":False,"mode":"TECHNICAL_ENGINE","model":None,
+            "direction":"WAIT","evidence_strength":"LOW",
+            "summary":f"Evaluación individual no disponible con IA ({reason}). Resultado histórico {net:+.2f} USDT; motivo de salida: {exit_reason}. El entrenador local permite revisar los hechos sin gastar tokens.",
+            "entry":0,"stop_loss":0,"tp1":0,"tp2":0,"tp3":0,
+            "invalidation":0,"breakout_level":0,"projection_from":0,"projection_to":0,
+            "reasons":[],"risks":["El resultado pasado no demuestra que una estrategia sea rentable."],
+            "what_to_wait_for":[],"usage":{},
+        }
     current = _dict(payload.get("current"))
     pattern = _dict(current.get("pattern"))
     price = _f(current.get("price"))
@@ -169,7 +182,7 @@ async def analyze_practice_direction(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(row, dict):
             candles.append({key: row.get(key) for key in features if key in row})
     trades = []
-    trade_keys = ("side", "symbol", "timeframe", "pattern", "entry_price", "exit_price", "net_pnl", "r_multiple", "close_reason")
+    trade_keys = ("side", "symbol", "timeframe", "pattern", "entry_price", "exit_price", "net_pnl", "r_multiple", "close_reason", "fees", "slippage")
     for item in list(payload.get("recent_trades") or [])[:10]:
         if isinstance(item, dict):
             trades.append({key: item.get(key) for key in trade_keys if key in item})
@@ -190,7 +203,10 @@ async def analyze_practice_direction(payload: dict[str, Any]) -> dict[str, Any]:
     raw_position = _dict(payload.get("open_position"))
     position_keys = ("side", "entry_price", "stop_loss", "take_profit", "mark_price", "quantity", "margin_used", "leverage")
     position = {key: raw_position.get(key) for key in position_keys if key in raw_position} if raw_position else None
+    review_row = _dict(payload.get("review_trade"))
+    review_trade = {key: review_row.get(key) for key in trade_keys if key in review_row} if review_row else None
     packet = {
+        "review_trade": review_trade,
         "manual_drawing": manual_drawing,
         "open_position": position,
         "symbol": str(payload.get("symbol") or "")[:32],
@@ -218,6 +234,11 @@ async def analyze_practice_direction(payload: dict[str, Any]) -> dict[str, Any]:
         "Si hay una posición abierta, considera su dirección, entrada y SL al proponer un único "
         "TP principal (campo tp1). tp2 y tp3 se devuelven solo para compatibilidad del esquema, "
         "no son órdenes activas en el Trading Lab. Si no hay confirmación, responde WAIT. "
+        "Si review_trade está presente, la tarea ES EXCLUSIVAMENTE revisar esa operación CERRADA: "
+        "responde dirección WAIT, no predigas precios, pon los campos de niveles numéricos en cero, "
+        "explica en summary y reasons qué se puede observar en la entrada, salida, coste y R "
+        "y separa los errores verificables de pérdidas normales; no inventes hechos ni culpes "
+        "al operador cuando los datos sean insuficientes. "
         "Los precios son solo para simulación PAPER."
     )
 
