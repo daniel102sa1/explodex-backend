@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.practice_trading import _candle_range_after_sync, _clean_session_id, _clean_symbol, _validate_geometry, estimated_liquidation_price
+from app.services.practice_trading import _candle_range_after_sync, _pending_minute_candles, _clean_session_id, _clean_symbol, _validate_geometry, estimated_liquidation_price
 
 
 def test_practice_symbol_normalization() -> None:
@@ -49,3 +49,16 @@ def test_management_change_does_not_reuse_earlier_intrabar_extremes() -> None:
     high2, low2 = _candle_range_after_sync(kline, 900)
     assert high2 == 110
     assert low2 == 90
+
+
+def test_sync_includes_overlapping_minute_at_close_only() -> None:
+    candles = [
+        [60_000, "100", "110", "90", "103", "1"],
+        [120_000, "103", "106", "101", "105", "1"],
+    ]
+    # Last sync happened at 00:01:30, within first candle.
+    pending = _pending_minute_candles(candles, 90_000)
+    assert pending == candles
+    assert _candle_range_after_sync(pending[0], 90_000) == (103, 103)
+    assert _candle_range_after_sync(pending[1], 90_000) == (106, 101)
+    assert _pending_minute_candles(candles, 120_000) == [candles[1]]
