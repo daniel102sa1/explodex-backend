@@ -54,6 +54,16 @@ def _clean_symbol(value: str) -> str:
     return value
 
 
+def _pending_minute_candles(klines: list[list[Any]], start_ms: int) -> list[list[Any]]:
+    """Include the overlapping minute so the latest close is not skipped.
+
+    An overlapping candle is evaluated at its close only by
+    _candle_range_after_sync; earlier highs/lows cannot be attributed to a
+    period after the previous sync.
+    """
+    return [k for k in klines if len(k) >= 5 and int(k[0]) + 60_000 > start_ms]
+
+
 def _candle_range_after_sync(kline: list[Any], start_ms: int) -> tuple[float, float]:
     """Return a non-retroactive range for a candle overlapping a management change."""
     candle_open_ms = int(kline[0])
@@ -1085,7 +1095,7 @@ async def _sync_open_positions(db: AsyncSession, session_id: str) -> dict[str, i
         sync_from = row.get("last_synced_at") or row["opened_at"]
         klines = bars_by_symbol.get(str(row["symbol"]), [])
         start_ms = int(sync_from.timestamp() * 1000)
-        future = [k for k in klines if len(k) >= 5 and int(k[0]) >= start_ms]
+        future = _pending_minute_candles(klines, start_ms)
         if not future:
             continue
         side = str(row["side"]).upper()
