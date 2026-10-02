@@ -49,6 +49,7 @@ class PracticeModifyRequest(BaseModel):
     take_profit: float | None = Field(default=None, gt=0)
     tp2: float | None = Field(default=None, gt=0)
     tp3: float | None = Field(default=None, gt=0)
+    single_target: bool = False
 
 
 class PracticePartialCloseRequest(BaseModel):
@@ -229,6 +230,7 @@ async def modify_manual_practice_trade(
             take_profit=request.take_profit,
             tp2=request.tp2,
             tp3=request.tp3,
+            single_target=request.single_target,
         )
     except ValueError as exc:
         await db.rollback()
