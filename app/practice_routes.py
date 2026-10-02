@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.services.practice_symbols import practice_symbol_catalog
 from app.services.practice_trading import (
     cancel_practice_order,
     close_practice_trade,
@@ -66,6 +67,15 @@ class PracticeCloseRequest(BaseModel):
 
 class PracticeResetRequest(BaseModel):
     session_id: str = Field(min_length=8, max_length=80)
+
+
+@router.get("/symbols")
+async def get_practice_symbols():
+    """Active futures symbols without opening a PostgreSQL session."""
+    try:
+        return await practice_symbol_catalog()
+    except Exception:
+        return {"source":"UNAVAILABLE","symbols":[],"count":0,"paper_only":True}
 
 
 @router.get("/summary")
