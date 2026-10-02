@@ -173,7 +173,26 @@ async def analyze_practice_direction(payload: dict[str, Any]) -> dict[str, Any]:
     for item in list(payload.get("recent_trades") or [])[:10]:
         if isinstance(item, dict):
             trades.append({key: item.get(key) for key in trade_keys if key in item})
+    # Optional sketches and ONE active position are concise, unverified hints,
+    # never an instruction to execute a trade or a substitute for the candles.
+    sketch = _dict(payload.get("manual_drawing"))
+    sketch_points = []
+    for point in list(sketch.get("points") or [])[:8]:
+        if not isinstance(point, dict):
+            continue
+        timestamp, value = _f(point.get("timestamp")), _f(point.get("value"))
+        if timestamp > 0 and value > 0:
+            sketch_points.append({"timestamp": int(timestamp), "value": value})
+    manual_drawing = {
+        "type": str(sketch.get("type") or "")[:40],
+        "points": sketch_points,
+    } if sketch_points else None
+    raw_position = _dict(payload.get("open_position"))
+    position_keys = ("side", "entry_price", "stop_loss", "take_profit", "mark_price", "quantity", "margin_used", "leverage")
+    position = {key: raw_position.get(key) for key in position_keys if key in raw_position} if raw_position else None
     packet = {
+        "manual_drawing": manual_drawing,
+        "open_position": position,
         "symbol": str(payload.get("symbol") or "")[:32],
         "interval": str(payload.get("interval") or "")[:16],
         "engine_direction": payload.get("engine_direction"),
@@ -192,8 +211,13 @@ async def analyze_practice_direction(payload: dict[str, Any]) -> dict[str, Any]:
         "hasta ruptura/retest. Si existe conflicto importante entre temporalidades, responde WAIT. "
         "Si eliges LONG o SHORT, devuelve niveles internamente coherentes: entrada, stop estructural, TP1/TP2/TP3, "
         "invalidación y un projection_to razonable. No inventes una precisión falsa. "
-        "Si se incluyen operaciones históricas, identifica errores recurrentes observables " 
-        "sin asumir que los resultados garantizan operaciones futuras. " 
+        "Si se incluyen operaciones históricas, identifica errores recurrentes observables "
+        "sin asumir que los resultados garantizan operaciones futuras. "
+        "Si se incluye un dibujo manual, interpreta su geometría como una hipótesis que debe "
+        "validarse con los precios; explica altura medida, ruptura e invalidación, si aplican. "
+        "Si hay una posición abierta, considera su dirección, entrada y SL al proponer un único "
+        "TP principal (campo tp1). tp2 y tp3 se devuelven solo para compatibilidad del esquema, "
+        "no son órdenes activas en el Trading Lab. Si no hay confirmación, responde WAIT. "
         "Los precios son solo para simulación PAPER."
     )
 

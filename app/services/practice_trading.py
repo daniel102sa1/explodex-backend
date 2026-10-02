@@ -765,6 +765,7 @@ async def modify_practice_trade(
     take_profit: float | None = None,
     tp2: float | None = None,
     tp3: float | None = None,
+    single_target: bool = False,
 ) -> dict[str, Any]:
     session_id = _clean_session_id(session_id)
     await ensure_practice_account(db, session_id)
@@ -778,8 +779,8 @@ async def modify_practice_trade(
     position = dict(row)
     new_stop = _f(stop_loss) if stop_loss is not None else _f(position.get("stop_loss"))
     new_tp1 = _f(take_profit) if take_profit is not None else _f(position.get("take_profit"))
-    new_tp2 = _f(tp2) if tp2 is not None else (_f(position.get("tp2")) if position.get("tp2") is not None else None)
-    new_tp3 = _f(tp3) if tp3 is not None else (_f(position.get("tp3")) if position.get("tp3") is not None else None)
+    new_tp2 = None if single_target else (_f(tp2) if tp2 is not None else (_f(position.get("tp2")) if position.get("tp2") is not None else None))
+    new_tp3 = None if single_target else (_f(tp3) if tp3 is not None else (_f(position.get("tp3")) if position.get("tp3") is not None else None))
     _validate_geometry(
         side=str(position["side"]),
         entry=_f(position["entry_price"]),
@@ -794,6 +795,9 @@ async def modify_practice_trade(
     await db.execute(text("""
         UPDATE practice_positions
         SET stop_loss=:stop_loss, take_profit=:take_profit, tp2=:tp2, tp3=:tp3,
+            tp1_hit=CASE WHEN :single_target THEN FALSE ELSE tp1_hit END,
+            tp2_hit=CASE WHEN :single_target THEN FALSE ELSE tp2_hit END,
+            tp3_hit=CASE WHEN :single_target THEN FALSE ELSE tp3_hit END,
             risk_usdt=:risk_usdt, last_synced_at=NOW()
         WHERE id=:trade_id AND session_id=:session_id
     """), {
@@ -801,6 +805,7 @@ async def modify_practice_trade(
         "take_profit": new_tp1,
         "tp2": new_tp2,
         "tp3": new_tp3,
+        "single_target": single_target,
         "risk_usdt": risk,
         "trade_id": int(trade_id),
         "session_id": session_id,
