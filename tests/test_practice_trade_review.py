@@ -7,7 +7,7 @@ def test_trade_review_fallback_never_invents_future_signal() -> None:
             "side":"LONG", "symbol":"SOLUSDT", "net_pnl":-1.25,
             "close_reason":"SL", "entry_price":100, "exit_price":98,
         },
-        "AI budget exhausted",
+    }, "AI budget exhausted",
     )
     assert result["direction"] == "WAIT"
     assert result["available"] is False
